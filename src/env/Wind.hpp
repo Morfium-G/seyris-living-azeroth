@@ -42,6 +42,7 @@ namespace wxl_livingazeroth::wind
         float strength = 0.0f;          // 0..1 scale, gusts can push past 1
         float gust = 0.0f;              // 0..1, how much of a gust is passing right here
         float open = 1.0f;              // 1 open sky, 0 roofed over (already applied to strength)
+        float lee = 1.0f;               // 1 exposed, lower in the lee of a wall/cliff (already applied)
     };
 
     void Init(const WXL_Api* api);

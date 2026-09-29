@@ -274,8 +274,11 @@ namespace wxl_livingazeroth::wind
                          * 20.0f * (0.5f + s.gust) * kPi / 180.0f;
         s.dirX = dx * std::cos(veer) - dy * std::sin(veer);
         s.dirY = dx * std::sin(veer) + dy * std::cos(veer);
-        s.open = steady > 0.0f ? shelter::Openness(pos) : 1.0f; // no ray needed where there's no wind
-        s.strength = steady * (1.0f + p[GustStrength] * s.gust) * s.open;
+        // No rays where there's no wind, and no lee ray under a roof (already calm there). The lee
+        // uses the steady direction, not the gust-veered one, so its cached rays stay valid.
+        s.open = steady > 0.0f ? shelter::Openness(pos) : 1.0f;
+        s.lee  = (steady > 0.0f && s.open > 0.0f) ? shelter::Lee(pos, dx, dy) : 1.0f;
+        s.strength = steady * (1.0f + p[GustStrength] * s.gust) * s.open * s.lee;
         return s;
     }
 

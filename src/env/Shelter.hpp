@@ -11,7 +11,7 @@ namespace wxl_livingazeroth::shelter
 {
     struct Stats
     {
-        unsigned entries = 0;        // cached cells
+        unsigned entries = 0;        // cached cells (roof + lee)
         unsigned raysThisFrame = 0;  // traces spent this frame
         unsigned deferredThisFrame = 0; // queries answered "open" because the budget was spent
     };
@@ -22,6 +22,25 @@ namespace wxl_livingazeroth::shelter
 
     /// 1 = open sky, 0 = roofed over. Cached; may trace a ray within this frame's budget.
     float Openness(const float pos[3]);
+
+    /// Wind shadow behind walls, cliffs and steep rock: 1 = fully exposed, lower = in the lee of
+    /// something upwind. (windDirX, windDirY) is the direction the wind blows TOWARD. One ray per
+    /// cell and 45-degree wind sector, angled slightly upward so ordinary slopes don't count.
+    float Lee(const float pos[3], float windDirX, float windDirY);
+
+    void SetLeeEnabled(bool enabled);
+    bool LeeEnabled();
+
+    /// Runtime-tunable lee shape (debug panel; not saved, defaults each launch).
+    struct LeeParams
+    {
+        float reach    = 15.0f;  // yards upwind an obstacle still casts shadow
+        float angleDeg = 15.0f;  // ray rise; only obstacles steeper than this block
+        float strength = 0.85f;  // wind removed right behind an obstacle (0..1)
+    };
+    LeeParams GetLeeParams();
+    /// Changing reach or angle re-traces the lee cache; strength applies instantly.
+    void SetLeeParams(const LeeParams& params);
 
     void  SetEnabled(bool enabled);
     bool  Enabled();

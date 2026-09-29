@@ -99,15 +99,28 @@ namespace wxl_livingazeroth::debug
             std::snprintf(line, sizeof(line), "steady: ground %.2f, aloft %.2f   blowing toward %.0f deg (%s)",
                           wind::SteadyGround(), wind::SteadyAloft(), wind::BearingDegrees(), Compass(wind::BearingDegrees()));
             g_api->UiText(line);
-            std::snprintf(line, sizeof(line), "at player: strength %.2f, gust %.2f   %s",
-                          w.strength, w.gust, w.open > 0.5f ? "open sky" : "ROOFED (sheltered)");
+            std::snprintf(line, sizeof(line), "at player: strength %.2f, gust %.2f   %s   lee %.2f",
+                          w.strength, w.gust, w.open > 0.5f ? "open sky" : "ROOFED (sheltered)", w.lee);
             g_api->UiText(line);
 
             int shelterOn = shelter::Enabled() ? 1 : 0;
             if (g_api->UiCheckbox("Per-point shelter (roof ray)", &shelterOn))
                 shelter::SetEnabled(shelterOn != 0);
             g_api->UiSameLine();
+            int leeOn = shelter::LeeEnabled() ? 1 : 0;
+            if (g_api->UiCheckbox("Lee ray", &leeOn))
+                shelter::SetLeeEnabled(leeOn != 0);
+            g_api->UiSameLine();
             if (g_api->UiButton("Clear shelter cache")) shelter::Clear();
+            // Lee shape: runtime only, back to defaults each launch.
+            shelter::LeeParams lee = shelter::GetLeeParams();
+            bool leeChanged = false;
+            leeChanged |= g_api->UiSliderFloat("Lee reach (yards)", &lee.reach, 5.0f, 60.0f) != 0;
+            leeChanged |= g_api->UiSliderFloat("Lee angle (deg)", &lee.angleDeg, 0.0f, 45.0f) != 0;
+            leeChanged |= g_api->UiSliderFloat("Lee strength", &lee.strength, 0.0f, 1.0f) != 0;
+            if (leeChanged) shelter::SetLeeParams(lee);
+            if (g_api->UiButton("Reset lee defaults")) shelter::SetLeeParams(shelter::LeeParams{});
+
             const shelter::Stats st = shelter::GetStats();
             std::snprintf(line, sizeof(line), "shelter cache: %u cells, %u rays this frame, %u deferred",
                           st.entries, st.raysThisFrame, st.deferredThisFrame);
@@ -150,7 +163,7 @@ namespace wxl_livingazeroth::debug
         // --- world arrows ---------------------------------------------------------------------------
         struct LineVtx { float x, y, z; D3DCOLOR c; };
 
-        D3DCOLOR StrengthColor(float strength, float gust)
+        D3DCOLOR StrengthColor(float strength, float gust, float lee)
         {
             const float t = strength < 0.0f ? 0.0f : (strength > 1.0f ? 1.0f : strength);
             float r = t < 0.5f ? t * 2.0f : 1.0f;
@@ -158,6 +171,9 @@ namespace wxl_livingazeroth::debug
             float b = 0.0f;
             // A passing gust brightens toward white.
             r += (1.0f - r) * gust * 0.8f; g += (1.0f - g) * gust * 0.8f; b += gust * 0.8f;
+            // Wind shadow tints toward purple by how deep in the lee the point is.
+            const float shade = 1.0f - (lee < 0.0f ? 0.0f : (lee > 1.0f ? 1.0f : lee));
+            r += (0.75f - r) * shade; g += (0.25f - g) * shade; b += (1.0f - b) * shade;
             return D3DCOLOR_ARGB(255, static_cast<int>(r * 255), static_cast<int>(g * 255), static_cast<int>(b * 255));
         }
 
@@ -175,7 +191,7 @@ namespace wxl_livingazeroth::debug
 
             const float len = 0.6f + w.strength * 5.0f; // yards
             const float hx = w.dirX * len * 0.5f, hy = w.dirY * len * 0.5f;
-            const D3DCOLOR c = StrengthColor(w.strength, w.gust);
+            const D3DCOLOR c = StrengthColor(w.strength, w.gust, w.lee);
 
             const float tipX = cx + hx, tipY = cy + hy;
             v.push_back({ cx - hx, cy - hy, cz, c });
