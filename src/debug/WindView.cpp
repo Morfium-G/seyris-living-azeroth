@@ -1,5 +1,7 @@
 #include "WindView.hpp"
 
+#include "ShaderDump.hpp"
+
 #include "../env/Shelter.hpp"
 #include "../env/Wind.hpp"
 #include "../env/WorldQuery.hpp"
@@ -152,6 +154,11 @@ namespace wxl_livingazeroth::debug
                     g_api->UiText(line);
                 }
             }
+
+            g_api->UiSeparator();
+            // Research: dump the stock grass vertex shaders for the wind-aware replacement.
+            if (g_api->UiButton("Dump grass shaders (Logs\\living-azeroth)"))
+                DumpGrassShaders(g_api);
 
             g_api->UiSeparator();
             g_api->UiCheckbox("Show wind arrows", &g_showArrows);
