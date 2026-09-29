@@ -41,6 +41,7 @@ namespace wxl_livingazeroth::wind
         float dirX = 1.0f, dirY = 0.0f; // unit vector in world XY
         float strength = 0.0f;          // 0..1 scale, gusts can push past 1
         float gust = 0.0f;              // 0..1, how much of a gust is passing right here
+        float open = 1.0f;              // 1 open sky, 0 roofed over (already applied to strength)
     };
 
     void Init(const WXL_Api* api);
@@ -63,7 +64,6 @@ namespace wxl_livingazeroth::wind
     float SteadyGround();          // current steady strength at ground level
     float SteadyAloft();
     float BearingDegrees();        // current steady direction
-    float IndoorFactor();          // 1 outdoors, fades to 0 indoors
     float EffectiveWeather();      // weather intensity the model used
 
     /// Debug override: < 0 follows the live weather, 0..1 forces an intensity.

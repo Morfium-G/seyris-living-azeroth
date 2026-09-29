@@ -1,5 +1,7 @@
 #include "Wind.hpp"
 
+#include "Shelter.hpp"
+
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -63,7 +65,6 @@ namespace wxl_livingazeroth::wind
         bool     g_haveCurrent = false;
 
         float g_time = 0.0f;
-        float g_indoor = 1.0f;
         float g_weatherOverride = -1.0f;
         float g_weatherUsed = 0.0f;
         float g_steadyGround = 0.0f, g_steadyAloft = 0.0f, g_bearing = 0.0f;
@@ -226,9 +227,8 @@ namespace wxl_livingazeroth::wind
         BlendToward(dt);
         const float* p = g_current.value;
 
-        // Indoors (the client's own verdict): fade out over ~0.75 s.
-        const float indoorTarget = (snap.inWorld && !snap.outdoors) ? 0.0f : 1.0f;
-        g_indoor = Lerp(g_indoor, indoorTarget, 1.0f - std::exp(-dt / 0.75f));
+        // Shelter is per position (see At), so standing indoors doesn't calm the storm outside.
+        shelter::BeginFrame(snap.playerPos, dt);
 
         // Where in [min, max] the steady wind sits: a slow wander in the lower-middle part, pushed
         // toward max by weather in proportion to WeatherInfluence.
@@ -236,8 +236,8 @@ namespace wxl_livingazeroth::wind
         float rangePos = 0.2f + 0.5f * Noise1(g_time / 40.0f + 17.3f);
         rangePos += (1.0f - rangePos) * Clamp01(g_weatherUsed * p[WeatherInfluence]);
 
-        g_steadyGround = Lerp(p[GroundMin], p[GroundMax], rangePos) * g_indoor;
-        g_steadyAloft  = Lerp(p[AloftMin],  p[AloftMax],  rangePos) * g_indoor;
+        g_steadyGround = Lerp(p[GroundMin], p[GroundMax], rangePos);
+        g_steadyAloft  = Lerp(p[AloftMin],  p[AloftMax],  rangePos);
 
         // Prevailing direction: a per-map base that wanders +-60 degrees over minutes, pulled toward
         // the locked direction by LockStrength.
@@ -274,7 +274,8 @@ namespace wxl_livingazeroth::wind
                          * 20.0f * (0.5f + s.gust) * kPi / 180.0f;
         s.dirX = dx * std::cos(veer) - dy * std::sin(veer);
         s.dirY = dx * std::sin(veer) + dy * std::cos(veer);
-        s.strength = steady * (1.0f + p[GustStrength] * s.gust);
+        s.open = steady > 0.0f ? shelter::Openness(pos) : 1.0f; // no ray needed where there's no wind
+        s.strength = steady * (1.0f + p[GustStrength] * s.gust) * s.open;
         return s;
     }
 
@@ -286,7 +287,6 @@ namespace wxl_livingazeroth::wind
     float SteadyGround()          { return g_steadyGround; }
     float SteadyAloft()           { return g_steadyAloft; }
     float BearingDegrees()        { return g_bearing; }
-    float IndoorFactor()          { return g_indoor; }
     float EffectiveWeather()      { return g_weatherUsed; }
 
     void  SetWeatherOverride(float intensity) { g_weatherOverride = intensity; }

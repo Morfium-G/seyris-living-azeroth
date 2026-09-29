@@ -1,5 +1,6 @@
 #include "WindView.hpp"
 
+#include "../env/Shelter.hpp"
 #include "../env/Wind.hpp"
 #include "../env/WorldQuery.hpp"
 
@@ -98,8 +99,18 @@ namespace wxl_livingazeroth::debug
             std::snprintf(line, sizeof(line), "steady: ground %.2f, aloft %.2f   blowing toward %.0f deg (%s)",
                           wind::SteadyGround(), wind::SteadyAloft(), wind::BearingDegrees(), Compass(wind::BearingDegrees()));
             g_api->UiText(line);
-            std::snprintf(line, sizeof(line), "at player: strength %.2f, gust %.2f   indoor fade %.2f",
-                          w.strength, w.gust, wind::IndoorFactor());
+            std::snprintf(line, sizeof(line), "at player: strength %.2f, gust %.2f   %s",
+                          w.strength, w.gust, w.open > 0.5f ? "open sky" : "ROOFED (sheltered)");
+            g_api->UiText(line);
+
+            int shelterOn = shelter::Enabled() ? 1 : 0;
+            if (g_api->UiCheckbox("Per-point shelter (roof ray)", &shelterOn))
+                shelter::SetEnabled(shelterOn != 0);
+            g_api->UiSameLine();
+            if (g_api->UiButton("Clear shelter cache")) shelter::Clear();
+            const shelter::Stats st = shelter::GetStats();
+            std::snprintf(line, sizeof(line), "shelter cache: %u cells, %u rays this frame, %u deferred",
+                          st.entries, st.raysThisFrame, st.deferredThisFrame);
             g_api->UiText(line);
 
             g_api->UiSeparator();
@@ -152,6 +163,16 @@ namespace wxl_livingazeroth::debug
 
         void AddArrow(std::vector<LineVtx>& v, float cx, float cy, float cz, const wind::Sample& w)
         {
+            if (w.open < 0.5f)
+            {
+                // Roofed over: a small cyan cross, so the roof outline shows up in the grid.
+                const D3DCOLOR c = D3DCOLOR_ARGB(255, 0, 200, 255);
+                const float r = 0.4f;
+                v.push_back({ cx - r, cy - r, cz, c }); v.push_back({ cx + r, cy + r, cz, c });
+                v.push_back({ cx - r, cy + r, cz, c }); v.push_back({ cx + r, cy - r, cz, c });
+                return;
+            }
+
             const float len = 0.6f + w.strength * 5.0f; // yards
             const float hx = w.dirX * len * 0.5f, hy = w.dirY * len * 0.5f;
             const D3DCOLOR c = StrengthColor(w.strength, w.gust);
