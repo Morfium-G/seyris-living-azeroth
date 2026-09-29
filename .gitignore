@@ -65,3 +65,6 @@ Testing/
 
 # session and development notes (local only)
 docs/notes/
+
+# generated test data (regenerate with tools/gen_*.py)
+data/*.cdbc

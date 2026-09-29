@@ -13,7 +13,11 @@
 #include "engine/events/Event.hpp"
 
 #include "debug/DepthView.hpp"
+#include "debug/WindView.hpp"
+#include "env/Wind.hpp"
+#include "env/WorldQuery.hpp"
 #include "render/SceneDepth.hpp"
+#include "wxl_seyris/CdbcApi.hpp"
 
 namespace
 {
@@ -29,10 +33,33 @@ namespace
 
     const WXL_Api* g_api = nullptr;
 
+    // Resolved on the first frame, never in WXL_Load: extensions load alphabetically on one thread,
+    // so GetInterface from WXL_Load can see a false NULL for a module that loads later.
+    void ResolveInterfacesOnce()
+    {
+        static bool done = false;
+        if (done) return;
+        done = true;
+
+        const auto* cdbc = static_cast<const WXL_SeyrisCdbcApi*>(
+            g_api->GetInterface(WXL_SEYRIS_CDBC_INTERFACE_NAME, WXL_SEYRIS_CDBC_INTERFACE_VERSION));
+        wxl_livingazeroth::debug::SetWindCdbc(cdbc);
+        wxl_livingazeroth::wind::LoadProfiles(cdbc);
+    }
+
     // Between frames: the safe moment to swap the depth surface the next world pass will bind.
     void __cdecl OnFrame(void* /*user*/, const void* /*args*/)
     {
+        ResolveInterfacesOnce();
         wxl_livingazeroth::depth::Update();
+    }
+
+    // Once per frame, main thread: refresh the world snapshot, then everything that reads it.
+    void __cdecl OnUpdate(void* /*user*/, const void* args)
+    {
+        const auto* a = static_cast<const ev::UpdateArgs*>(args);
+        const auto& snap = wxl_livingazeroth::world::Refresh();
+        wxl_livingazeroth::wind::Update(a ? a->dt : 0.0f, snap);
     }
 
     void __cdecl OnDeviceLost(void* /*user*/, const void* /*args*/)
@@ -55,7 +82,11 @@ int __cdecl WXL_Load(const WXL_Api* api)
     api->Subscribe(static_cast<uint32_t>(ev::Event::OnFrame), &OnFrame, nullptr);
     api->Subscribe(static_cast<uint32_t>(ev::Event::OnDeviceLost), &OnDeviceLost, nullptr);
 
+    wxl_livingazeroth::wind::Init(api);
+    api->Subscribe(static_cast<uint32_t>(ev::Event::OnUpdate), &OnUpdate, nullptr);
+
     wxl_livingazeroth::debug::RegisterPanel(api);
+    wxl_livingazeroth::debug::RegisterWindPanel(api);
 
     api->Log(WXL_LOG_INFO, "wxl-seyris-living-azeroth", "v1.1 loaded (WXL_Load reached).");
     return 1;
