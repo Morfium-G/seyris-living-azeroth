@@ -1,5 +1,7 @@
 #include "GrassDoodads.hpp"
 
+#include "GrassPerf.hpp"
+
 #include "../wxl_seyris/CdbcApi.hpp"
 
 #include "game/Gx.hpp"
@@ -259,7 +261,11 @@ namespace wxl_livingazeroth::grassdoodads
                 ++tagged;
             }
 
+            const double t0 = grassperf::Now();
             g_origFill(slot, edx);
+            uint32_t vertices = 0;
+            ReadU32(s + 0x08, vertices); // slot vertex count
+            grassperf::OnBuild(grassperf::Now() - t0, count, vertices);
 
             for (uint32_t i = 0; i < tagged; ++i)
                 WriteU32(instances + i * kInstanceStride + kInstanceColor, savedColors[i]);
@@ -323,7 +329,9 @@ namespace wxl_livingazeroth::grassdoodads
                 dev->SetVertexShaderConstantF(kHighlightReg, highlight, 1);
             }
 
+            const double t0 = grassperf::Now();
             g_origDraw(slot, edx);
+            grassperf::OnDraw(grassperf::Now() - t0);
         }
     }
 

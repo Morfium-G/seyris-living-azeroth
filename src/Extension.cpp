@@ -19,6 +19,7 @@
 #include "env/WorldQuery.hpp"
 #include "features/GrassDoodads.hpp"
 #include "features/GrassMotion.hpp"
+#include "features/GrassPerf.hpp"
 #include "render/SceneDepth.hpp"
 #include "render/ShaderPatch.hpp"
 #include "wxl_seyris/CdbcApi.hpp"
@@ -56,6 +57,7 @@ namespace
     void __cdecl OnFrame(void* /*user*/, const void* /*args*/)
     {
         ResolveInterfacesOnce();
+        wxl_livingazeroth::grassperf::OnFrameEnd();
         wxl_livingazeroth::depth::Update();
     }
 

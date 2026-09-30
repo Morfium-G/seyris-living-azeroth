@@ -4,6 +4,7 @@
 
 #include "../features/GrassDoodads.hpp"
 #include "../features/GrassMotion.hpp"
+#include "../features/GrassPerf.hpp"
 #include "../render/ShaderPatch.hpp"
 
 #include "../env/Actors.hpp"
@@ -15,9 +16,12 @@
 #include "game/Camera.hpp"
 #include "game/Gx.hpp"
 
+#include <windows.h>
 #include <d3d9.h>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <string>
 #include <vector>
 
 namespace wxl_livingazeroth::debug
@@ -319,6 +323,85 @@ namespace wxl_livingazeroth::debug
             g_api->UiSliderFloat("Height above feet", &g_heightOffset, 0.0f, 10.0f);
         }
 
+        // --- grass performance -------------------------------------------------------------------
+        std::vector<std::string> GrassPerfReport()
+        {
+            std::vector<std::string> out;
+            char line[256];
+            const grassperf::Summary s = grassperf::Summarize();
+            if (s.frames == 0) { out.emplace_back("no frames recorded yet"); return out; }
+
+            const world::Snapshot& w = world::Current();
+            std::snprintf(line, sizeof(line), "grass performance -- map %d, pos %.0f %.0f %.0f",
+                          w.mapId, w.playerPos[0], w.playerPos[1], w.playerPos[2]);
+            out.emplace_back(line);
+            std::snprintf(line, sizeof(line), "last %u frames: median %.2f ms (%.0f fps), average %.2f ms",
+                          s.frames, s.medianFrameMs, s.medianFrameMs > 0 ? 1000.0 / s.medianFrameMs : 0.0,
+                          s.average.frameMs);
+            out.emplace_back(line);
+            out.emplace_back("AVERAGE PER FRAME");
+            std::snprintf(line, sizeof(line), "  grass pass %.2f ms   chunks %u   layer draws %u (submit %.2f ms)",
+                          s.average.passMs, s.average.chunks, s.average.draws, s.average.drawSubmitMs);
+            out.emplace_back(line);
+            std::snprintf(line, sizeof(line), "  layer builds %u   %.2f ms   plants %u   vertices %u",
+                          s.average.builds, s.average.buildMs, s.average.plantsBuilt, s.average.verticesBuilt);
+            out.emplace_back(line);
+            out.emplace_back("WORST FRAME");
+            std::snprintf(line, sizeof(line), "  frame %.2f ms   grass pass %.2f ms   draws %u (submit %.2f ms)",
+                          s.worst.frameMs, s.worst.passMs, s.worst.draws, s.worst.drawSubmitMs);
+            out.emplace_back(line);
+            std::snprintf(line, sizeof(line), "  layer builds %u   %.2f ms total   %.2f ms slowest   plants %u   vertices %u",
+                          s.worst.builds, s.worst.buildMs, s.worst.worstBuildMs, s.worst.plantsBuilt, s.worst.verticesBuilt);
+            out.emplace_back(line);
+            std::snprintf(line, sizeof(line), "spike frames (> 2x median): %u   share of spike time spent building grass: %.0f%%",
+                          s.spikeFrames, s.spikeBuildShare * 100.0);
+            out.emplace_back(line);
+            return out;
+        }
+
+        bool CopyToClipboard(const std::string& text)
+        {
+            if (!OpenClipboard(nullptr)) return false;
+            EmptyClipboard();
+            HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, text.size() + 1);
+            bool ok = false;
+            if (mem)
+            {
+                if (void* p = GlobalLock(mem))
+                {
+                    std::memcpy(p, text.c_str(), text.size() + 1);
+                    GlobalUnlock(mem);
+                    ok = SetClipboardData(CF_TEXT, mem) != nullptr;
+                }
+                if (!ok) GlobalFree(mem); // on success the clipboard owns it
+            }
+            CloseClipboard();
+            return ok;
+        }
+
+        void __cdecl GrassPerfPanel(void* /*user*/)
+        {
+            const std::vector<std::string> report = GrassPerfReport();
+            for (const std::string& l : report) g_api->UiText(l.c_str());
+
+            static char status[96] = "";
+            if (g_api->UiButton("Reset measurements")) { grassperf::Reset(); status[0] = '\0'; }
+            g_api->UiSameLine();
+            if (g_api->UiButton("Copy report to clipboard"))
+            {
+                std::string text;
+                for (const std::string& l : report) text += l + "\r\n";
+                std::snprintf(status, sizeof(status), CopyToClipboard(text) ? "copied" : "clipboard unavailable");
+            }
+            g_api->UiSameLine();
+            if (g_api->UiButton("Write report to log"))
+            {
+                for (const std::string& l : report) g_api->Log(WXL_LOG_INFO, "wxl-seyris-living-azeroth", "%s", l.c_str());
+                std::snprintf(status, sizeof(status), "written to wxl-core.log");
+            }
+            if (status[0]) g_api->UiText(status);
+        }
+
         // --- world arrows ---------------------------------------------------------------------------
         struct LineVtx { float x, y, z; D3DCOLOR c; };
 
@@ -427,6 +510,7 @@ namespace wxl_livingazeroth::debug
     {
         g_api = api;
         api->UiAddPanel(kPanelTitle, &WindPanel, nullptr);
+        api->UiAddPanel("wxl-seyris-living-azeroth: grass performance", &GrassPerfPanel, nullptr);
         api->Subscribe(static_cast<uint32_t>(ev::Event::OnWorldSceneEnd), &OnWorldSceneEnd, nullptr);
     }
 

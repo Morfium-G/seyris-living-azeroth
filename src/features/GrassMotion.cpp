@@ -1,6 +1,7 @@
 ﻿#include "GrassMotion.hpp"
 
 #include "GrassDoodads.hpp"
+#include "GrassPerf.hpp"
 
 #include "../env/Actors.hpp"
 #include "../env/Wind.hpp"
@@ -215,6 +216,7 @@ namespace wxl_livingazeroth::grass
         // rest of its block; we fill c14..c18 (shipped with every chunk) and rebuild the wind grid.
         void __cdecl hkInitShaderConstants()
         {
+            grassperf::OnPassBegin();
             g_origInit();
 
             g_chunkUploadsLast = g_chunkUploads;
@@ -317,6 +319,7 @@ namespace wxl_livingazeroth::grass
         {
             g_origChunk(mtx, group);
             if (group != 0) return; // the dormant point-light path isn't patched
+            grassperf::OnChunk();
             if (auto* dev = static_cast<IDirect3DDevice9*>(wxl::game::gx::RawDevice()))
             {
                 dev->SetVertexShaderConstantF(kGridFirstReg, &g_grid[0][0], kGrid * kGrid);
