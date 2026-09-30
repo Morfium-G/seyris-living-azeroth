@@ -1,4 +1,4 @@
-#include "GrassMotion.hpp"
+﻿#include "GrassMotion.hpp"
 
 #include "GrassDoodads.hpp"
 
@@ -58,26 +58,9 @@ namespace wxl_livingazeroth::grass
             "    def c36, 0.001, 3.0, 0.3, 8.0\n"                 // eps, push height window, flutter base, grid stride
             "    def c37, 0.15915494, 0.5, 6.2831853, 3.1415927\n" // 1/2pi, 0.5, 2pi, pi
             "    def c38, 6.999, 2025.0, 0.0, 0.0\n"              // grid clamp, actor range^2 (45 yd)
+            "    def c39, 255.0, 0.5, 0.125, 8.0\n"               // doodad index decode (green)
+            "    def c35, 0.25, 4.0, 8.0, 0.0\n"                  // doodad index decode (red/blue)
             "    defi i0, 16, 0, 1, 0\n";                         // actor loop: 16 iterations
-
-        // One doodad-table entry (A = rectangle register, B = mapping register): is the vertex's UV
-        // inside the rectangle, and how far is it from root to tip within it.
-        std::string DoodadEntryAsm(int a, int b)
-        {
-            char buf[512];
-            std::snprintf(buf, sizeof(buf),
-                "    sge r10.xy, v3.xy, c%d.xy\n"
-                "    sge r10.zw, c%d, v3.xyxy\n"
-                "    mul r10.xy, r10, r10.zwzw\n"
-                "    mul r10.x, r10.x, r10.y\n"
-                "    add r11.x, v3.y, -c%d.x\n"
-                "    mul_sat r11.x, r11.x, c%d.y\n"
-                "    mad r12.x, r10.x, r11.x, r12.x\n"
-                "    mad r12.yz, r10.x, c%d.xzwx, r12\n"
-                "    add r12.w, r12.w, r10.x\n",
-                a, a, b, b, b);
-            return buf;
-        }
 
         // Inserted right after the stock "add r0, r0, c3" (view-space position complete in r0).
         std::string BuildBody()
@@ -88,24 +71,31 @@ namespace wxl_livingazeroth::grass
             "    dp3 r2.y, c1, r0\n"
             "    dp3 r2.z, c2, r0\n"
             "    add r2.xyz, r2, c14\n"
-            // Per-doodad table (c104..c111, uploaded before each layer draw): 4 entries of
-            //   A = {uMin, vMin, uMax, vMax} (the doodad's atlas rectangle)
-            //   B = {rootV, 1/(tipV-rootV), windScale, pushScale}
-            // The vertex's UV picks its entry; accumulate into r12 = {raw bend, wind, push, matched}.
-            "    mov r12, c13.x\n"
-            + DoodadEntryAsm(104, 105) + DoodadEntryAsm(106, 107)
-            + DoodadEntryAsm(108, 109) + DoodadEntryAsm(110, 111) +
-            // Overlapping atlas rectangles can match twice: average rather than add.
-            "    max r13.x, r12.w, c13.y\n"
-            "    rcp r13.x, r13.x\n"
-            "    mul r12.xyz, r12, r13.x\n"
-            // No matching entry: fall back to "uv.y is 1 at the root, 0 at the tip", full wind/push.
-            "    min r12.w, r12.w, c13.y\n"
-            "    add r13.x, c13.y, -r12.w\n"
-            "    add r13.y, c13.y, -v3.y\n"
-            "    mad r3.w, r13.x, r13.y, r12.x\n"
-            "    add r13.z, r12.y, r13.x\n"
-            "    add r13.w, r12.z, r13.x\n"
+            // Per-doodad table (c104..c135, uploaded before each layer draw), one register per entry:
+            // {rootV, 1/(tipV-rootV), windScale, pushScale}. The vertex's entry index sits in the
+            // lowest 3 bits of its colour's green channel (tagged when the client built the slot).
+            "    mad r10.x, v2.y, c39.x, c39.y\n"   // green byte + 0.5
+            "    mul r10.x, r10.x, c39.z\n"
+            "    frc r10.x, r10.x\n"
+            "    mul r10.x, r10.x, c39.w\n"         // (green mod 8) + 0.5
+            "    add r10.x, r10.x, -c39.y\n"        // low 3 bits of the index
+            "    mad r10.y, v2.x, c39.x, c39.y\n"   // red (or blue: same bits) byte + 0.5
+            "    mul r10.y, r10.y, c35.x\n"
+            "    frc r10.y, r10.y\n"
+            "    mul r10.y, r10.y, c35.y\n"         // (red mod 4) + 0.5
+            "    add r10.y, r10.y, -c39.y\n"        // high 2 bits
+            "    mad r10.x, r10.y, c35.z, r10.x\n"  // entry index = low + 8 * high
+            "    mova a0.x, r10.x\n"
+            "    mov r11, c104[a0.x]\n"
+            // Bend within the doodad: 0 at its root V, 1 at its tip V.
+            "    add r3.w, v3.y, -r11.x\n"
+            "    mul_sat r3.w, r3.w, r11.y\n"
+            "    mov r13.zw, r11\n"                 // wind and push scale
+            // Debug highlight: r15.w = 1 when this vertex's entry is the highlighted one (c152.x).
+            "    add r15.w, r10.x, -c152.x\n"
+            "    abs r15.w, r15.w\n"
+            "    add r15.w, c13.y, -r15.w\n"
+            "    max r15.w, r15.w, c13.x\n"
             // Stiff base, squared falloff.
             "    add r3.w, r3.w, -c15.x\n"
             "    mul_sat r3.w, r3.w, c15.y\n"
@@ -143,7 +133,7 @@ namespace wxl_livingazeroth::grass
             "    mad r7.z, r7.y, r8.y, c15.z\n"
             "    mul r8.xy, r6, r7.z\n"
             "    mul r8.xy, r8, r13.z\n"
-            // Actor parting: every nearby actor (c112..c127 = xyz + push radius; unused = radius 0,
+            // Actor parting: every nearby actor (c136..c151 = xyz + push radius; unused = radius 0,
             // far away) pushes blades away within its radius, only near its own height. Grass far
             // from the player (where no gathered actor can be) skips the loop entirely.
             "    mov r14, c13.x\n"
@@ -152,17 +142,17 @@ namespace wxl_livingazeroth::grass
             "    mad r15.z, r15.y, r15.y, r15.z\n"
             "    if_lt r15.z, c38.y\n"
             "    loop aL, i0\n"
-            "    add r9.xy, r2, -c112[aL]\n"
+            "    add r9.xy, r2, -c136[aL]\n"
             "    mul r9.z, r9.x, r9.x\n"
             "    mad r9.z, r9.y, r9.y, r9.z\n"
             "    add r9.z, r9.z, c36.x\n"
             "    rsq r9.w, r9.z\n"
             "    mul r9.z, r9.z, r9.w\n"
-            "    rcp r7.w, c112[aL].w\n"
+            "    rcp r7.w, c136[aL].w\n"
             "    mul r9.z, r9.z, r7.w\n"
             "    add r9.z, c13.y, -r9.z\n"
             "    max r9.z, r9.z, c13.x\n"
-            "    add r7.w, r2.z, -c112[aL].z\n"
+            "    add r7.w, r2.z, -c136[aL].z\n"
             "    abs r7.w, r7.w\n"
             "    add r7.w, c36.y, -r7.w\n"
             "    max r7.w, r7.w, c13.x\n"
@@ -179,6 +169,9 @@ namespace wxl_livingazeroth::grass
             "    mul r8.xy, r8, r3.w\n"
             "    mul r4.xyz, c0, r8.x\n"
             "    mad r4.xyz, c1, r8.y, r4\n"
+            // Highlighted doodads are lifted whole (c152.y yards) so they stand out in the world.
+            "    mul r8.z, r15.w, c152.y\n"
+            "    mad r4.xyz, c2, r8.z, r4\n"
             "    add r0.xyz, r0, r4\n";
         }
 
@@ -187,7 +180,7 @@ namespace wxl_livingazeroth::grass
         Settings       g_settings;
         const char*    g_disabled = "not installed yet";
         float          g_grid[kGrid * kGrid][4] = {};
-        constexpr unsigned kActorsFirstReg = 112;  // c112..c127
+        constexpr unsigned kActorsFirstReg = 136;  // c136..c151 (after the 32-entry doodad table)
         float          g_actors[kMaxActors][4] = {};
         unsigned       g_actorsFed = 0;
         unsigned       g_chunkUploads = 0, g_chunkUploadsLast = 0;

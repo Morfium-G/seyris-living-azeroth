@@ -1,0 +1,7 @@
+  <Table Name="GroundEffectDoodadWind" Build="12340">
+    <Field Name="ID" Type="int" IsIndex="true" />
+    <Field Name="Flags" Type="int" />
+    <Field Name="Stiffness" Type="float" />
+    <Field Name="RootV" Type="float" />
+    <Field Name="TipV" Type="float" />
+  </Table>

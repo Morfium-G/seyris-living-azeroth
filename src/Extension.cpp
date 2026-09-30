@@ -17,6 +17,7 @@
 #include "env/Actors.hpp"
 #include "env/Wind.hpp"
 #include "env/WorldQuery.hpp"
+#include "features/GrassDoodads.hpp"
 #include "features/GrassMotion.hpp"
 #include "render/SceneDepth.hpp"
 #include "render/ShaderPatch.hpp"
@@ -48,6 +49,7 @@ namespace
             g_api->GetInterface(WXL_SEYRIS_CDBC_INTERFACE_NAME, WXL_SEYRIS_CDBC_INTERFACE_VERSION));
         wxl_livingazeroth::debug::SetWindCdbc(cdbc);
         wxl_livingazeroth::wind::LoadProfiles(cdbc);
+        wxl_livingazeroth::grassdoodads::LoadOverrides(cdbc);
     }
 
     // Between frames: the safe moment to swap the depth surface the next world pass will bind.

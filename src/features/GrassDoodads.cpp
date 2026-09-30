@@ -1,5 +1,7 @@
 #include "GrassDoodads.hpp"
 
+#include "../wxl_seyris/CdbcApi.hpp"
+
 #include "game/Gx.hpp"
 
 #include <windows.h>
@@ -7,6 +9,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <string>
 #include <unordered_map>
 
 namespace wxl_livingazeroth::grassdoodads
@@ -46,7 +51,24 @@ namespace wxl_livingazeroth::grassdoodads
 
         using SlotFn = void(__fastcall*)(void* slot, void* edx);
 
-        struct SlotDoodads { uint32_t ids[kEntries]; unsigned count; };
+        struct SlotDoodads { uint32_t ids[kDoodadEntries]; unsigned count; };
+
+        constexpr size_t   kInstanceColor = 0x28;
+        // Colour bytes: blue 0..7, green 8..15, red 16..23 (red/blue may swap for the GPU; green
+        // doesn't move, and the high bits go into red AND blue so the swap is harmless).
+        constexpr uint32_t kIndexMask     = 0x00030703u; // green low 3 bits, red + blue low 2 bits
+
+        uint32_t IndexTag(unsigned index)
+        {
+            const uint32_t low = index & 7u, high = (index >> 3) & 3u;
+            return (low << 8) | high | (high << 16);
+        }
+
+        bool WriteU32(uintptr_t address, uint32_t value)
+        {
+            __try { *reinterpret_cast<uint32_t*>(address) = value; return true; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
 
         const WXL_Api* g_api = nullptr;
         SlotFn g_origFill = nullptr;
@@ -54,8 +76,28 @@ namespace wxl_livingazeroth::grassdoodads
 
         std::unordered_map<uint32_t, DoodadInfo>    g_doodads;
         std::unordered_map<const void*, SlotDoodads> g_slots;
-        std::unordered_map<uint32_t, bool> g_windOverride, g_pushOverride, g_flipOverride;
+        std::unordered_map<uint32_t, Override> g_overrides;
+
+        constexpr const char* kOverrideFile = "DBFilesClient\\GroundEffectDoodadWind.cdbc";
+        constexpr WXL_SeyrisCdbcField kOverrideFields[] = {
+            {"ID",        0, WXL_CDBC_FIELD_VALUE},
+            {"Flags",     1, WXL_CDBC_FIELD_VALUE},
+            {"Stiffness", 2, WXL_CDBC_FIELD_VALUE},
+            {"RootV",     3, WXL_CDBC_FIELD_VALUE},
+            {"TipV",      4, WXL_CDBC_FIELD_VALUE},
+        };
+        constexpr WXL_SeyrisCdbcDefinition kOverrideDef = {
+            "GroundEffectDoodadWind", kOverrideFile, kOverrideFields, 5,
+        };
+
+        float    BitsToFloat(uint32_t b) { float f; std::memcpy(&f, &b, sizeof(f)); return f; }
+        uint32_t FloatToBits(float f)    { uint32_t b; std::memcpy(&b, &f, sizeof(b)); return b; }
         unsigned g_tooMany = 0;
+
+        constexpr unsigned kHighlightReg  = 152;   // {entry index or -1, lift in yards, 0, 0}
+        constexpr float    kHighlightLift = 1.5f;
+        uint32_t           g_highlightId = 0;
+        unsigned           g_drawsTracked = 0, g_drawsUntracked = 0;
 
         // --- guarded reads (no C++ objects in these frames: __try needs that) --------------------
         bool ReadU32(uintptr_t address, uint32_t& out)
@@ -108,14 +150,30 @@ namespace wxl_livingazeroth::grassdoodads
             return reinterpret_cast<const char*>(p);
         }
 
+        // Effective values: automatic, unless an override row exists for this doodad.
         void ApplyOverrides(DoodadInfo& d)
         {
-            d.windOn = d.valid && !d.autoFlat;
-            d.pushOn = d.valid && !d.autoFlat;
-            if (auto it = g_windOverride.find(d.id); it != g_windOverride.end()) d.windOn = it->second;
-            if (auto it = g_pushOverride.find(d.id); it != g_pushOverride.end()) d.pushOn = it->second;
-            auto f = g_flipOverride.find(d.id);
-            d.flipped = f != g_flipOverride.end() && f->second;
+            d.effRootV = d.rootV;
+            d.effTipV = d.tipV;
+            auto it = g_overrides.find(d.id);
+            d.hasOverride = it != g_overrides.end();
+            if (!d.hasOverride)
+            {
+                d.windOn = d.valid && !d.autoFlat;
+                d.pushOn = d.valid && !d.autoFlat;
+                d.flipped = false;
+                d.stiffness = 0.0f;
+                return;
+            }
+            const Override& o = it->second;
+            if (o.rootV >= 0.0f) d.effRootV = o.rootV;
+            if (o.tipV >= 0.0f)  d.effTipV = o.tipV;
+            // A manual mapping makes the doodad usable even if the automatic one failed.
+            const bool usable = d.valid || (o.rootV >= 0.0f && o.tipV >= 0.0f);
+            d.windOn = usable && !(o.flags & kNoWind);
+            d.pushOn = usable && !(o.flags & kNoPush);
+            d.flipped = (o.flags & kFlip) != 0;
+            d.stiffness = o.stiffness < 0.0f ? 0.0f : (o.stiffness > 1.0f ? 1.0f : o.stiffness);
         }
 
         void Analyze(uint32_t id)
@@ -163,27 +221,48 @@ namespace wxl_livingazeroth::grassdoodads
                        d.autoFlat ? " -> flat, no wind" : (d.valid ? "" : " -> no usable root/tip, default bend"));
         }
 
-        // After the client (re)builds a slot's grass: note its doodads, analyse any new ones.
+        // Around the client's (re)build of a slot's grass: tag every instance's colour with its entry
+        // index (green low bits, copied into all its vertices by the build), then restore the
+        // colours. Also records the slot's doodads and analyses new ones.
         void __fastcall hkFill(void* slot, void* edx)
         {
-            g_origFill(slot, edx);
-
             uint32_t count = 0, instances = 0;
             const uintptr_t s = reinterpret_cast<uintptr_t>(slot);
-            if (!ReadU32(s + kSlotInstanceCount, count) || !ReadU32(s + kSlotInstances, instances) || !instances) return;
+            if (!ReadU32(s + kSlotInstanceCount, count) || !ReadU32(s + kSlotInstances, instances) || !instances
+                || count > 65536)
+            {
+                g_origFill(slot, edx);
+                return;
+            }
 
             SlotDoodads sd{};
             bool overflow = false;
-            for (uint32_t i = 0; i < count && i < 8192; ++i)
+            std::vector<uint32_t> savedColors(count);
+            uint32_t tagged = 0;
+            for (uint32_t i = 0; i < count; ++i)
             {
-                uint32_t id = 0;
-                if (!ReadU32(instances + i * kInstanceStride + kInstanceDoodadId, id)) break;
-                bool known = false;
-                for (unsigned k = 0; k < sd.count; ++k) known |= sd.ids[k] == id;
-                if (known) continue;
-                if (sd.count < kEntries) sd.ids[sd.count++] = id;
-                else overflow = true;
+                const uintptr_t rec = instances + i * kInstanceStride;
+                uint32_t id = 0, color = 0;
+                if (!ReadU32(rec + kInstanceDoodadId, id) || !ReadU32(rec + kInstanceColor, color)) break;
+
+                unsigned index = kFallbackEntry;
+                for (unsigned k = 0; k < sd.count; ++k)
+                    if (sd.ids[k] == id) { index = k; break; }
+                if (index == kFallbackEntry)
+                {
+                    if (sd.count < kDoodadEntries) { index = sd.count; sd.ids[sd.count++] = id; }
+                    else overflow = true;
+                }
+
+                savedColors[i] = color;
+                if (!WriteU32(rec + kInstanceColor, (color & ~kIndexMask) | IndexTag(index))) break;
+                ++tagged;
             }
+
+            g_origFill(slot, edx);
+
+            for (uint32_t i = 0; i < tagged; ++i)
+                WriteU32(instances + i * kInstanceStride + kInstanceColor, savedColors[i]);
             if (overflow) ++g_tooMany;
 
             for (unsigned k = 0; k < sd.count; ++k)
@@ -195,17 +274,15 @@ namespace wxl_livingazeroth::grassdoodads
             g_slots[slot] = sd;
         }
 
-        // Before each layer draw: hand the shader this slot's doodad table. Unused entries get an
-        // impossible rectangle so no vertex matches them.
+        // Before each layer draw: hand the shader this slot's doodad table, one register per entry:
+        // {rootV, 1/(tipV-rootV), windScale, pushScale}. The fallback entry reproduces the old rule
+        // (root at v = 1, tip at v = 0, full wind and push); unused entries get it too.
         void __fastcall hkDraw(void* slot, void* edx)
         {
-            float table[kEntries * 2][4];
+            float table[kEntries][4];
             for (unsigned k = 0; k < kEntries; ++k)
             {
-                float* a = table[k * 2];
-                float* b = table[k * 2 + 1];
-                a[0] = 2.0f; a[1] = 2.0f; a[2] = -1.0f; a[3] = -1.0f;
-                b[0] = 0.0f; b[1] = 0.0f; b[2] = 0.0f; b[3] = 0.0f;
+                table[k][0] = 1.0f; table[k][1] = -1.0f; table[k][2] = 1.0f; table[k][3] = 1.0f;
             }
 
             auto it = g_slots.find(slot);
@@ -217,23 +294,34 @@ namespace wxl_livingazeroth::grassdoodads
                     if (d == g_doodads.end()) continue;
                     DoodadInfo& info = d->second;
                     if (!info.analyzed) Analyze(info.id); // its model may have loaded since
-                    if (!info.valid) continue;             // falls back to the default bend
+                    if (!info.analyzed || (!info.valid && !info.hasOverride)) continue; // fallback rule
 
-                    float* a = table[k * 2];
-                    float* b = table[k * 2 + 1];
-                    a[0] = info.uMin; a[1] = info.vMin; a[2] = info.uMax; a[3] = info.vMax;
-                    const float rootV = info.flipped ? info.tipV : info.rootV;
-                    const float tipV  = info.flipped ? info.rootV : info.tipV;
+                    const float rootV = info.flipped ? info.effTipV : info.effRootV;
+                    const float tipV  = info.flipped ? info.effRootV : info.effTipV;
                     const float span = tipV - rootV;
-                    b[0] = rootV;
-                    b[1] = std::abs(span) > 1e-4f ? 1.0f / span : 0.0f;
-                    b[2] = info.windOn ? 1.0f : 0.0f;
-                    b[3] = info.pushOn ? 1.0f : 0.0f;
+                    const float flex = 1.0f - info.stiffness; // stiff plants bend less from anything
+                    table[k][0] = rootV;
+                    table[k][1] = std::abs(span) > 1e-4f ? 1.0f / span : 0.0f;
+                    table[k][2] = info.windOn ? flex : 0.0f;
+                    table[k][3] = info.pushOn ? flex : 0.0f;
                 }
             }
 
+            if (it != g_slots.end()) ++g_drawsTracked; else ++g_drawsUntracked;
+
+            // Debug highlight: which entry (if any) of this slot is the highlighted doodad.
+            float highlight[4] = { -1.0f, kHighlightLift, 0.0f, 0.0f };
+            if (g_highlightId == kHighlightFallbackId)
+                highlight[0] = static_cast<float>(kFallbackEntry);
+            else if (g_highlightId && it != g_slots.end())
+                for (unsigned k = 0; k < it->second.count; ++k)
+                    if (it->second.ids[k] == g_highlightId) highlight[0] = static_cast<float>(k);
+
             if (auto* dev = static_cast<IDirect3DDevice9*>(wxl::game::gx::RawDevice()))
-                dev->SetVertexShaderConstantF(kFirstReg, &table[0][0], kEntries * 2);
+            {
+                dev->SetVertexShaderConstantF(kFirstReg, &table[0][0], kEntries);
+                dev->SetVertexShaderConstantF(kHighlightReg, highlight, 1);
+            }
 
             g_origDraw(slot, edx);
         }
@@ -262,22 +350,124 @@ namespace wxl_livingazeroth::grassdoodads
         return out;
     }
 
-    void SetWind(uint32_t id, bool on)
+    void SetOverride(uint32_t id, const Override& o)
     {
-        g_windOverride[id] = on;
+        g_overrides[id] = o;
         if (auto it = g_doodads.find(id); it != g_doodads.end()) ApplyOverrides(it->second);
     }
 
-    void SetPush(uint32_t id, bool on)
+    void ClearOverride(uint32_t id)
     {
-        g_pushOverride[id] = on;
+        g_overrides.erase(id);
         if (auto it = g_doodads.find(id); it != g_doodads.end()) ApplyOverrides(it->second);
     }
 
-    void SetFlip(uint32_t id, bool flipped)
+    bool GetOverride(uint32_t id, Override& out)
     {
-        g_flipOverride[id] = flipped;
-        if (auto it = g_doodads.find(id); it != g_doodads.end()) ApplyOverrides(it->second);
+        auto it = g_overrides.find(id);
+        if (it == g_overrides.end()) return false;
+        out = it->second;
+        return true;
+    }
+
+    Override CurrentAsOverride(uint32_t id)
+    {
+        Override o;
+        if (GetOverride(id, o)) return o;
+        auto it = g_doodads.find(id);
+        if (it != g_doodads.end())
+        {
+            const DoodadInfo& d = it->second;
+            if (!d.windOn) o.flags |= kNoWind;
+            if (!d.pushOn) o.flags |= kNoPush;
+        }
+        return o;
+    }
+
+    void LoadOverrides(const void* cdbcApi)
+    {
+        const auto* cdbc = static_cast<const WXL_SeyrisCdbcApi*>(cdbcApi);
+        if (!cdbc || !cdbc->HasFeature("cdbc-load")) return;
+
+        char err[256] = {};
+        void* table = cdbc->Load(&kOverrideDef, err, sizeof(err));
+        if (!table)
+        {
+            g_api->Log(WXL_LOG_INFO, kTag, "grass doodads: no overrides loaded (%s).", err);
+            return;
+        }
+        g_overrides.clear();
+        const uint32_t count = cdbc->RowCount(table);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const void* row = cdbc->RowAt(table, i);
+            if (!row) continue;
+            Override o;
+            const uint32_t id = cdbc->Value(table, row, "ID", 0);
+            o.flags     = cdbc->Value(table, row, "Flags", 0);
+            o.stiffness = BitsToFloat(cdbc->Value(table, row, "Stiffness", 0));
+            o.rootV     = BitsToFloat(cdbc->Value(table, row, "RootV", 0));
+            o.tipV      = BitsToFloat(cdbc->Value(table, row, "TipV", 0));
+            g_overrides[id] = o;
+        }
+        cdbc->Release(table);
+        for (auto& [id, d] : g_doodads) ApplyOverrides(d);
+        g_api->Log(WXL_LOG_INFO, kTag, "grass doodads: %u override row(s) loaded from GroundEffectDoodadWind.cdbc.", count);
+    }
+
+    bool SaveOverrides(char* message, size_t messageSize)
+    {
+        // Plain WDBC: 20-byte header, 5 x 4-byte columns per row sorted by ID, an empty string block.
+        std::vector<uint32_t> ids;
+        for (const auto& [id, o] : g_overrides) ids.push_back(id);
+        std::sort(ids.begin(), ids.end());
+
+        std::vector<uint8_t> file;
+        auto put = [&](uint32_t v) { const uint8_t* b = reinterpret_cast<const uint8_t*>(&v); file.insert(file.end(), b, b + 4); };
+        file.insert(file.end(), { 'W', 'D', 'B', 'C' });
+        put(static_cast<uint32_t>(ids.size())); // records
+        put(5);                                 // fields
+        put(20);                                // record size
+        put(1);                                 // string block size
+        for (uint32_t id : ids)
+        {
+            const Override& o = g_overrides[id];
+            put(id); put(o.flags); put(FloatToBits(o.stiffness)); put(FloatToBits(o.rootV)); put(FloatToBits(o.tipV));
+        }
+        file.push_back(0); // string block: just the empty string
+
+        CreateDirectoryA("DBFilesClient", nullptr);
+        const std::string backup = std::string(kOverrideFile) + ".bak";
+        CopyFileA(kOverrideFile, backup.c_str(), FALSE); // ignore failure: no previous file
+
+        FILE* f = nullptr;
+        if (fopen_s(&f, kOverrideFile, "wb") != 0 || !f)
+        {
+            std::snprintf(message, messageSize, "couldn't open %s for writing", kOverrideFile);
+            return false;
+        }
+        const size_t written = std::fwrite(file.data(), 1, file.size(), f);
+        std::fclose(f);
+        if (written != file.size())
+        {
+            std::snprintf(message, messageSize, "short write to %s", kOverrideFile);
+            return false;
+        }
+        std::snprintf(message, messageSize, "saved %u row(s) to %s", static_cast<unsigned>(ids.size()), kOverrideFile);
+        g_api->Log(WXL_LOG_INFO, kTag, "grass doodads: %s", message);
+        return true;
+    }
+
+    unsigned OverrideCount() { return static_cast<unsigned>(g_overrides.size()); }
+
+    void     SetHighlight(uint32_t id) { g_highlightId = id; }
+    uint32_t Highlighted()             { return g_highlightId; }
+
+    void FrameCounters(unsigned& tracked, unsigned& untracked)
+    {
+        tracked = g_drawsTracked;
+        untracked = g_drawsUntracked;
+        g_drawsTracked = g_drawsUntracked = 0;
     }
 
     unsigned SlotsTracked()            { return static_cast<unsigned>(g_slots.size()); }

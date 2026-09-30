@@ -226,12 +226,39 @@ namespace wxl_livingazeroth::debug
                 if (g_api->UiCollapsingHeader("Grass doodads seen (per GroundEffectDoodad ID)"))
                 {
                     std::snprintf(line, sizeof(line), "layer slots tracked: %u, slots with more than %u doodads: %u",
-                                  grassdoodads::SlotsTracked(), grassdoodads::kEntries,
+                                  grassdoodads::SlotsTracked(), grassdoodads::kDoodadEntries,
                                   grassdoodads::SlotsWithTooManyDoodads());
                     g_api->UiText(line);
+                    // Diagnostics: layer draws whose build we never saw use the fallback entry.
+                    {
+                        unsigned tracked = 0, untracked = 0;
+                        grassdoodads::FrameCounters(tracked, untracked);
+                        std::snprintf(line, sizeof(line), "layer draws since last panel frame: %u tracked, %u UNTRACKED",
+                                      tracked, untracked);
+                        g_api->UiText(line);
+                        const bool fb = grassdoodads::Highlighted() == grassdoodads::kHighlightFallbackId;
+                        if (g_api->UiButton(fb ? "stop highlighting fallback##hf" : "highlight fallback (untagged / overflow)##hf"))
+                            grassdoodads::SetHighlight(fb ? 0 : grassdoodads::kHighlightFallbackId);
+                    }
+
+                    // Overrides file: every change below becomes an override row for that doodad.
+                    static char saveMessage[160] = "";
+                    std::snprintf(line, sizeof(line), "GroundEffectDoodadWind.cdbc: %u override row(s) in memory",
+                                  grassdoodads::OverrideCount());
+                    g_api->UiText(line);
+                    if (g_api->UiButton("Save overrides"))
+                        grassdoodads::SaveOverrides(saveMessage, sizeof(saveMessage));
+                    g_api->UiSameLine();
+                    if (g_api->UiButton("Reload overrides"))
+                    {
+                        grassdoodads::LoadOverrides(g_cdbc);
+                        std::snprintf(saveMessage, sizeof(saveMessage), "reloaded: %u row(s)", grassdoodads::OverrideCount());
+                    }
+                    if (saveMessage[0]) g_api->UiTextWrapped(saveMessage);
+
                     for (const grassdoodads::DoodadInfo& d : grassdoodads::Seen())
                     {
-                        std::snprintf(line, sizeof(line), "#%u %s", d.id, d.modelPath);
+                        std::snprintf(line, sizeof(line), "#%u %s%s", d.id, d.modelPath, d.hasOverride ? "   [override]" : "");
                         g_api->UiTextWrapped(line);
                         if (!d.analyzed)
                             std::snprintf(line, sizeof(line), "   model not loaded yet");
@@ -241,17 +268,41 @@ namespace wxl_livingazeroth::debug
                                           d.autoFlat ? "  FLAT" : "", d.valid ? "" : "  (default bend)");
                         g_api->UiText(line);
 
+                        grassdoodads::Override o = grassdoodads::CurrentAsOverride(d.id);
+                        bool changed = false;
                         char label[48];
-                        int wind = d.windOn ? 1 : 0, push = d.pushOn ? 1 : 0;
+
+                        int wind = (o.flags & grassdoodads::kNoWind) ? 0 : 1;
                         std::snprintf(label, sizeof(label), "wind##w%u", d.id);
-                        if (g_api->UiCheckbox(label, &wind)) grassdoodads::SetWind(d.id, wind != 0);
+                        if (g_api->UiCheckbox(label, &wind))
+                        { o.flags = wind ? (o.flags & ~grassdoodads::kNoWind) : (o.flags | grassdoodads::kNoWind); changed = true; }
                         g_api->UiSameLine();
+
+                        int push = (o.flags & grassdoodads::kNoPush) ? 0 : 1;
                         std::snprintf(label, sizeof(label), "push##p%u", d.id);
-                        if (g_api->UiCheckbox(label, &push)) grassdoodads::SetPush(d.id, push != 0);
+                        if (g_api->UiCheckbox(label, &push))
+                        { o.flags = push ? (o.flags & ~grassdoodads::kNoPush) : (o.flags | grassdoodads::kNoPush); changed = true; }
                         g_api->UiSameLine();
-                        int flip = d.flipped ? 1 : 0;
+
+                        int flip = (o.flags & grassdoodads::kFlip) ? 1 : 0;
                         std::snprintf(label, sizeof(label), "flip root/tip##f%u", d.id);
-                        if (g_api->UiCheckbox(label, &flip)) grassdoodads::SetFlip(d.id, flip != 0);
+                        if (g_api->UiCheckbox(label, &flip))
+                        { o.flags = flip ? (o.flags | grassdoodads::kFlip) : (o.flags & ~grassdoodads::kFlip); changed = true; }
+
+                        std::snprintf(label, sizeof(label), "stiffness##s%u", d.id);
+                        if (g_api->UiSliderFloat(label, &o.stiffness, 0.0f, 1.0f)) changed = true;
+
+                        if (changed) grassdoodads::SetOverride(d.id, o);
+
+                        const bool lit = grassdoodads::Highlighted() == d.id;
+                        std::snprintf(label, sizeof(label), "%s##h%u", lit ? "stop highlight" : "highlight (lift in world)", d.id);
+                        if (g_api->UiButton(label)) grassdoodads::SetHighlight(lit ? 0 : d.id);
+                        if (d.hasOverride) g_api->UiSameLine();
+                        if (d.hasOverride)
+                        {
+                            std::snprintf(label, sizeof(label), "back to automatic##a%u", d.id);
+                            if (g_api->UiButton(label)) grassdoodads::ClearOverride(d.id);
+                        }
                     }
                 }
             }
