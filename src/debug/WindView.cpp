@@ -6,6 +6,7 @@
 #include "../features/GrassMotion.hpp"
 #include "../render/ShaderPatch.hpp"
 
+#include "../env/Actors.hpp"
 #include "../env/Shelter.hpp"
 #include "../env/Wind.hpp"
 #include "../env/WorldQuery.hpp"
@@ -190,8 +191,32 @@ namespace wxl_livingazeroth::debug
                 g_api->UiSliderFloat("Flutter (yards)", &gs.flutter, 0.0f, 0.4f);
                 g_api->UiSliderFloat("Flutter speed", &gs.flutterSpeed, 0.0f, 12.0f);
                 g_api->UiSliderFloat("Stiff base (fraction)", &gs.anchor, 0.0f, 0.8f);
-                g_api->UiSliderFloat("Player push (yards)", &gs.pushStrength, 0.0f, 1.5f);
-                g_api->UiSliderFloat("Player push radius", &gs.pushRadius, 0.3f, 5.0f);
+                g_api->UiSliderFloat("Push strength (yards)", &gs.pushStrength, 0.0f, 1.5f);
+                g_api->UiSliderFloat("Push radius x bounding radius", &gs.radiusScale, 0.5f, 5.0f);
+                g_api->UiSliderFloat("Minimum push radius", &gs.minRadius, 0.1f, 3.0f);
+                g_api->UiSliderFloat("Mounted radius factor", &gs.mountedScale, 1.0f, 4.0f);
+
+                if (g_api->UiCollapsingHeader("Actors pushing grass"))
+                {
+                    std::snprintf(line, sizeof(line), "fed to the shader: %u (max %u, within %.0f yd)",
+                                  grass::ActorsFed(), grass::kMaxActors, grass::kActorRange);
+                    g_api->UiText(line);
+                    unsigned shown = 0;
+                    for (const actors::Actor& act : actors::Nearby())
+                    {
+                        if (++shown > 10) break;
+                        std::snprintf(line, sizeof(line), "%5.1f yd  bounding radius %.3f  combat reach %.2f%s%s",
+                                      act.distance, act.boundingRadius, act.combatReach,
+                                      act.mounted ? "  MOUNTED" : "", act.isPlayer ? "  (you)" : "");
+                        g_api->UiText(line);
+                        if (act.displayId != act.nativeDisplayId)
+                        {
+                            std::snprintf(line, sizeof(line), "        morphed: display %u (width %.2f) vs native %u (width %.2f) -> radius %.3f",
+                                          act.displayId, act.widthNow, act.nativeDisplayId, act.widthNative, act.effectiveRadius);
+                            g_api->UiText(line);
+                        }
+                    }
+                }
                 int ignoreUv = gs.debugIgnoreUv ? 1 : 0;
                 if (g_api->UiCheckbox("Ignore UV bend (debug: whole blades move)", &ignoreUv))
                     gs.debugIgnoreUv = ignoreUv != 0;

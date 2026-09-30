@@ -17,8 +17,10 @@ namespace wxl_livingazeroth::grass
         float flutter       = 0.08f;  // extra per-blade shimmer, yards
         float flutterSpeed  = 3.0f;   // shimmer speed, radians per second
         float anchor        = 0.15f;  // bottom fraction of a blade that never moves
-        float pushStrength  = 0.5f;   // how far blades lean away from the player, yards
-        float pushRadius    = 1.6f;   // player influence radius, yards
+        float pushStrength  = 0.5f;   // how far blades lean away from an actor, yards
+        float radiusScale   = 2.0f;   // push radius = bounding radius x this
+        float minRadius     = 0.5f;   // smallest push radius, yards
+        float mountedScale  = 2.0f;   // extra radius factor while mounted
         bool  debugIgnoreUv = false;  // diagnostic: bend whole blades, ignoring the UV root/tip weight
     };
 
@@ -32,4 +34,11 @@ namespace wxl_livingazeroth::grass
     /// Why grass motion is off, or null when it's installed.
     const char* DisabledReason();
     unsigned ChunkUploadsLastFrame();
+
+    /// Actors fed to the grass shader last frame (the player counts as one).
+    unsigned ActorsFed();
+
+    /// Actors are gathered within this range of the player; grass farther away skips the actor loop.
+    constexpr float kActorRange = 40.0f;
+    constexpr unsigned kMaxActors = 16;
 }

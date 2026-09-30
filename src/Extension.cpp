@@ -14,6 +14,7 @@
 
 #include "debug/DepthView.hpp"
 #include "debug/WindView.hpp"
+#include "env/Actors.hpp"
 #include "env/Wind.hpp"
 #include "env/WorldQuery.hpp"
 #include "features/GrassMotion.hpp"
@@ -62,6 +63,8 @@ namespace
         const auto* a = static_cast<const ev::UpdateArgs*>(args);
         const auto& snap = wxl_livingazeroth::world::Refresh();
         wxl_livingazeroth::wind::Update(a ? a->dt : 0.0f, snap);
+        if (snap.inWorld)
+            wxl_livingazeroth::actors::Refresh(snap.playerPos, wxl_livingazeroth::grass::kActorRange);
     }
 
     void __cdecl OnDeviceLost(void* /*user*/, const void* /*args*/)

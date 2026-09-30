@@ -2,6 +2,7 @@
 
 #include "GrassDoodads.hpp"
 
+#include "../env/Actors.hpp"
 #include "../env/Wind.hpp"
 #include "../env/WorldQuery.hpp"
 #include "../render/ShaderPatch.hpp"
@@ -47,7 +48,7 @@ namespace wxl_livingazeroth::grass
         //     c15 = anchor, 1/(1-anchor), amplitude, flutter
         //     c16 = 1/spacing, 1/spacing, grid offset x, grid offset y
         //     c17 = flutter speed, phase-per-yard x, phase-per-yard y, push strength
-        //     c18 = player xyz, push radius
+        //     c18 = player xyz (centre of the actor range), unused
         //     c19 = debug: x = ignore UV bend weight (0/1)
         //   our own upload: c40..c103 = the wind grid
         //   shader defs: c36..c38
@@ -56,7 +57,8 @@ namespace wxl_livingazeroth::grass
         const char* kPrologue =
             "    def c36, 0.001, 3.0, 0.3, 8.0\n"                 // eps, push height window, flutter base, grid stride
             "    def c37, 0.15915494, 0.5, 6.2831853, 3.1415927\n" // 1/2pi, 0.5, 2pi, pi
-            "    def c38, 6.999, 0.0, 0.0, 0.0\n";                // grid clamp
+            "    def c38, 6.999, 2025.0, 0.0, 0.0\n"              // grid clamp, actor range^2 (45 yd)
+            "    defi i0, 16, 0, 1, 0\n";                         // actor loop: 16 iterations
 
         // One doodad-table entry (A = rectangle register, B = mapping register): is the vertex's UV
         // inside the rectangle, and how far is it from root to tip within it.
@@ -141,27 +143,38 @@ namespace wxl_livingazeroth::grass
             "    mad r7.z, r7.y, r8.y, c15.z\n"
             "    mul r8.xy, r6, r7.z\n"
             "    mul r8.xy, r8, r13.z\n"
-            // Player parting: lean away within the radius, only near the player's height.
-            "    add r9.xy, r2, -c18\n"
+            // Actor parting: every nearby actor (c112..c127 = xyz + push radius; unused = radius 0,
+            // far away) pushes blades away within its radius, only near its own height. Grass far
+            // from the player (where no gathered actor can be) skips the loop entirely.
+            "    mov r14, c13.x\n"
+            "    add r15.xy, r2, -c18\n"
+            "    mul r15.z, r15.x, r15.x\n"
+            "    mad r15.z, r15.y, r15.y, r15.z\n"
+            "    if_lt r15.z, c38.y\n"
+            "    loop aL, i0\n"
+            "    add r9.xy, r2, -c112[aL]\n"
             "    mul r9.z, r9.x, r9.x\n"
             "    mad r9.z, r9.y, r9.y, r9.z\n"
             "    add r9.z, r9.z, c36.x\n"
             "    rsq r9.w, r9.z\n"
             "    mul r9.z, r9.z, r9.w\n"
-            "    rcp r7.w, c18.w\n"
+            "    rcp r7.w, c112[aL].w\n"
             "    mul r9.z, r9.z, r7.w\n"
             "    add r9.z, c13.y, -r9.z\n"
             "    max r9.z, r9.z, c13.x\n"
-            "    add r7.w, r2.z, -c18.z\n"
+            "    add r7.w, r2.z, -c112[aL].z\n"
             "    abs r7.w, r7.w\n"
             "    add r7.w, c36.y, -r7.w\n"
             "    max r7.w, r7.w, c13.x\n"
             "    min r7.w, r7.w, c13.y\n"
             "    mul r9.z, r9.z, r7.w\n"
-            "    mul r9.z, r9.z, c17.w\n"
-            "    mul r9.z, r9.z, r13.w\n"
             "    mul r9.z, r9.z, r9.w\n"
-            "    mad r8.xy, r9, r9.z, r8\n"
+            "    mad r14.xy, r9, r9.z, r14\n"
+            "    endloop\n"
+            "    endif\n"
+            "    mul r14.xy, r14, c17.w\n"
+            "    mul r14.xy, r14, r13.w\n"
+            "    add r8.xy, r8, r14\n"
             // Apply the bend weight and rotate the world-space offset back into view space.
             "    mul r8.xy, r8, r3.w\n"
             "    mul r4.xyz, c0, r8.x\n"
@@ -174,6 +187,9 @@ namespace wxl_livingazeroth::grass
         Settings       g_settings;
         const char*    g_disabled = "not installed yet";
         float          g_grid[kGrid * kGrid][4] = {};
+        constexpr unsigned kActorsFirstReg = 112;  // c112..c127
+        float          g_actors[kMaxActors][4] = {};
+        unsigned       g_actorsFed = 0;
         unsigned       g_chunkUploads = 0, g_chunkUploadsLast = 0;
 
         ge::InitShaderConstantsFn  g_origInit = nullptr;
@@ -236,11 +252,29 @@ namespace wxl_livingazeroth::grass
                 { anchor, 1.0f / (1.0f - anchor), on ? p.amplitude : 0.0f, on ? p.flutter : 0.0f },
                 { inv, inv, originX * inv + 0.5f, originY * inv + 0.5f },
                 { p.flutterSpeed, 0.61f, 0.37f, on ? p.pushStrength : 0.0f },
-                { s.playerPos[0], s.playerPos[1], s.playerPos[2], p.pushRadius > 0.1f ? p.pushRadius : 0.1f },
+                { s.playerPos[0], s.playerPos[1], s.playerPos[2], 0.0f },
                 { p.debugIgnoreUv ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f },
             };
             float* block = reinterpret_cast<float*>(ge::kVsConstantBlock) + ge::kVsFirstFreeReg * 4;
             std::memcpy(block, c, sizeof(c));
+
+            // Actors: nearest first, push radius from their bounding radius. Unused slots are far away
+            // with radius 0, so they never push anything.
+            g_actorsFed = 0;
+            for (unsigned i = 0; i < kMaxActors; ++i)
+            {
+                float* a = g_actors[i];
+                a[0] = a[1] = a[2] = 1.0e5f; a[3] = 0.0f;
+            }
+            if (on)
+                for (const actors::Actor& act : actors::Nearby())
+                {
+                    if (g_actorsFed >= kMaxActors) break;
+                    float r = act.effectiveRadius * p.radiusScale * (act.mounted ? p.mountedScale : 1.0f);
+                    if (r < p.minRadius) r = p.minRadius;
+                    float* a = g_actors[g_actorsFed++];
+                    a[0] = act.pos[0]; a[1] = act.pos[1]; a[2] = act.pos[2]; a[3] = r;
+                }
 
             // Wind grid from the full model (weather, gusts, shelter, lee), sampled at each cell's
             // ground height and eased toward its target so changes blend instead of snapping.
@@ -293,6 +327,7 @@ namespace wxl_livingazeroth::grass
             if (auto* dev = static_cast<IDirect3DDevice9*>(wxl::game::gx::RawDevice()))
             {
                 dev->SetVertexShaderConstantF(kGridFirstReg, &g_grid[0][0], kGrid * kGrid);
+                dev->SetVertexShaderConstantF(kActorsFirstReg, &g_actors[0][0], kMaxActors);
                 ++g_chunkUploads;
             }
         }
@@ -335,4 +370,5 @@ namespace wxl_livingazeroth::grass
     Settings&   Tunables()              { return g_settings; }
     const char* DisabledReason()        { return g_disabled; }
     unsigned    ChunkUploadsLastFrame() { return g_chunkUploadsLast; }
+    unsigned    ActorsFed()             { return g_actorsFed; }
 }
