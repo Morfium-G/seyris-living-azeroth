@@ -16,7 +16,9 @@
 #include "debug/WindView.hpp"
 #include "env/Wind.hpp"
 #include "env/WorldQuery.hpp"
+#include "features/GrassMotion.hpp"
 #include "render/SceneDepth.hpp"
+#include "render/ShaderPatch.hpp"
 #include "wxl_seyris/CdbcApi.hpp"
 
 namespace
@@ -84,6 +86,10 @@ int __cdecl WXL_Load(const WXL_Api* api)
 
     wxl_livingazeroth::wind::Init(api);
     api->Subscribe(static_cast<uint32_t>(ev::Event::OnUpdate), &OnUpdate, nullptr);
+
+    // Features register their shader patches first; the single create hook goes in after.
+    wxl_livingazeroth::grass::Install(api);
+    wxl_livingazeroth::shaderpatch::Install(api);
 
     wxl_livingazeroth::debug::RegisterPanel(api);
     wxl_livingazeroth::debug::RegisterWindPanel(api);

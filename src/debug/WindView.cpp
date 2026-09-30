@@ -2,6 +2,9 @@
 
 #include "ShaderDump.hpp"
 
+#include "../features/GrassMotion.hpp"
+#include "../render/ShaderPatch.hpp"
+
 #include "../env/Shelter.hpp"
 #include "../env/Wind.hpp"
 #include "../env/WorldQuery.hpp"
@@ -153,6 +156,38 @@ namespace wxl_livingazeroth::debug
                                       cur.value[f], tgt.value[f], SourceText(tgt.source[f]));
                     g_api->UiText(line);
                 }
+            }
+
+            g_api->UiSeparator();
+
+            // --- grass motion ---
+            if (const char* why = grass::DisabledReason())
+            {
+                std::snprintf(line, sizeof(line), "Grass motion OFF: %s", why);
+                g_api->UiTextWrapped(line);
+            }
+            else
+            {
+                for (const shaderpatch::RuleStatus& st : shaderpatch::Status())
+                {
+                    std::snprintf(line, sizeof(line), "shader patch '%s': %u applied, %u failed%s%s",
+                                  st.name.c_str(), st.applied, st.failed,
+                                  st.lastError.empty() ? "" : " -- ", st.lastError.c_str());
+                    g_api->UiTextWrapped(line);
+                }
+                std::snprintf(line, sizeof(line), "grass chunks fed last frame: %u", grass::ChunkUploadsLastFrame());
+                g_api->UiText(line);
+
+                grass::Settings& gs = grass::Tunables();
+                int grassOn = gs.enabled ? 1 : 0;
+                if (g_api->UiCheckbox("Grass motion", &grassOn)) gs.enabled = grassOn != 0;
+                g_api->UiSliderFloat("Sway (yards at full wind)", &gs.amplitude, 0.0f, 1.5f);
+                g_api->UiSliderFloat("Flutter (yards)", &gs.flutter, 0.0f, 0.4f);
+                g_api->UiSliderFloat("Flutter speed", &gs.flutterSpeed, 0.0f, 12.0f);
+                g_api->UiSliderFloat("Stiff base (fraction)", &gs.anchor, 0.0f, 0.8f);
+                g_api->UiSliderFloat("Player push (yards)", &gs.pushStrength, 0.0f, 1.5f);
+                g_api->UiSliderFloat("Player push radius", &gs.pushRadius, 0.3f, 5.0f);
+                if (g_api->UiButton("Reset grass defaults")) gs = grass::Settings{};
             }
 
             g_api->UiSeparator();
