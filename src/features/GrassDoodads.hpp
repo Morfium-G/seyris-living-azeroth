@@ -29,6 +29,28 @@ namespace wxl_livingazeroth::grassdoodads
     constexpr unsigned kDoodadEntries = kEntries - 1;
     constexpr unsigned kFallbackEntry = kEntries - 1;
 
+    /// The colour bits the entry index occupies, and the tag for an index.
+    constexpr uint32_t kIndexMask = 0x00030703u; // green low 3 bits, red + blue low 2 bits
+    inline uint32_t IndexTag(unsigned index)
+    {
+        const uint32_t low = index & 7u, high = (index >> 3) & 3u;
+        return (low << 8) | high | (high << 16);
+    }
+
+    /// A layer slot's doodads in first-appearance order: entry k of the per-draw table is ids[k].
+    struct SlotDoodads { uint32_t ids[kDoodadEntries]; unsigned count; };
+
+    /// The table entry for a doodad in a slot, adding it if there's room; kFallbackEntry (and
+    /// `overflow` set) when the slot already holds kDoodadEntries others.
+    inline unsigned EntryFor(SlotDoodads& sd, uint32_t id, bool& overflow)
+    {
+        for (unsigned k = 0; k < sd.count; ++k)
+            if (sd.ids[k] == id) return k;
+        if (sd.count < kDoodadEntries) { sd.ids[sd.count] = id; return sd.count++; }
+        overflow = true;
+        return kFallbackEntry;
+    }
+
     struct DoodadInfo
     {
         uint32_t    id = 0;
@@ -69,6 +91,10 @@ namespace wxl_livingazeroth::grassdoodads
 
     /// Attaches the fill/draw hooks. Call from WXL_Load, only when grass motion is installed.
     bool Install(const WXL_Api* api);
+
+    /// A slot's doodads became known outside the client's build (the instanced renderer builds
+    /// slots itself): analyse new doodads and count them for the panel.
+    void NoteSlot(const SlotDoodads& sd, bool overflow);
 
     /// Snapshot of every doodad seen so far, for the debug panel.
     std::vector<DoodadInfo> Seen();

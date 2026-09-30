@@ -18,6 +18,7 @@
 #include "env/Wind.hpp"
 #include "env/WorldQuery.hpp"
 #include "features/GrassDoodads.hpp"
+#include "features/GrassInstanced.hpp"
 #include "features/GrassMotion.hpp"
 #include "features/GrassPerf.hpp"
 #include "render/SceneDepth.hpp"
@@ -58,6 +59,7 @@ namespace
     {
         ResolveInterfacesOnce();
         wxl_livingazeroth::grassperf::OnFrameEnd();
+        wxl_livingazeroth::grassinst::OnFrameEnd();
         wxl_livingazeroth::depth::Update();
     }
 
@@ -74,6 +76,7 @@ namespace
     void __cdecl OnDeviceLost(void* /*user*/, const void* /*args*/)
     {
         wxl_livingazeroth::depth::OnDeviceLost();
+        wxl_livingazeroth::grassinst::OnDeviceLost();
     }
 }
 

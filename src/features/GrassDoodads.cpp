@@ -1,5 +1,6 @@
 #include "GrassDoodads.hpp"
 
+#include "GrassInstanced.hpp"
 #include "GrassPerf.hpp"
 
 #include "../wxl_seyris/CdbcApi.hpp"
@@ -53,18 +54,9 @@ namespace wxl_livingazeroth::grassdoodads
 
         using SlotFn = void(__fastcall*)(void* slot, void* edx);
 
-        struct SlotDoodads { uint32_t ids[kDoodadEntries]; unsigned count; };
-
-        constexpr size_t   kInstanceColor = 0x28;
         // Colour bytes: blue 0..7, green 8..15, red 16..23 (red/blue may swap for the GPU; green
         // doesn't move, and the high bits go into red AND blue so the swap is harmless).
-        constexpr uint32_t kIndexMask     = 0x00030703u; // green low 3 bits, red + blue low 2 bits
-
-        uint32_t IndexTag(unsigned index)
-        {
-            const uint32_t low = index & 7u, high = (index >> 3) & 3u;
-            return (low << 8) | high | (high << 16);
-        }
+        constexpr size_t   kInstanceColor = 0x28;
 
         bool WriteU32(uintptr_t address, uint32_t value)
         {
@@ -247,35 +239,24 @@ namespace wxl_livingazeroth::grassdoodads
                 uint32_t id = 0, color = 0;
                 if (!ReadU32(rec + kInstanceDoodadId, id) || !ReadU32(rec + kInstanceColor, color)) break;
 
-                unsigned index = kFallbackEntry;
-                for (unsigned k = 0; k < sd.count; ++k)
-                    if (sd.ids[k] == id) { index = k; break; }
-                if (index == kFallbackEntry)
-                {
-                    if (sd.count < kDoodadEntries) { index = sd.count; sd.ids[sd.count++] = id; }
-                    else overflow = true;
-                }
-
+                const unsigned index = EntryFor(sd, id, overflow);
                 savedColors[i] = color;
                 if (!WriteU32(rec + kInstanceColor, (color & ~kIndexMask) | IndexTag(index))) break;
                 ++tagged;
             }
 
+            grassinst::BeforeStockFill(slot);
             const double t0 = grassperf::Now();
             g_origFill(slot, edx);
             uint32_t vertices = 0;
             ReadU32(s + 0x08, vertices); // slot vertex count
             grassperf::OnBuild(grassperf::Now() - t0, count, vertices);
+            grassinst::AfterStockFill(slot); // still tagged: the verification compares against this
 
             for (uint32_t i = 0; i < tagged; ++i)
                 WriteU32(instances + i * kInstanceStride + kInstanceColor, savedColors[i]);
-            if (overflow) ++g_tooMany;
 
-            for (unsigned k = 0; k < sd.count; ++k)
-            {
-                Analyze(sd.ids[k]);
-                ++g_doodads[sd.ids[k]].seenInSlots;
-            }
+            NoteSlot(sd, overflow);
             if (g_slots.size() > 50000) g_slots.clear(); // slots get reused; don't grow forever
             g_slots[slot] = sd;
         }
@@ -291,12 +272,21 @@ namespace wxl_livingazeroth::grassdoodads
                 table[k][0] = 1.0f; table[k][1] = -1.0f; table[k][2] = 1.0f; table[k][3] = 1.0f;
             }
 
-            auto it = g_slots.find(slot);
-            if (it != g_slots.end())
+            // Instanced renderer: the slot's plants sit in our own static buffers (built on first
+            // sight), so the client's per-frame re-bake is skipped. Null = this slot draws stock.
+            const SlotDoodads* sd = grassinst::Prepare(slot);
+            const bool instanced = sd != nullptr;
+            if (!sd)
             {
-                for (unsigned k = 0; k < it->second.count; ++k)
+                auto it = g_slots.find(slot);
+                if (it != g_slots.end()) sd = &it->second;
+            }
+
+            if (sd)
+            {
+                for (unsigned k = 0; k < sd->count; ++k)
                 {
-                    auto d = g_doodads.find(it->second.ids[k]);
+                    auto d = g_doodads.find(sd->ids[k]);
                     if (d == g_doodads.end()) continue;
                     DoodadInfo& info = d->second;
                     if (!info.analyzed) Analyze(info.id); // its model may have loaded since
@@ -313,15 +303,15 @@ namespace wxl_livingazeroth::grassdoodads
                 }
             }
 
-            if (it != g_slots.end()) ++g_drawsTracked; else ++g_drawsUntracked;
+            if (sd) ++g_drawsTracked; else ++g_drawsUntracked;
 
             // Debug highlight: which entry (if any) of this slot is the highlighted doodad.
             float highlight[4] = { -1.0f, kHighlightLift, 0.0f, 0.0f };
             if (g_highlightId == kHighlightFallbackId)
                 highlight[0] = static_cast<float>(kFallbackEntry);
-            else if (g_highlightId && it != g_slots.end())
-                for (unsigned k = 0; k < it->second.count; ++k)
-                    if (it->second.ids[k] == g_highlightId) highlight[0] = static_cast<float>(k);
+            else if (g_highlightId && sd)
+                for (unsigned k = 0; k < sd->count; ++k)
+                    if (sd->ids[k] == g_highlightId) highlight[0] = static_cast<float>(k);
 
             if (auto* dev = static_cast<IDirect3DDevice9*>(wxl::game::gx::RawDevice()))
             {
@@ -330,6 +320,11 @@ namespace wxl_livingazeroth::grassdoodads
             }
 
             const double t0 = grassperf::Now();
+            if (instanced && grassinst::Draw(slot))
+            {
+                grassperf::OnDraw(grassperf::Now() - t0);
+                return;
+            }
             g_origDraw(slot, edx);
             grassperf::OnDraw(grassperf::Now() - t0);
         }
@@ -346,7 +341,19 @@ namespace wxl_livingazeroth::grassdoodads
                                       WXL_HOOK_DEFAULT_PRIORITY);
         api->Log((a && b) ? WXL_LOG_INFO : WXL_LOG_WARN, kTag, "grass doodads: hooks %s.",
                  (a && b) ? "installed" : "FAILED (per-doodad bend falls back to the default)");
+        // The instanced renderer runs inside these two hooks.
+        grassinst::Install(api);
         return a && b;
+    }
+
+    void NoteSlot(const SlotDoodads& sd, bool overflow)
+    {
+        if (overflow) ++g_tooMany;
+        for (unsigned k = 0; k < sd.count; ++k)
+        {
+            Analyze(sd.ids[k]);
+            ++g_doodads[sd.ids[k]].seenInSlots;
+        }
     }
 
     std::vector<DoodadInfo> Seen()

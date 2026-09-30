@@ -40,4 +40,9 @@ namespace wxl_livingazeroth::shaderpatch
     bool Install(const WXL_Api* api);
 
     std::vector<RuleStatus> Status();
+
+    /// d3dcompiler_47 round trip, shared with other shader derivations. Both return false with a
+    /// reason in `error` when the compiler is missing or the call fails.
+    bool Disassemble(const void* code, size_t length, std::string& text, std::string& error);
+    bool Assemble(const std::string& source, const char* name, std::vector<uint8_t>& code, std::string& error);
 }

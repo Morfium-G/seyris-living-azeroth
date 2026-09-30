@@ -46,6 +46,20 @@ namespace wxl_livingazeroth::grassperf
         g_lastDrawEnd = Now();
     }
 
+    void OnInstancedDraw(unsigned drawCalls, unsigned plants)
+    {
+        ++g_current.instSlots;
+        g_current.instDrawCalls += drawCalls;
+        g_current.instPlants += plants;
+    }
+
+    void OnInstanceBuild(double ms, double deviceMs)
+    {
+        ++g_current.instBuilds;
+        g_current.instBuildMs += ms;
+        g_current.instBuildDeviceMs += deviceMs;
+    }
+
     void OnFrameEnd()
     {
         const double now = Now();
@@ -79,10 +93,18 @@ namespace wxl_livingazeroth::grassperf
             s.average.plantsBuilt += f.plantsBuilt; s.average.verticesBuilt += f.verticesBuilt;
             s.average.draws += f.draws;          s.average.drawSubmitMs += f.drawSubmitMs;
             s.average.chunks += f.chunks;
+            s.average.instSlots += f.instSlots;  s.average.instDrawCalls += f.instDrawCalls;
+            s.average.instPlants += f.instPlants; s.average.instBuilds += f.instBuilds;
+            s.average.instBuildMs += f.instBuildMs; s.average.instBuildDeviceMs += f.instBuildDeviceMs;
             if (f.frameMs > s.worst.frameMs) s.worst = f;
         }
         const double n = static_cast<double>(g_history.size());
         s.average.frameMs /= n; s.average.passMs /= n; s.average.buildMs /= n; s.average.drawSubmitMs /= n;
+        s.average.instBuildMs /= n; s.average.instBuildDeviceMs /= n;
+        s.average.instSlots = static_cast<unsigned>(s.average.instSlots / n + 0.5);
+        s.average.instDrawCalls = static_cast<unsigned>(s.average.instDrawCalls / n + 0.5);
+        s.average.instPlants = static_cast<unsigned>(s.average.instPlants / n + 0.5);
+        s.average.instBuilds = static_cast<unsigned>(s.average.instBuilds / n + 0.5);
         s.average.builds = static_cast<unsigned>(s.average.builds / n + 0.5);
         s.average.plantsBuilt = static_cast<unsigned>(s.average.plantsBuilt / n + 0.5);
         s.average.verticesBuilt = static_cast<unsigned>(s.average.verticesBuilt / n + 0.5);

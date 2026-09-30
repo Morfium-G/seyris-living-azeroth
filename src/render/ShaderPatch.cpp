@@ -20,7 +20,7 @@ namespace wxl_livingazeroth::shaderpatch
                                                UINT, ID3DBlob**, ID3DBlob**);
         using DisassembleFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, UINT, LPCSTR, ID3DBlob**);
 
-        struct CachedBlob { uint32_t stockLength; ID3DBlob* blob; };
+        struct CachedBlob { uint32_t stockLength; std::vector<uint8_t> code; };
 
         struct Rule
         {
@@ -60,20 +60,13 @@ namespace wxl_livingazeroth::shaderpatch
             g_api->Log(WXL_LOG_WARN, kTag, "shader patch '%s': %s", r.def.name, r.status.lastError.c_str());
         }
 
-        ID3DBlob* BuildPatched(Rule& r, const uint8_t* stock, uint32_t length)
+        const std::vector<uint8_t>* BuildPatched(Rule& r, const uint8_t* stock, uint32_t length)
         {
             for (const CachedBlob& c : r.cache)
-                if (c.stockLength == length) return c.blob;
+                if (c.stockLength == length) return &c.code;
 
-            HMODULE comp = Compiler();
-            auto disassemble = comp ? reinterpret_cast<DisassembleFn>(GetProcAddress(comp, "D3DDisassemble")) : nullptr;
-            auto assemble    = comp ? reinterpret_cast<AssembleFn>(GetProcAddress(comp, "D3DAssemble")) : nullptr;
-            if (!disassemble || !assemble) { Fail(r, "d3dcompiler_47 missing D3DDisassemble/D3DAssemble", nullptr); return nullptr; }
-
-            ID3DBlob* text = nullptr;
-            if (FAILED(disassemble(stock, length, 0, nullptr, &text)) || !text) { Fail(r, "disassembly failed", nullptr); return nullptr; }
-            std::string src(static_cast<const char*>(text->GetBufferPointer()));
-            text->Release();
+            std::string src, error;
+            if (!Disassemble(stock, length, src, error)) { Fail(r, error.c_str(), nullptr); return nullptr; }
 
             // Prologue after the version line; body after the anchor line.
             size_t versionEnd = src.find('\n');
@@ -86,22 +79,13 @@ namespace wxl_livingazeroth::shaderpatch
             if (at == std::string::npos) { Fail(r, "anchor has no line end", nullptr); return nullptr; }
             src.insert(at + 1, r.def.body);
 
-            ID3DBlob* code = nullptr;
-            ID3DBlob* errors = nullptr;
-            const HRESULT hr = assemble(src.c_str(), src.size(), r.def.name, nullptr, nullptr, 0, &code, &errors);
-            if (FAILED(hr) || !code)
-            {
-                Fail(r, "assembly failed", errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
-                if (errors) errors->Release();
-                if (code) code->Release();
-                return nullptr;
-            }
-            if (errors) errors->Release();
+            std::vector<uint8_t> code;
+            if (!Assemble(src, r.def.name, code, error)) { Fail(r, error.c_str(), nullptr); return nullptr; }
 
-            r.cache.push_back({ length, code });
             g_api->Log(WXL_LOG_INFO, kTag, "shader patch '%s': patched stock shader (%u -> %u bytes).",
-                       r.def.name, length, static_cast<unsigned>(code->GetBufferSize()));
-            return code;
+                       r.def.name, length, static_cast<unsigned>(code.size()));
+            r.cache.push_back({ length, std::move(code) });
+            return &r.cache.back().code;
         }
 
         // The client's per-shader create: swap the wrapper's bytecode to the patched version for this
@@ -116,12 +100,12 @@ namespace wxl_livingazeroth::shaderpatch
 
                 if (Rule* r = Match(*codePtr, *lenPtr))
                 {
-                    if (ID3DBlob* patched = BuildPatched(*r, *codePtr, *lenPtr))
+                    if (const std::vector<uint8_t>* patched = BuildPatched(*r, *codePtr, *lenPtr))
                     {
                         const uint8_t* savedCode = *codePtr;
                         const uint32_t savedLen  = *lenPtr;
-                        *codePtr = static_cast<const uint8_t*>(patched->GetBufferPointer());
-                        *lenPtr  = static_cast<uint32_t>(patched->GetBufferSize());
+                        *codePtr = patched->data();
+                        *lenPtr  = static_cast<uint32_t>(patched->size());
                         g_origCreate(device, edx, wrapper);
                         *codePtr = savedCode;
                         *lenPtr  = savedLen;
@@ -159,5 +143,41 @@ namespace wxl_livingazeroth::shaderpatch
         std::vector<RuleStatus> out;
         for (const Rule& r : g_rules) out.push_back(r.status);
         return out;
+    }
+
+    bool Disassemble(const void* code, size_t length, std::string& text, std::string& error)
+    {
+        HMODULE comp = Compiler();
+        auto disassemble = comp ? reinterpret_cast<DisassembleFn>(GetProcAddress(comp, "D3DDisassemble")) : nullptr;
+        if (!disassemble) { error = "d3dcompiler_47 missing D3DDisassemble"; return false; }
+
+        ID3DBlob* blob = nullptr;
+        if (FAILED(disassemble(code, length, 0, nullptr, &blob)) || !blob) { error = "disassembly failed"; return false; }
+        text.assign(static_cast<const char*>(blob->GetBufferPointer()));
+        blob->Release();
+        return true;
+    }
+
+    bool Assemble(const std::string& source, const char* name, std::vector<uint8_t>& code, std::string& error)
+    {
+        HMODULE comp = Compiler();
+        auto assemble = comp ? reinterpret_cast<AssembleFn>(GetProcAddress(comp, "D3DAssemble")) : nullptr;
+        if (!assemble) { error = "d3dcompiler_47 missing D3DAssemble"; return false; }
+
+        ID3DBlob* blob = nullptr;
+        ID3DBlob* errors = nullptr;
+        const HRESULT hr = assemble(source.c_str(), source.size(), name, nullptr, nullptr, 0, &blob, &errors);
+        if (FAILED(hr) || !blob)
+        {
+            error = std::string("assembly failed: ") + (errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+            if (errors) errors->Release();
+            if (blob) blob->Release();
+            return false;
+        }
+        if (errors) errors->Release();
+        const auto* bytes = static_cast<const uint8_t*>(blob->GetBufferPointer());
+        code.assign(bytes, bytes + blob->GetBufferSize());
+        blob->Release();
+        return true;
     }
 }

@@ -3,6 +3,7 @@
 #include "ShaderDump.hpp"
 
 #include "../features/GrassDoodads.hpp"
+#include "../features/GrassInstanced.hpp"
 #include "../features/GrassMotion.hpp"
 #include "../features/GrassPerf.hpp"
 #include "../render/ShaderPatch.hpp"
@@ -226,6 +227,34 @@ namespace wxl_livingazeroth::debug
                     gs.debugIgnoreUv = ignoreUv != 0;
                 if (g_api->UiButton("Reset grass defaults")) gs = grass::Settings{};
 
+                // Instanced renderer: the client's placement, drawn from our static buffers.
+                if (g_api->UiCollapsingHeader("Instanced grass renderer (experimental)"))
+                {
+                    grassinst::Settings& is = grassinst::Tunables();
+                    int instOn = is.enabled ? 1 : 0;
+                    if (g_api->UiCheckbox("Instanced grass (off = the client's own path)", &instOn)) is.enabled = instOn != 0;
+                    if (const char* why = grassinst::Problem())
+                    {
+                        std::snprintf(line, sizeof(line), "UNAVAILABLE: %s", why);
+                        g_api->UiTextWrapped(line);
+                    }
+                    const grassinst::Stats st = grassinst::GetStats();
+                    g_api->UiSliderFloat("Build budget (ms per frame)", &is.buildBudgetMs, 0.5f, 20.0f);
+                    std::snprintf(line, sizeof(line), "last frame: %u layers instanced in %u draw calls; %u built in %.2f ms (%.2f ms in D3D); "
+                                  "drawn stock: %u (over budget), %u (model loading), %u (failed)",
+                                  st.slotsInstanced, st.drawCalls, st.builds, st.buildMs, st.buildDeviceMs,
+                                  st.fallbackBudget, st.fallbackNotLoaded, st.fallbackFailed);
+                    g_api->UiTextWrapped(line);
+                    std::snprintf(line, sizeof(line), "cached: %u layers (%.1f MB in %u x 4 MB pages), %u doodad models (%.0f KB), %u shaders",
+                                  st.slotsCached, st.instanceMB, st.poolPages, st.geometries, st.geometryKB, st.shaders);
+                    g_api->UiText(line);
+                    if (g_api->UiButton(grassinst::VerifyPending() ? "verifying... (waits for a layer build)##iv"
+                                                                   : "Verify against the client's bake (next layer build)##iv"))
+                        grassinst::RequestVerify();
+                    std::snprintf(line, sizeof(line), "verification: %s", grassinst::VerifyReport().c_str());
+                    g_api->UiTextWrapped(line);
+                }
+
                 // Per-doodad: what was worked out from each model, with live wind/push switches.
                 if (g_api->UiCollapsingHeader("Grass doodads seen (per GroundEffectDoodad ID)"))
                 {
@@ -346,12 +375,19 @@ namespace wxl_livingazeroth::debug
             std::snprintf(line, sizeof(line), "  layer builds %u   %.2f ms   plants %u   vertices %u",
                           s.average.builds, s.average.buildMs, s.average.plantsBuilt, s.average.verticesBuilt);
             out.emplace_back(line);
+            std::snprintf(line, sizeof(line), "  instanced: %u layers, %u draw calls, %u plants   instance builds %u (%.2f ms, %.2f ms in D3D)",
+                          s.average.instSlots, s.average.instDrawCalls, s.average.instPlants, s.average.instBuilds,
+                          s.average.instBuildMs, s.average.instBuildDeviceMs);
+            out.emplace_back(line);
             out.emplace_back("WORST FRAME");
             std::snprintf(line, sizeof(line), "  frame %.2f ms   grass pass %.2f ms   draws %u (submit %.2f ms)",
                           s.worst.frameMs, s.worst.passMs, s.worst.draws, s.worst.drawSubmitMs);
             out.emplace_back(line);
             std::snprintf(line, sizeof(line), "  layer builds %u   %.2f ms total   %.2f ms slowest   plants %u   vertices %u",
                           s.worst.builds, s.worst.buildMs, s.worst.worstBuildMs, s.worst.plantsBuilt, s.worst.verticesBuilt);
+            out.emplace_back(line);
+            std::snprintf(line, sizeof(line), "  instanced: %u layers, %u draw calls   instance builds %u (%.2f ms, %.2f ms in D3D)",
+                          s.worst.instSlots, s.worst.instDrawCalls, s.worst.instBuilds, s.worst.instBuildMs, s.worst.instBuildDeviceMs);
             out.emplace_back(line);
             std::snprintf(line, sizeof(line), "spike frames (> 2x median): %u   share of spike time spent building grass: %.0f%%",
                           s.spikeFrames, s.spikeBuildShare * 100.0);

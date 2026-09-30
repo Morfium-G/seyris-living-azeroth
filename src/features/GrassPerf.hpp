@@ -20,6 +20,13 @@ namespace wxl_livingazeroth::grassperf
         unsigned draws = 0;         // layer draw calls
         double   drawSubmitMs = 0;  // CPU time inside the layer draw calls
         unsigned chunks = 0;        // grass chunks set up
+        // Instanced renderer (counted inside the layer draws above).
+        unsigned instSlots = 0;     // layer draws done instanced
+        unsigned instDrawCalls = 0; // device draw calls they issued (one per doodad model)
+        unsigned instPlants = 0;    // plants drawn instanced
+        unsigned instBuilds = 0;    // slot instance buffers built
+        double   instBuildMs = 0;
+        double   instBuildDeviceMs = 0; // of which creating + filling D3D buffers
     };
 
     // --- hooks call these (main thread) ---
@@ -28,6 +35,8 @@ namespace wxl_livingazeroth::grassperf
     double Now();                                         // high-resolution milliseconds
     void OnBuild(double ms, unsigned plants, unsigned vertices);
     void OnDraw(double submitMs);
+    void OnInstancedDraw(unsigned drawCalls, unsigned plants);
+    void OnInstanceBuild(double ms, double deviceMs);
     void OnFrameEnd();                                    // Present
 
     // --- panel ---
