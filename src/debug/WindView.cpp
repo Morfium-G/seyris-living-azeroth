@@ -2,6 +2,7 @@
 
 #include "ShaderDump.hpp"
 
+#include "../features/GrassDoodads.hpp"
 #include "../features/GrassMotion.hpp"
 #include "../render/ShaderPatch.hpp"
 
@@ -96,6 +97,10 @@ namespace wxl_livingazeroth::debug
             if (g_forceWeather && g_api->UiSliderFloat("Forced intensity", &g_forcedWeather, 0.0f, 1.0f))
                 wind::SetWeatherOverride(g_forcedWeather);
 
+            float mult = wind::StrengthMultiplier();
+            if (g_api->UiSliderFloat("Global wind multiplier (testing)", &mult, 0.0f, 5.0f))
+                wind::SetStrengthMultiplier(mult);
+
             g_api->UiSeparator();
 
             // --- resulting wind ---
@@ -187,7 +192,43 @@ namespace wxl_livingazeroth::debug
                 g_api->UiSliderFloat("Stiff base (fraction)", &gs.anchor, 0.0f, 0.8f);
                 g_api->UiSliderFloat("Player push (yards)", &gs.pushStrength, 0.0f, 1.5f);
                 g_api->UiSliderFloat("Player push radius", &gs.pushRadius, 0.3f, 5.0f);
+                int ignoreUv = gs.debugIgnoreUv ? 1 : 0;
+                if (g_api->UiCheckbox("Ignore UV bend (debug: whole blades move)", &ignoreUv))
+                    gs.debugIgnoreUv = ignoreUv != 0;
                 if (g_api->UiButton("Reset grass defaults")) gs = grass::Settings{};
+
+                // Per-doodad: what was worked out from each model, with live wind/push switches.
+                if (g_api->UiCollapsingHeader("Grass doodads seen (per GroundEffectDoodad ID)"))
+                {
+                    std::snprintf(line, sizeof(line), "layer slots tracked: %u, slots with more than %u doodads: %u",
+                                  grassdoodads::SlotsTracked(), grassdoodads::kEntries,
+                                  grassdoodads::SlotsWithTooManyDoodads());
+                    g_api->UiText(line);
+                    for (const grassdoodads::DoodadInfo& d : grassdoodads::Seen())
+                    {
+                        std::snprintf(line, sizeof(line), "#%u %s", d.id, d.modelPath);
+                        g_api->UiTextWrapped(line);
+                        if (!d.analyzed)
+                            std::snprintf(line, sizeof(line), "   model not loaded yet");
+                        else
+                            std::snprintf(line, sizeof(line), "   h %.2f  root v %.2f  tip v %.2f  uv [%.2f,%.2f]-[%.2f,%.2f]%s%s",
+                                          d.height, d.rootV, d.tipV, d.uMin, d.vMin, d.uMax, d.vMax,
+                                          d.autoFlat ? "  FLAT" : "", d.valid ? "" : "  (default bend)");
+                        g_api->UiText(line);
+
+                        char label[48];
+                        int wind = d.windOn ? 1 : 0, push = d.pushOn ? 1 : 0;
+                        std::snprintf(label, sizeof(label), "wind##w%u", d.id);
+                        if (g_api->UiCheckbox(label, &wind)) grassdoodads::SetWind(d.id, wind != 0);
+                        g_api->UiSameLine();
+                        std::snprintf(label, sizeof(label), "push##p%u", d.id);
+                        if (g_api->UiCheckbox(label, &push)) grassdoodads::SetPush(d.id, push != 0);
+                        g_api->UiSameLine();
+                        int flip = d.flipped ? 1 : 0;
+                        std::snprintf(label, sizeof(label), "flip root/tip##f%u", d.id);
+                        if (g_api->UiCheckbox(label, &flip)) grassdoodads::SetFlip(d.id, flip != 0);
+                    }
+                }
             }
 
             g_api->UiSeparator();

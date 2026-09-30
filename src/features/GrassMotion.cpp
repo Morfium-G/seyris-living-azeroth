@@ -1,18 +1,25 @@
 #include "GrassMotion.hpp"
 
+#include "GrassDoodads.hpp"
+
 #include "../env/Wind.hpp"
 #include "../env/WorldQuery.hpp"
 #include "../render/ShaderPatch.hpp"
 
 #include "game/Camera.hpp"
 #include "game/Gx.hpp"
+#include "game/Pick.hpp"
 #include "offsets/game/GroundEffect.hpp"
 
 #include <windows.h>
 #include <d3d9.h>
 
 #include <cstring>
+#include <cmath>
+#include <cstdio>
 #include <iterator>
+#include <string>
+#include <unordered_map>
 
 namespace wxl_livingazeroth::grass
 {
@@ -41,6 +48,7 @@ namespace wxl_livingazeroth::grass
         //     c16 = 1/spacing, 1/spacing, grid offset x, grid offset y
         //     c17 = flutter speed, phase-per-yard x, phase-per-yard y, push strength
         //     c18 = player xyz, push radius
+        //     c19 = debug: x = ignore UV bend weight (0/1)
         //   our own upload: c40..c103 = the wind grid
         //   shader defs: c36..c38
         // (vs_3_0 allows one constant register per instruction, so constants that meet in one
@@ -50,18 +58,59 @@ namespace wxl_livingazeroth::grass
             "    def c37, 0.15915494, 0.5, 6.2831853, 3.1415927\n" // 1/2pi, 0.5, 2pi, pi
             "    def c38, 6.999, 0.0, 0.0, 0.0\n";                // grid clamp
 
+        // One doodad-table entry (A = rectangle register, B = mapping register): is the vertex's UV
+        // inside the rectangle, and how far is it from root to tip within it.
+        std::string DoodadEntryAsm(int a, int b)
+        {
+            char buf[512];
+            std::snprintf(buf, sizeof(buf),
+                "    sge r10.xy, v3.xy, c%d.xy\n"
+                "    sge r10.zw, c%d, v3.xyxy\n"
+                "    mul r10.xy, r10, r10.zwzw\n"
+                "    mul r10.x, r10.x, r10.y\n"
+                "    add r11.x, v3.y, -c%d.x\n"
+                "    mul_sat r11.x, r11.x, c%d.y\n"
+                "    mad r12.x, r10.x, r11.x, r12.x\n"
+                "    mad r12.yz, r10.x, c%d.xzwx, r12\n"
+                "    add r12.w, r12.w, r10.x\n",
+                a, a, b, b, b);
+            return buf;
+        }
+
         // Inserted right after the stock "add r0, r0, c3" (view-space position complete in r0).
-        const char* kBody =
+        std::string BuildBody()
+        {
+            return
             // World position: grass batches are unrotated, so c0..c2 are the pure view rotation.
             "    dp3 r2.x, c0, r0\n"
             "    dp3 r2.y, c1, r0\n"
             "    dp3 r2.z, c2, r0\n"
             "    add r2.xyz, r2, c14\n"
-            // Bend weight: uv.y is 1 at the root, 0 at the tip; stiff base, squared falloff.
-            "    add r3.w, c13.y, -v3.y\n"
+            // Per-doodad table (c104..c111, uploaded before each layer draw): 4 entries of
+            //   A = {uMin, vMin, uMax, vMax} (the doodad's atlas rectangle)
+            //   B = {rootV, 1/(tipV-rootV), windScale, pushScale}
+            // The vertex's UV picks its entry; accumulate into r12 = {raw bend, wind, push, matched}.
+            "    mov r12, c13.x\n"
+            + DoodadEntryAsm(104, 105) + DoodadEntryAsm(106, 107)
+            + DoodadEntryAsm(108, 109) + DoodadEntryAsm(110, 111) +
+            // Overlapping atlas rectangles can match twice: average rather than add.
+            "    max r13.x, r12.w, c13.y\n"
+            "    rcp r13.x, r13.x\n"
+            "    mul r12.xyz, r12, r13.x\n"
+            // No matching entry: fall back to "uv.y is 1 at the root, 0 at the tip", full wind/push.
+            "    min r12.w, r12.w, c13.y\n"
+            "    add r13.x, c13.y, -r12.w\n"
+            "    add r13.y, c13.y, -v3.y\n"
+            "    mad r3.w, r13.x, r13.y, r12.x\n"
+            "    add r13.z, r12.y, r13.x\n"
+            "    add r13.w, r12.z, r13.x\n"
+            // Stiff base, squared falloff.
             "    add r3.w, r3.w, -c15.x\n"
             "    mul_sat r3.w, r3.w, c15.y\n"
             "    mul r3.w, r3.w, r3.w\n"
+            // Debug (c19.x = 1): ignore the UV weight so every vertex moves fully.
+            "    add r4.w, c13.y, -r3.w\n"
+            "    mad r3.w, r4.w, c19.x, r3.w\n"
             // Wind grid lookup, bilinear, clamped to the grid edge.
             "    mul r4.xy, r2, c16\n"
             "    add r4.xy, r4, -c16.zw\n"
@@ -91,6 +140,7 @@ namespace wxl_livingazeroth::grass
             "    mul r7.y, r7.y, c15.w\n"
             "    mad r7.z, r7.y, r8.y, c15.z\n"
             "    mul r8.xy, r6, r7.z\n"
+            "    mul r8.xy, r8, r13.z\n"
             // Player parting: lean away within the radius, only near the player's height.
             "    add r9.xy, r2, -c18\n"
             "    mul r9.z, r9.x, r9.x\n"
@@ -109,6 +159,7 @@ namespace wxl_livingazeroth::grass
             "    min r7.w, r7.w, c13.y\n"
             "    mul r9.z, r9.z, r7.w\n"
             "    mul r9.z, r9.z, c17.w\n"
+            "    mul r9.z, r9.z, r13.w\n"
             "    mul r9.z, r9.z, r9.w\n"
             "    mad r8.xy, r9, r9.z, r8\n"
             // Apply the bend weight and rotate the world-space offset back into view space.
@@ -116,6 +167,7 @@ namespace wxl_livingazeroth::grass
             "    mul r4.xyz, c0, r8.x\n"
             "    mad r4.xyz, c1, r8.y, r4\n"
             "    add r0.xyz, r0, r4\n";
+        }
 
         // --- state ------------------------------------------------------------------------------
         const WXL_Api* g_api = nullptr;
@@ -128,6 +180,27 @@ namespace wxl_livingazeroth::grass
         ge::ChunkConstantUploadFn  g_origChunk = nullptr;
 
         float SecondsNow() { return static_cast<float>(GetTickCount() % 3600000u) * 0.001f; }
+
+        // World-snapped grid cells: cached ground height (so hills above/below the player sample
+        // their own surface) and an eased wind value (so changes blend instead of snapping).
+        constexpr float    kEaseSeconds     = 0.35f;
+        constexpr float    kGroundRecheck   = 10.0f;  // seconds; terrain/WMOs stream in late
+        constexpr float    kGroundSearch    = 55.0f;  // GroundZ searches +-60 yd around the player
+        constexpr unsigned kGroundRayBudget = 16;     // ground probes per frame
+
+        struct GridCell
+        {
+            float groundZ = 0.0f, groundAt = 0.0f, lastSeen = 0.0f;
+            float value[3] = {};
+            bool  haveGround = false, fresh = true;
+        };
+        std::unordered_map<uint64_t, GridCell> g_cells;
+        float g_lastGridTime = 0.0f;
+
+        uint64_t CellKey(int cx, int cy)
+        {
+            return (static_cast<uint64_t>(static_cast<uint32_t>(cx)) << 32) | static_cast<uint32_t>(cy);
+        }
 
         // Once per frame at the top of the grass pass: the engine just rebuilt c0..c13 and zeroed the
         // rest of its block; we fill c14..c18 (shipped with every chunk) and rebuild the wind grid.
@@ -145,35 +218,70 @@ namespace wxl_livingazeroth::grass
             float cam[3];
             wxl::game::camera::GetPosition(cam);
 
-            // Grid origin: the player sits in the middle of the grid.
-            const float half = kGrid * kSpacing * 0.5f;
-            const float originX = s.playerPos[0] - half, originY = s.playerPos[1] - half;
+            // Grid origin snapped to world cells (so each cell is a fixed place with its own cached
+            // ground height and smoothed wind), with the player near the middle.
             const float inv = 1.0f / kSpacing;
+            const int   baseX = static_cast<int>(std::floor(s.playerPos[0] * inv)) - kGrid / 2;
+            const int   baseY = static_cast<int>(std::floor(s.playerPos[1] * inv)) - kGrid / 2;
+            const float originX = baseX * kSpacing, originY = baseY * kSpacing;
+
+            const float now = SecondsNow();
+            float dt = now - g_lastGridTime;
+            if (dt < 0.0f || dt > 1.0f) dt = 1.0f / 60.0f;
+            g_lastGridTime = now;
 
             const float anchor = p.anchor < 0.0f ? 0.0f : (p.anchor > 0.9f ? 0.9f : p.anchor);
-            const float c[5][4] = {
+            const float c[6][4] = {
                 { cam[0], cam[1], cam[2], SecondsNow() },
                 { anchor, 1.0f / (1.0f - anchor), on ? p.amplitude : 0.0f, on ? p.flutter : 0.0f },
                 { inv, inv, originX * inv + 0.5f, originY * inv + 0.5f },
                 { p.flutterSpeed, 0.61f, 0.37f, on ? p.pushStrength : 0.0f },
                 { s.playerPos[0], s.playerPos[1], s.playerPos[2], p.pushRadius > 0.1f ? p.pushRadius : 0.1f },
+                { p.debugIgnoreUv ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f },
             };
             float* block = reinterpret_cast<float*>(ge::kVsConstantBlock) + ge::kVsFirstFreeReg * 4;
             std::memcpy(block, c, sizeof(c));
 
-            // Wind grid from the full model (weather, gusts, shelter, lee).
+            // Wind grid from the full model (weather, gusts, shelter, lee), sampled at each cell's
+            // ground height and eased toward its target so changes blend instead of snapping.
+            const float ease = 1.0f - std::exp(-dt / kEaseSeconds);
+            unsigned groundRays = 0;
             for (int iy = 0; iy < kGrid; ++iy)
                 for (int ix = 0; ix < kGrid; ++ix)
                 {
-                    const float pos[3] = { originX + (ix + 0.5f) * kSpacing,
-                                           originY + (iy + 0.5f) * kSpacing, s.playerPos[2] };
+                    const int cx = baseX + ix, cy = baseY + iy;
+                    GridCell& gc = g_cells[CellKey(cx, cy)];
+                    gc.lastSeen = now;
+
+                    const float x = (cx + 0.5f) * kSpacing, y = (cy + 0.5f) * kSpacing;
+                    const bool groundStale = !gc.haveGround || now - gc.groundAt > kGroundRecheck
+                                          || std::fabs(gc.groundZ - s.playerPos[2]) > kGroundSearch;
+                    if (groundStale && groundRays < kGroundRayBudget)
+                    {
+                        ++groundRays;
+                        float z;
+                        if (wxl::game::world::GroundZ(x, y, s.playerPos[2], z)) { gc.groundZ = z; gc.haveGround = true; }
+                        else if (!gc.haveGround) gc.groundZ = s.playerPos[2];
+                        gc.groundAt = now;
+                    }
+                    const float pos[3] = { x, y, gc.haveGround ? gc.groundZ : s.playerPos[2] };
+
                     const wind::Sample w = on ? wind::At(pos) : wind::Sample{};
+                    const float target[3] = { on ? w.dirX * w.strength : 0.0f,
+                                               on ? w.dirY * w.strength : 0.0f,
+                                               on ? w.gust : 0.0f };
+                    for (int k = 0; k < 3; ++k)
+                        gc.value[k] = gc.fresh ? target[k] : gc.value[k] + (target[k] - gc.value[k]) * ease;
+                    gc.fresh = false;
+
                     float* cell = g_grid[iy * kGrid + ix];
-                    cell[0] = on ? w.dirX * w.strength : 0.0f;
-                    cell[1] = on ? w.dirY * w.strength : 0.0f;
-                    cell[2] = on ? w.gust : 0.0f;
-                    cell[3] = 0.0f;
+                    cell[0] = gc.value[0]; cell[1] = gc.value[1]; cell[2] = gc.value[2]; cell[3] = 0.0f;
                 }
+
+            // Forget cells we haven't needed for a while (the grid moves with the player).
+            if (g_cells.size() > kGrid * kGrid * 4)
+                for (auto it = g_cells.begin(); it != g_cells.end();)
+                    it = (now - it->second.lastSeen > 5.0f || now < it->second.lastSeen) ? g_cells.erase(it) : std::next(it);
         }
 
         // Per grass chunk, after the engine's own c0..c22 upload: add the wind grid. Uploaded per
@@ -207,7 +315,7 @@ namespace wxl_livingazeroth::grass
         rule.stockLengths.assign(std::begin(kLiveGrassLengths), std::end(kLiveGrassLengths));
         rule.prologue = kPrologue;
         rule.anchor = "add r0, r0, c3";
-        rule.body = kBody;
+        rule.body = BuildBody();
         shaderpatch::Register(std::move(rule));
 
         const int a = api->HookAttach("LivingAzeroth.GrassInitConstants", ge::kInitShaderConstants,
@@ -219,6 +327,9 @@ namespace wxl_livingazeroth::grass
         g_disabled = (a && b) ? nullptr : "constant hooks failed to install";
         api->Log((a && b) ? WXL_LOG_INFO : WXL_LOG_WARN, kTag, "grass motion: constant hooks %s.",
                  (a && b) ? "installed" : "FAILED");
+
+        // Per-doodad bend/opt-out table. Without it the shader falls back to the default bend.
+        grassdoodads::Install(api);
     }
 
     Settings&   Tunables()              { return g_settings; }

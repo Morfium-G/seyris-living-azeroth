@@ -19,6 +19,7 @@ namespace wxl_livingazeroth::grass
         float anchor        = 0.15f;  // bottom fraction of a blade that never moves
         float pushStrength  = 0.5f;   // how far blades lean away from the player, yards
         float pushRadius    = 1.6f;   // player influence radius, yards
+        bool  debugIgnoreUv = false;  // diagnostic: bend whole blades, ignoring the UV root/tip weight
     };
 
     /// Registers the shader patch and attaches the constant hooks. Call from WXL_Load. Does nothing

@@ -67,6 +67,10 @@ namespace wxl_livingazeroth::wind
     float BearingDegrees();        // current steady direction
     float EffectiveWeather();      // weather intensity the model used
 
+    /// Debug/testing: scales every sample's strength (1 = as authored). Not saved.
+    void  SetStrengthMultiplier(float multiplier);
+    float StrengthMultiplier();
+
     /// Debug override: < 0 follows the live weather, 0..1 forces an intensity.
     void SetWeatherOverride(float intensity);
     float WeatherOverride();

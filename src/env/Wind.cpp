@@ -66,6 +66,7 @@ namespace wxl_livingazeroth::wind
 
         float g_time = 0.0f;
         float g_weatherOverride = -1.0f;
+        float g_strengthMultiplier = 1.0f;
         float g_weatherUsed = 0.0f;
         float g_steadyGround = 0.0f, g_steadyAloft = 0.0f, g_bearing = 0.0f;
         int   g_mapId = -1;
@@ -278,7 +279,7 @@ namespace wxl_livingazeroth::wind
         // uses the steady direction, not the gust-veered one, so its cached rays stay valid.
         s.open = steady > 0.0f ? shelter::Openness(pos) : 1.0f;
         s.lee  = (steady > 0.0f && s.open > 0.0f) ? shelter::Lee(pos, dx, dy) : 1.0f;
-        s.strength = steady * (1.0f + p[GustStrength] * s.gust) * s.open * s.lee;
+        s.strength = steady * (1.0f + p[GustStrength] * s.gust) * s.open * s.lee * g_strengthMultiplier;
         return s;
     }
 
@@ -291,6 +292,9 @@ namespace wxl_livingazeroth::wind
     float SteadyAloft()           { return g_steadyAloft; }
     float BearingDegrees()        { return g_bearing; }
     float EffectiveWeather()      { return g_weatherUsed; }
+
+    void  SetStrengthMultiplier(float multiplier) { g_strengthMultiplier = multiplier < 0.0f ? 0.0f : multiplier; }
+    float StrengthMultiplier()                    { return g_strengthMultiplier; }
 
     void  SetWeatherOverride(float intensity) { g_weatherOverride = intensity; }
     float WeatherOverride()                   { return g_weatherOverride; }
