@@ -13,4 +13,8 @@ namespace wxl_livingazeroth::debug
     /// cdbc may be null (tools module missing); the Reload button then stays inert.
     void RegisterWindPanel(const WXL_Api* api);
     void SetWindCdbc(const WXL_SeyrisCdbcApi* cdbc);
+
+    /// The wind arrow debug display (config default, panel override).
+    void SetShowArrows(bool show);
+    bool ShowArrows();
 }

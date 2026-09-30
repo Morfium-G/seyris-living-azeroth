@@ -12,11 +12,14 @@
 
 #include "engine/events/Event.hpp"
 
+#include "Config.hpp"
+
 #include "debug/DepthView.hpp"
 #include "debug/WindView.hpp"
 #include "env/Actors.hpp"
 #include "env/Wind.hpp"
 #include "env/WorldQuery.hpp"
+#include "features/GrassDistanceCap.hpp"
 #include "features/GrassDoodads.hpp"
 #include "features/GrassInstanced.hpp"
 #include "features/GrassMotion.hpp"
@@ -52,6 +55,9 @@ namespace
         wxl_livingazeroth::debug::SetWindCdbc(cdbc);
         wxl_livingazeroth::wind::LoadProfiles(cdbc);
         wxl_livingazeroth::grassdoodads::LoadOverrides(cdbc);
+
+        wxl_livingazeroth::config::Apply(g_api);
+        wxl_livingazeroth::grassdistance::OnFirstFrame();
     }
 
     // Between frames: the safe moment to swap the depth surface the next world pass will bind.
@@ -96,6 +102,10 @@ int __cdecl WXL_Load(const WXL_Api* api)
 
     wxl_livingazeroth::wind::Init(api);
     api->Subscribe(static_cast<uint32_t>(ev::Event::OnUpdate), &OnUpdate, nullptr);
+
+    // Raises the grass distance cap right before the world CVars (and Config.wtf's value) are
+    // validated.
+    wxl_livingazeroth::grassdistance::Install(api);
 
     // Features register their shader patches first; the single create hook goes in after.
     wxl_livingazeroth::grass::Install(api);

@@ -2,6 +2,7 @@
 
 #include "ShaderDump.hpp"
 
+#include "../features/GrassDistanceCap.hpp"
 #include "../features/GrassDoodads.hpp"
 #include "../features/GrassInstanced.hpp"
 #include "../features/GrassMotion.hpp"
@@ -37,7 +38,7 @@ namespace wxl_livingazeroth::debug
         const WXL_Api*           g_api  = nullptr;
         const WXL_SeyrisCdbcApi* g_cdbc = nullptr;
 
-        int   g_showArrows = 1;
+        int   g_showArrows = 0;
         int   g_gridSize = 11;        // arrows per side
         float g_spacing = 6.0f;       // yards between arrows
         float g_heightOffset = 1.0f;  // yards above the player's feet
@@ -245,6 +246,8 @@ namespace wxl_livingazeroth::debug
                                   st.slotsInstanced, st.drawCalls, st.builds, st.buildMs, st.buildDeviceMs,
                                   st.fallbackBudget, st.fallbackNotLoaded, st.fallbackFailed);
                     g_api->UiTextWrapped(line);
+                    std::snprintf(line, sizeof(line), "grass distance cap (groundEffectDist): %.0f yd", grassdistance::CurrentCap());
+                    g_api->UiText(line);
                     std::snprintf(line, sizeof(line), "cached: %u layers (%.1f MB in %u x 4 MB pages), %u doodad models (%.0f KB), %u shaders",
                                   st.slotsCached, st.instanceMB, st.poolPages, st.geometries, st.geometryKB, st.shaders);
                     g_api->UiText(line);
@@ -551,4 +554,7 @@ namespace wxl_livingazeroth::debug
     }
 
     void SetWindCdbc(const WXL_SeyrisCdbcApi* cdbc) { g_cdbc = cdbc; }
+
+    void SetShowArrows(bool show) { g_showArrows = show ? 1 : 0; }
+    bool ShowArrows() { return g_showArrows != 0; }
 }
