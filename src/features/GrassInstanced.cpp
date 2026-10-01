@@ -1,5 +1,6 @@
 #include "GrassInstanced.hpp"
 
+#include "GrassDensity.hpp"
 #include "GrassPerf.hpp"
 
 #include "../env/WorldQuery.hpp"
@@ -48,6 +49,19 @@ namespace wxl_livingazeroth::grassinst
         constexpr uintptr_t kDoodadTableSize = 0x00D1C4F8;
         constexpr uintptr_t kKeepColorAlpha  = 0x00D1C4F0; // 0 = the bake folds alpha into rgb
         constexpr uintptr_t kTiltBasisX      = 0x009E418C; // float the tilt basis starts from (0.0 shipped)
+
+        // Chunk context (placement 0x7D3390): the grass object's 4 layer slots start at +4 (0x24 each)
+        // and it points to its map chunk at +0x98 (the chunk points back at +0xA4). The chunk's MCNK
+        // header is at +0x110 (layer count +0x0C, area ID +0x34 -- the holes the placement reads at
+        // +0x3C fix the layout), its MCLY layer table at +0x12C (16 bytes each, ground effect ID
+        // at +0x0C). GroundEffectTexture storage: max ID 0xAD3AF4, min ID 0xAD3AF8, row table
+        // 0xAD3B08; a row's 4 doodad IDs at +0x04.
+        constexpr size_t    kGrassSlotsStart = 0x04, kGrassSlotStride = 0x24;
+        constexpr size_t    kGrassChunk = 0x98, kChunkGrass = 0xA4;
+        constexpr size_t    kChunkHeader = 0x110, kHeaderLayers = 0x0C, kHeaderArea = 0x34;
+        constexpr size_t    kChunkLayers = 0x12C, kLayerStride = 0x10, kLayerEffect = 0x0C;
+        constexpr uintptr_t kEffectMaxId = 0x00AD3AF4, kEffectMinId = 0x00AD3AF8, kEffectTable = 0x00AD3B08;
+        constexpr size_t    kEffectDoodads = 0x04;
 
         // layer slot
         constexpr size_t kSlotTexture = 0x00, kSlotVertexCount = 0x04, kSlotVB = 0x0C;
@@ -197,7 +211,12 @@ namespace wxl_livingazeroth::grassinst
         std::vector<Page>    g_pages;
         std::vector<Retired> g_retired;
 
-        struct Range { Geometry* geo; uint32_t start, count; }; // start: instance index in the page
+        struct Range
+        {
+            Geometry* geo;
+            uint32_t  start, count;         // start: instance index in the page
+            grassdensity::Values density;   // from GroundEffectDoodadDensity.cdbc (uncapped)
+        };
         struct SlotEntry
         {
             uintptr_t instances = 0;
@@ -206,6 +225,8 @@ namespace wxl_livingazeroth::grassinst
             uint32_t  offset = 0;
             uint32_t  allocated = 0;  // instances in the page range
             float     center[2] = {}; // chunk-local centre of the plants (density distance)
+            uint32_t  densityGeneration = 0; // GroundEffectDoodadDensity.cdbc load it resolved against
+            uintptr_t slot = 0;              // the client's layer slot (for its chunk context)
             gd::SlotDoodads sd{};
             std::vector<Range> ranges;
             uint32_t  lastFrame = 0;
@@ -585,6 +606,62 @@ namespace wxl_livingazeroth::grassinst
             g_retired.clear();
         }
 
+        struct ChunkContext
+        {
+            bool     valid = false;
+            uint32_t area = 0;
+            uint32_t effects[4] = {};
+            unsigned effectCount = 0;
+        };
+
+        // Which chunk a layer slot belongs to: the slot is one of its grass object's 4; the right
+        // one is the grass object whose chunk points back at it.
+        ChunkContext ReadChunkContext(const void* slot)
+        {
+            ChunkContext c;
+            const uintptr_t s = reinterpret_cast<uintptr_t>(slot);
+            for (uintptr_t k = 0; k < 4; ++k)
+            {
+                const uintptr_t grass = s - kGrassSlotsStart - k * kGrassSlotStride;
+                uint32_t chunk = 0, back = 0, header = 0, layers = 0, count = 0;
+                if (!ReadU32(grass + kGrassChunk, chunk) || !chunk || !ReadU32(chunk + kChunkGrass, back) || back != grass) continue;
+                if (!ReadU32(chunk + kChunkHeader, header) || !header || !ReadU32(header + kHeaderArea, c.area)) return c;
+                if (ReadU32(header + kHeaderLayers, count) && ReadU32(chunk + kChunkLayers, layers) && layers)
+                    for (uint32_t i = 0; i < count && i < 4; ++i)
+                        if (ReadU32(layers + i * kLayerStride + kLayerEffect, c.effects[c.effectCount]) && c.effects[c.effectCount])
+                            ++c.effectCount;
+                c.valid = true;
+                return c;
+            }
+            return c;
+        }
+
+        // The ground effect (of the chunk's layers) that lists this doodad; 0 = none found.
+        uint32_t EffectForDoodad(const ChunkContext& c, uint32_t doodad)
+        {
+            int32_t minId = 0, maxId = 0;
+            uint32_t table = 0;
+            if (!ReadU32(kEffectMinId, reinterpret_cast<uint32_t&>(minId)) || !ReadU32(kEffectMaxId, reinterpret_cast<uint32_t&>(maxId))
+                || !ReadU32(kEffectTable, table) || !table)
+                return 0;
+            for (unsigned i = 0; i < c.effectCount; ++i)
+            {
+                const int32_t id = static_cast<int32_t>(c.effects[i]);
+                if (id < minId || id > maxId) continue;
+                uint32_t row = 0;
+                if (!ReadU32(table + static_cast<uint32_t>(id - minId) * 4, row) || !row) continue;
+                for (uint32_t d = 0; d < 4; ++d)
+                {
+                    uint32_t listed = 0;
+                    if (ReadU32(row + kEffectDoodads + d * 4, listed) && listed == doodad) return c.effects[i];
+                }
+            }
+            return 0;
+        }
+
+        ChunkContext g_lastContext; // of the last layer built (panel)
+        unsigned g_lastEffectsFound = 0, g_lastDoodads = 0;
+
         Need BuildSlot(IDirect3DDevice9* d3d, uintptr_t instances, uint32_t count, SlotEntry& e, double& deviceMs)
         {
             deviceMs = 0;
@@ -666,9 +743,24 @@ namespace wxl_livingazeroth::grassinst
             e.center[0] = center[0];
             e.center[1] = center[1];
             e.sd = sd;
+            // Density content per doodad, from the chunk's area, the map and the ground effect that
+            // placed it (resolved once per build; the player's caps apply per draw).
+            const ChunkContext ctx = ReadChunkContext(reinterpret_cast<const void*>(e.slot));
+            const int mapId = world::Current().mapId;
+            unsigned effectsFound = 0;
             e.ranges.clear();
             for (size_t g = 0; g < order.size(); ++g)
-                e.ranges.push_back({ orderGeo[g], offset + start[g], (g + 1 < order.size() ? start[g + 1] : total) - start[g] });
+            {
+                Range r{ orderGeo[g], offset + start[g], (g + 1 < order.size() ? start[g + 1] : total) - start[g], {} };
+                const uint32_t effect = ctx.valid ? EffectForDoodad(ctx, order[g]) : 0;
+                effectsFound += effect ? 1 : 0;
+                r.density = grassdensity::Resolve(ctx.valid ? ctx.area : 0, mapId, order[g], effect);
+                e.ranges.push_back(r);
+            }
+            e.densityGeneration = grassdensity::Generation();
+            g_lastContext = ctx;
+            g_lastEffectsFound = effectsFound;
+            g_lastDoodads = static_cast<unsigned>(order.size());
             gd::NoteSlot(sd, overflow);
             return Need::Ok;
         }
@@ -886,21 +978,39 @@ namespace wxl_livingazeroth::grassinst
             return true;
         }
 
-        // Full multiplier within half the radius, fading to 1 at the radius.
-        unsigned LayerMultiplier(const SlotEntry& e)
+        // A doodad range's multiplier this frame: its content values capped by the player's limits;
+        // full within half the radius, fading to 1 at the radius.
+        unsigned RangeMultiplier(const SlotEntry& e, const Range& r)
         {
-            const float mult = g_settings.densityMultiplier;
-            if (mult < 1.5f || !g_chunkOriginValid) return 1;
+            const Settings& cap = g_settings;
+            const float mult = r.density.multiplier < cap.maxMultiplier ? r.density.multiplier : cap.maxMultiplier;
+            const float radius = r.density.radius < cap.maxRadius ? r.density.radius : cap.maxRadius;
+            if (mult < 1.5f || radius <= 1.0f || !g_chunkOriginValid) return 1;
             const world::Snapshot& w = world::Current();
             if (!w.inWorld) return 1;
             const float dx = g_chunkOrigin[0] + e.center[0] - w.playerPos[0];
             const float dy = g_chunkOrigin[1] + e.center[1] - w.playerPos[1];
-            const float r = g_settings.densityRadius > 1.0f ? g_settings.densityRadius : 1.0f;
             const float d = std::sqrt(dx * dx + dy * dy);
-            const float full = r * 0.5f;
-            const float t = d <= full ? 1.0f : (d >= r ? 0.0f : 1.0f - (d - full) / (r - full));
+            const float full = radius * 0.5f;
+            const float t = d <= full ? 1.0f : (d >= radius ? 0.0f : 1.0f - (d - full) / (radius - full));
             const unsigned m = static_cast<unsigned>(1.0f + (mult - 1.0f) * t + 0.5f);
             return m < 1 ? 1 : (m > kMaxMultiplier ? kMaxMultiplier : m);
+        }
+
+        // The device everything here was made on. A graphics restart (e.g. changing multisampling)
+        // can replace the device without the reset events; objects from the old one must never
+        // reach the new one, so a changed device drops all of them.
+        IDirect3DDevice9* g_device = nullptr;
+
+        void DropDeviceObjects()
+        {
+            for (auto& [clientVs, d] : g_shaders) { Release(d.shader); Release(clientVs); }
+            g_shaders.clear();
+            Release(g_decl);
+            g_decl = nullptr;
+            g_declFailed = false;
+            g_capsChecked = false;
+            g_problem = nullptr;
         }
 
         bool CheckCaps(IDirect3DDevice9* d3d)
@@ -1035,7 +1145,18 @@ namespace wxl_livingazeroth::grassinst
     {
         if (!g_settings.enabled || g_problem || g_cap.pending) return nullptr;
         auto* d3d = static_cast<IDirect3DDevice9*>(wxl::game::gx::RawDevice());
-        if (!d3d || !CheckCaps(d3d)) return nullptr;
+        if (!d3d) return nullptr;
+        if (d3d != g_device)
+        {
+            if (g_device)
+            {
+                g_api->Log(WXL_LOG_INFO, kTag, "instanced grass: the graphics device was replaced; rebuilding everything on the new one.");
+                OnDeviceLost();
+                DropDeviceObjects();
+            }
+            g_device = d3d;
+        }
+        if (!CheckCaps(d3d)) return nullptr;
 
         const uintptr_t s = reinterpret_cast<uintptr_t>(slot);
         uint32_t count = 0, instances = 0;
@@ -1048,7 +1169,8 @@ namespace wxl_livingazeroth::grassinst
 
         auto found = g_slots.find(slot);
         const bool current = found != g_slots.end() && found->second.page >= 0 && found->second.instances == instances
-                          && found->second.count == count && found->second.fingerprint == fp;
+                          && found->second.count == count && found->second.fingerprint == fp
+                          && found->second.densityGeneration == grassdensity::Generation();
         if (!current)
         {
             // Layers coming into view all want building at once (turning the camera at long
@@ -1057,6 +1179,7 @@ namespace wxl_livingazeroth::grassinst
 
             SlotEntry& e = g_slots[slot];
             ReleaseSlot(e);
+            e.slot = s;
             const double t0 = grassperf::Now();
             double deviceMs = 0;
             const Need r = BuildSlot(d3d, instances, count, e, deviceMs);
@@ -1135,16 +1258,19 @@ namespace wxl_livingazeroth::grassinst
 
         d3d->SetVertexShader(ours);
         d3d->SetVertexDeclaration(g_decl);
-        const unsigned m = LayerMultiplier(e);
-        const float copyReg[4] = { g_settings.densitySpread, 0.0f, 0.0f, 0.0f };
-        d3d->SetVertexShaderConstantF(kCopyReg, copyReg, 1);
         // A per-layer start in the table, so layers don't all repeat the same copy pattern.
         const uint32_t group0 = Mix(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(slot))) % (kCopyTableSpan - kCopyPlants);
 
         unsigned calls = 0, copies = 0;
+        bool densified = false;
         for (const Range& r : e.ranges)
         {
             if (!r.count || !r.geo->vb) continue;
+            const unsigned m = RangeMultiplier(e, r);
+            const float spread = r.density.spread < g_settings.maxSpread ? r.density.spread : g_settings.maxSpread;
+            const float copyReg[4] = { spread, 0.0f, 0.0f, 0.0f };
+            d3d->SetVertexShaderConstantF(kCopyReg, copyReg, 1);
+            densified |= m > 1;
             d3d->SetStreamSource(0, r.geo->vb, 0, sizeof(GpuVertex));
             d3d->SetIndices(r.geo->ib);
             for (uint32_t first = 0; first < r.count; first += kCopyPlants)
@@ -1161,7 +1287,7 @@ namespace wxl_livingazeroth::grassinst
             }
         }
         d3d->SetVertexShaderConstantF(kCopyReg, savedCopyReg, 1);
-        if (m > 1) { ++g_frameStats.densifiedLayers; g_frameStats.densityCopies += copies; }
+        if (densified) { ++g_frameStats.densifiedLayers; g_frameStats.densityCopies += copies; }
 
         for (UINT i = 0; i < 3; ++i)
         {
@@ -1298,6 +1424,11 @@ namespace wxl_livingazeroth::grassinst
         size_t instanceBytes = 0, geometryBytes = 0;
         for (const auto& [slot, e] : g_slots) instanceBytes += static_cast<size_t>(e.allocated) * sizeof(GpuInstance);
         s.poolPages = LivePages();
+        s.lastArea = g_lastContext.valid ? g_lastContext.area : 0;
+        s.lastEffects = g_lastContext.effectCount;
+        s.lastDoodads = g_lastDoodads;
+        s.lastDoodadsWithEffect = g_lastEffectsFound;
+        s.lastContextValid = g_lastContext.valid;
         s.poolLimitPages = PageLimit();
         s.memoryTight = g_memoryTight;
         for (const auto& [id, g] : g_geometry)

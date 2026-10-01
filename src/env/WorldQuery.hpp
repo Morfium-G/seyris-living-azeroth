@@ -33,4 +33,8 @@ namespace wxl_livingazeroth::world
 
     /// The last snapshot Refresh() produced.
     const Snapshot& Current();
+
+    /// An area and its parents, most specific first (sub-area, zone, ...), from AreaTable.
+    /// Returns how many were written (0 for area 0).
+    int AreaChain(uint32_t area, uint32_t* out, int max);
 }

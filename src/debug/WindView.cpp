@@ -2,6 +2,7 @@
 
 #include "ShaderDump.hpp"
 
+#include "../features/GrassDensity.hpp"
 #include "../features/GrassDistanceCap.hpp"
 #include "../features/GrassDoodads.hpp"
 #include "../features/GrassInstanced.hpp"
@@ -255,10 +256,19 @@ namespace wxl_livingazeroth::debug
                     g_api->UiText(line);
                     // Density preview: our own extra plants around a picked spot, to judge the look.
                     g_api->UiSeparator();
-                    g_api->UiText("Density near the player (instanced grass only; multiplier 1 = off):");
-                    g_api->UiSliderFloat("Density multiplier", &is.densityMultiplier, 1.0f, 8.0f);
-                    g_api->UiSliderFloat("Density radius (yards)", &is.densityRadius, 10.0f, 1000.0f);
-                    g_api->UiSliderFloat("Copy spread (yards)", &is.densitySpread, 0.2f, 3.0f);
+                    g_api->UiText("Density near the player (instanced grass only). Your limits:");
+                    g_api->UiSliderFloat("Max density multiplier", &is.maxMultiplier, 1.0f, 8.0f);
+                    g_api->UiSliderFloat("Max density radius (yards)", &is.maxRadius, 10.0f, 1000.0f);
+                    g_api->UiSliderFloat("Max copy spread (yards)", &is.maxSpread, 0.2f, 3.0f);
+                    std::snprintf(line, sizeof(line), "GroundEffectDoodadDensity.cdbc: %s", grassdensity::Status());
+                    g_api->UiTextWrapped(line);
+                    if (g_api->UiButton("Reload GroundEffectDoodadDensity.cdbc")) grassdensity::Load(g_cdbc);
+                    if (st.lastContextValid)
+                        std::snprintf(line, sizeof(line), "last layer built: area %u, %u ground effect(s), %u of %u doodads traced to one",
+                                      st.lastArea, st.lastEffects, st.lastDoodadsWithEffect, st.lastDoodads);
+                    else
+                        std::snprintf(line, sizeof(line), "last layer built: chunk not found (density uses map/global rows only)");
+                    g_api->UiTextWrapped(line);
                     std::snprintf(line, sizeof(line), "last frame: %u layers densified, %u extra plants drawn", st.densifiedLayers, st.densityCopies);
                     g_api->UiText(line);
                     g_api->UiSeparator();

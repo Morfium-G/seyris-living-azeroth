@@ -19,6 +19,7 @@
 #include "env/Actors.hpp"
 #include "env/Wind.hpp"
 #include "env/WorldQuery.hpp"
+#include "features/GrassDensity.hpp"
 #include "features/GrassDistanceCap.hpp"
 #include "features/GrassDoodads.hpp"
 #include "features/GrassInstanced.hpp"
@@ -55,6 +56,7 @@ namespace
         wxl_livingazeroth::debug::SetWindCdbc(cdbc);
         wxl_livingazeroth::wind::LoadProfiles(cdbc);
         wxl_livingazeroth::grassdoodads::LoadOverrides(cdbc);
+        wxl_livingazeroth::grassdensity::Load(cdbc);
 
         wxl_livingazeroth::config::Apply(g_api);
         wxl_livingazeroth::grassdistance::OnFirstFrame();

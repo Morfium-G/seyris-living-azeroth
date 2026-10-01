@@ -177,6 +177,15 @@ namespace wxl_livingazeroth::debug
         auto* dev = static_cast<IDirect3DDevice9*>(a && a->device ? a->device : gx::RawDevice());
         if (!dev) return;
 
+        // A graphics restart can replace the device; a shader from the old one can't be used.
+        static void* shaderDevice = nullptr;
+        if (dev != shaderDevice)
+        {
+            if (g_pixelShader) gx::Release(g_pixelShader);
+            g_pixelShader = nullptr;
+            g_shaderFailed = false;
+            shaderDevice = dev;
+        }
         if (!g_pixelShader && !g_shaderFailed)
         {
             g_pixelShader = gx::CompilePixelShader(gx::Device9(dev), kDepthViewHlsl, "ps_2_0");

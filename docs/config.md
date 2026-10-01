@@ -13,9 +13,9 @@ says why.
 | InstancedGrass | 1 | Draw grass with the instanced renderer (much faster at long grass distances). 0 = the client's own path. |
 | InstancedGrassBuildBudgetMs | 3 | Milliseconds per frame spent preparing grass coming into view; the rest is drawn the client's way until a later frame. |
 | InstancedGrassMemoryMB | 256 | Most memory (MB) the instanced grass may use. It shares the client's 32-bit address space; too high can crash the client. At the limit, grass not seen for about a second is dropped. |
-| GrassDensityMultiplier | 1 | Instanced grass only: each plant near the player is drawn this many times (1 = off, up to 8). The copies are made on the GPU (no extra memory): same doodad and tint, a random turn, a random spot on the plant's own terrain triangle. Full density within half of GrassDensityRadius, fading to normal at it. |
-| GrassDensityRadius | 60 | Yards around the player where the density multiplier applies. |
-| GrassDensitySpread | 1 | Most yards a copy moves from its plant. Copies never leave the plant's terrain triangle, so above ~2 yd this stops mattering. |
+| GrassDensityMaxMultiplier | 4 | Instanced grass only: your limit on grass density (plants drawn per placed plant, 1 = never denser, up to 8). How dense grass is comes from `GroundEffectDoodadDensity.cdbc`; this only caps it, like a graphics setting. |
+| GrassDensityMaxRadius | 150 | Your limit on how far around you grass is made denser, in yards. |
+| GrassDensityMaxSpread | 3 | Your limit on how far an extra plant may move from its plant, in yards. |
 | GrassDistanceCap | 10000 | Highest grass distance (`groundEffectDist`) the client accepts. The exe's own cap is 140. Only raised, never lowered: if the exe or another module already allows at least this much, it's left alone. |
 | GrassMotion | 1 | Grass sways in the wind and parts around characters. |
 | GrassSway | 0.35 | Grass tip movement in yards at full wind. |

@@ -26,12 +26,11 @@ namespace wxl_livingazeroth::grassinst
     {
         bool  enabled = true;       // runtime switch (debug panel); off = the client's own path
         float buildBudgetMs = 3.0f; // per frame; layers past it draw the client's way that frame
-        // Density near the player (instanced path only): every plant is drawn `multiplier` times
-        // (copies made on the GPU: a random spot within densitySpread yards on its own terrain
-        // plane, a random turn). Full within half of densityRadius, fading to 1 at it. 1 = off.
-        float densityMultiplier = 1.0f;
-        float densityRadius = 60.0f;  // yards around the player
-        float densitySpread = 1.0f;   // yards a copy may sit from its original
+        // The player's density limits (instanced path only). How dense grass is comes from
+        // GroundEffectDoodadDensity.cdbc (content); these cap it, like a graphics setting.
+        float maxMultiplier = 4.0f;   // plants drawn per placed plant
+        float maxRadius = 150.0f;     // yards around the player
+        float maxSpread = 3.0f;       // yards a copy may move from its plant
         float memoryLimitMB = 256.0f; // cap on the instance pool (dynamic buffers share the 32-bit address space)
     };
 
@@ -72,6 +71,11 @@ namespace wxl_livingazeroth::grassinst
         unsigned shaders = 0;          // derived instanced shaders
         unsigned densifiedLayers = 0;  // last frame: layers drawn with density copies
         unsigned densityCopies = 0;    // last frame: extra plants drawn
+        // the last layer built: its chunk's area, ground effects, and how many of its doodads
+        // were traced back to one of them (for checking the density context)
+        bool     lastContextValid = false;
+        uint32_t lastArea = 0;
+        unsigned lastEffects = 0, lastDoodads = 0, lastDoodadsWithEffect = 0;
         // last frame
         unsigned slotsInstanced = 0;
         unsigned drawCalls = 0;

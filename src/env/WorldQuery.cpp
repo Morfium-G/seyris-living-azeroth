@@ -95,18 +95,7 @@ namespace wxl_livingazeroth::world
             {
                 uint32_t area = 0;
                 if (reinterpret_cast<QueryAreaIdFn>(wo::kMapAreaIdQuery)(location, &area) && area)
-                {
-                    // Walk up the parents; the cap guards against a malformed (cyclic) table.
-                    while (area && s.areaCount < kMaxAreaChain)
-                    {
-                        s.areaChain[s.areaCount++] = area;
-                        const uint8_t* rec = AreaRecord(area);
-                        if (!rec) break;
-                        const uint32_t parent = *reinterpret_cast<const uint32_t*>(rec + kAreaParentField);
-                        if (parent == area) break;
-                        area = parent;
-                    }
-                }
+                    s.areaCount = AreaChain(area, s.areaChain, kMaxAreaChain);
                 s.outdoors = reinterpret_cast<OutdoorsFn>(wo::kOutdoorsQuery)(location) != 0;
             }
 
@@ -120,4 +109,20 @@ namespace wxl_livingazeroth::world
     }
 
     const Snapshot& Current() { return g_snap; }
+
+    int AreaChain(uint32_t area, uint32_t* out, int max)
+    {
+        // Walk up the parents; the cap guards against a malformed (cyclic) table.
+        int n = 0;
+        while (area && n < max)
+        {
+            out[n++] = area;
+            const uint8_t* rec = AreaRecord(area);
+            if (!rec) break;
+            const uint32_t parent = *reinterpret_cast<const uint32_t*>(rec + kAreaParentField);
+            if (parent == area) break;
+            area = parent;
+        }
+        return n;
+    }
 }
