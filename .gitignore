@@ -66,5 +66,4 @@ Testing/
 # session and development notes (local only)
 docs/notes/
 
-# generated test data (regenerate with tools/gen_*.py)
-data/*.cdbc
+# data/*.cdbc is shipped sample data (tracked); the tools/gen_*.py scripts can regenerate a baseline

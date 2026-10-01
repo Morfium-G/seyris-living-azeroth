@@ -37,7 +37,9 @@ only add what stock data can't express, and every feature can be switched off.
   (`GroundEffectDoodadDensity.cdbc`, per area, map or globally, per doodad or ground effect). The
   player's own limits cap it, like a graphics setting.
 - **Grass distance:** the client's hard limit of 140 yards for `groundEffectDist` is raised, with
-  no exe patch. It's left alone if the exe or another module already allows more.
+  no exe patch. It's left alone if the exe or another module already allows more. The game's own
+  options slider still stops at its old maximum; to go further, set the distance with the console,
+  e.g. `/console groundEffectDist 1024`. The client saves it like any other setting.
 
 **Readable scene depth**
 - The world's depth buffer made readable for later effects (fog, footprints, water edges). It's
@@ -53,13 +55,17 @@ only add what stock data can't express, and every feature can be switched off.
 ## Installation
 
 1. Put `wxl-seyris-living-azeroth.dll` into `<client>\Extensions\wxl-seyris-living-azeroth\`.
-2. Optional data, into `<client>\DBFilesClient\`:
-   - `GroundEffectDoodadDensity.cdbc`: grass density. Generate the shipped baseline with
-     `python tools/gen_default_density.py`. Without it there are no extra plants.
+2. Copy the files from [`data/`](data/) into `<client>\DBFilesClient\`:
    - `WindProfile.cdbc`: wind per map/area. It needs a Global row for any wind at all; without
-     the file, grass still parts around characters but doesn't sway. `tools/gen_test_wind.py`
-     writes an example: a global wind plus a few areas around Orgrimmar.
-   - `GroundEffectDoodadWind.cdbc`: per-doodad grass overrides, written by the in-game panel.
+     the file, grass still parts around characters but doesn't sway.
+   - `GroundEffectDoodadWind.cdbc`: per-doodad grass overrides (also editable and saved from the
+     in-game panel).
+   - `GroundEffectDoodadDensity.cdbc`: grass density near the player. Without it there are no
+     extra plants.
+
+   **These are sample data**, so that wind and grass show up and work in some stock 3.3.5 zones.
+   They are in no way fine-tuned yet. The scripts in `tools/` regenerate a minimal baseline
+   (`gen_default_density.py`) or a small wind example (`gen_test_wind.py`).
 3. Start the client. `Logs\wxl-core.log` lists what loaded.
 
 ## Configuration
