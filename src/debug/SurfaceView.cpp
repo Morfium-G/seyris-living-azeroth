@@ -1,5 +1,7 @@
 #include "SurfaceView.hpp"
 
+#include "ShaderDump.hpp"
+#include "../env/TerrainHeight.hpp"
 #include "../env/WorldQuery.hpp"
 #include "../features/GrassInstanced.hpp"
 
@@ -37,7 +39,7 @@ namespace wxl_livingazeroth::debug
             std::snprintf(out, size, "%d %s%s", id, name ? name : "?", (flags & 1) ? " [footprints]" : "");
         }
 
-        void __cdecl Panel(void* /*user*/)
+        void Details(void* /*user*/)
         {
             char line[256], a[96], b[96];
             const world::Snapshot& s = world::Current();
@@ -45,6 +47,24 @@ namespace wxl_livingazeroth::debug
 
             Describe(s.playerTerrainType, a, sizeof(a));
             std::snprintf(line, sizeof(line), "client says the player stands on: TerrainType %s", a);
+            g_api->UiText(line);
+
+            // The client's own terrain query (0x7A0530) at the player: matches the line above on
+            // terrain, differs on WMOs (those come from the WMO material instead).
+            int queried = -1;
+            if (terrain::TerrainTypeAt(s.playerPos[0], s.playerPos[1], queried)) Describe(queried, a, sizeof(a));
+            else std::snprintf(a, sizeof(a), "(no terrain here: hole or not loaded)");
+            std::snprintf(line, sizeof(line), "client terrain query at the player: TerrainType %s", a);
+            g_api->UiText(line);
+
+            // Terrain height from the chunk's MCVT under the player vs the player's own z: on open
+            // ground these should agree to a few centimetres.
+            float ground = 0.0f;
+            if (terrain::HeightAt(s.playerPos[0], s.playerPos[1], ground))
+                std::snprintf(line, sizeof(line), "terrain height (MCVT) %.3f, player z %.3f, player - terrain %+.3f yd",
+                              ground, s.playerPos[2], s.playerPos[2] - ground);
+            else
+                std::snprintf(line, sizeof(line), "terrain height (MCVT): none here (hole or chunk not loaded)");
             g_api->UiText(line);
 
             const grassinst::TerrainProbe& p = grassinst::Probe();
@@ -82,6 +102,15 @@ namespace wxl_livingazeroth::debug
                 anyMatch                             ? "PARTIAL: one of the chunk's layers matches, but not the cell's dominant one" :
                                                        "NO MATCH: the client's value doesn't come from these layers (or you're on a WMO/object)";
             g_api->UiTextWrapped(verdict);
+        }
+
+        void __cdecl Panel(void* user)
+        {
+            Details(user);
+            g_api->UiSeparator();
+            // Research: the terrain shaders, for the surface-cover and terrain-relief patches.
+            if (g_api->UiButton("Dump terrain shaders (Logs\\living-azeroth)"))
+                DumpTerrainShaders(g_api);
         }
     }
 
