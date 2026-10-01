@@ -17,6 +17,8 @@ says why.
 | GrassDensityMaxRadius | 150 | Your limit on how far around you grass is made denser, in yards. |
 | GrassDensityMaxSpread | 3 | Your limit on how far an extra plant may move from its plant, in yards. |
 | GrassDistanceCap | 10000 | Highest grass distance (`groundEffectDist`) the client accepts. The exe's own cap is 140. Only raised, never lowered: if the exe or another module already allows at least this much, it's left alone. |
+| AntiAliasing | 1 | Our own anti-aliasing (FXAA), drawn before the UI. It only runs with the client's multisampling off, which readable depth (for upcoming effects like fog) needs anyway. |
+| AntiAliasingSubpixel | 0.75 | FXAA subpixel smoothing, 0 (sharpest) .. 1 (softest). |
 | GrassMotion | 1 | Grass sways in the wind and parts around characters. |
 | GrassSway | 0.35 | Grass tip movement in yards at full wind. |
 | GrassFlutter | 0.08 | Extra per-blade shimmer in yards. |

@@ -25,6 +25,7 @@
 #include "features/GrassInstanced.hpp"
 #include "features/GrassMotion.hpp"
 #include "features/GrassPerf.hpp"
+#include "render/PostAA.hpp"
 #include "render/SceneDepth.hpp"
 #include "render/ShaderPatch.hpp"
 #include "wxl_seyris/CdbcApi.hpp"
@@ -85,6 +86,7 @@ namespace
     {
         wxl_livingazeroth::depth::OnDeviceLost();
         wxl_livingazeroth::grassinst::OnDeviceLost();
+        wxl_livingazeroth::postaa::OnDeviceLost();
     }
 }
 
@@ -113,6 +115,9 @@ int __cdecl WXL_Load(const WXL_Api* api)
     wxl_livingazeroth::grass::Install(api);
     wxl_livingazeroth::shaderpatch::Install(api);
 
+    // Anti-aliasing subscribes before the debug overlays, so it runs first and they stay sharp on top.
+    wxl_livingazeroth::postaa::Install(api);
+    wxl_livingazeroth::postaa::RegisterPanel(api);
     wxl_livingazeroth::debug::RegisterPanel(api);
     wxl_livingazeroth::debug::RegisterWindPanel(api);
 

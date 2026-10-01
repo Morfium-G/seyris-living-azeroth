@@ -4,6 +4,7 @@
 #include "env/Shelter.hpp"
 #include "features/GrassInstanced.hpp"
 #include "features/GrassMotion.hpp"
+#include "render/PostAA.hpp"
 #include "wxl_seyris/SettingsApi.hpp"
 
 namespace wxl_livingazeroth::config
@@ -79,6 +80,13 @@ namespace wxl_livingazeroth::config
         g.radiusScale = Float(s, "GrassPushRadiusScale", "Push radius as a multiple of a character's bounding radius.", g.radiusScale);
         g.minRadius = Float(s, "GrassMinPushRadius", "Smallest push radius in yards.", g.minRadius);
         g.mountedScale = Float(s, "GrassMountedRadiusScale", "Extra push radius factor while mounted.", g.mountedScale);
+
+        postaa::Settings& aa = postaa::Tunables();
+        const bool fxaa = Bool(s, "AntiAliasing",
+            "Our own anti-aliasing (FXAA). Turn the client's multisampling off to use it: readable depth (for fog etc.) needs it off.",
+            aa.mode != postaa::Mode::Off);
+        aa.mode = fxaa ? postaa::Mode::Fxaa : postaa::Mode::Off;
+        aa.subpixel = Float(s, "AntiAliasingSubpixel", "FXAA subpixel smoothing, 0 (sharpest) .. 1 (softest).", aa.subpixel);
 
         shelter::SetEnabled(Bool(s, "WindShelter", "Roofs and overhangs shelter the ground below from wind.", shelter::Enabled()));
         shelter::SetLeeEnabled(Bool(s, "WindLee", "Walls and cliffs cast a wind shadow on their downwind side.", shelter::LeeEnabled()));
