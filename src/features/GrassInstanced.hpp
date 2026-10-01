@@ -26,6 +26,13 @@ namespace wxl_livingazeroth::grassinst
     {
         bool  enabled = true;       // runtime switch (debug panel); off = the client's own path
         float buildBudgetMs = 3.0f; // per frame; layers past it draw the client's way that frame
+        // Density near the player (instanced path only): every plant is drawn `multiplier` times
+        // (copies made on the GPU: a random spot within densitySpread yards on its own terrain
+        // plane, a random turn). Full within half of densityRadius, fading to 1 at it. 1 = off.
+        float densityMultiplier = 1.0f;
+        float densityRadius = 60.0f;  // yards around the player
+        float densitySpread = 1.0f;   // yards a copy may sit from its original
+        float memoryLimitMB = 256.0f; // cap on the instance pool (dynamic buffers share the 32-bit address space)
     };
 
     /// Attaches the engine buffer lock/unlock hooks the bake verification uses. Call from WXL_Load.
@@ -44,6 +51,10 @@ namespace wxl_livingazeroth::grassinst
     void BeforeStockFill(void* slot);
     void AfterStockFill(void* slot);
 
+    /// Per grass chunk, after the client uploaded its constants: the chunk's world origin (its
+    /// layers draw next). Chunk axes are world axes.
+    void SetChunkOrigin(const float origin[3]);
+
     // --- lifecycle ---
     void OnFrameEnd();
     void OnDeviceLost();
@@ -54,9 +65,13 @@ namespace wxl_livingazeroth::grassinst
         unsigned slotsCached = 0;
         double   instanceMB = 0;       // in use, of ...
         unsigned poolPages = 0;        // ... this many 4 MB pages
+        unsigned poolLimitPages = 0;
+        bool     memoryTight = false;  // at the cap: stale layers are dropped sooner
         unsigned geometries = 0;
         double   geometryKB = 0;
         unsigned shaders = 0;          // derived instanced shaders
+        unsigned densifiedLayers = 0;  // last frame: layers drawn with density copies
+        unsigned densityCopies = 0;    // last frame: extra plants drawn
         // last frame
         unsigned slotsInstanced = 0;
         unsigned drawCalls = 0;

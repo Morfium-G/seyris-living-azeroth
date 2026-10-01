@@ -248,9 +248,21 @@ namespace wxl_livingazeroth::debug
                     g_api->UiTextWrapped(line);
                     std::snprintf(line, sizeof(line), "grass distance cap (groundEffectDist): %.0f yd", grassdistance::CurrentCap());
                     g_api->UiText(line);
-                    std::snprintf(line, sizeof(line), "cached: %u layers (%.1f MB in %u x 4 MB pages), %u doodad models (%.0f KB), %u shaders",
-                                  st.slotsCached, st.instanceMB, st.poolPages, st.geometries, st.geometryKB, st.shaders);
+                    g_api->UiSliderFloat("Memory limit (MB)", &is.memoryLimitMB, 16.0f, 1024.0f);
+                    std::snprintf(line, sizeof(line), "cached: %u layers (%.1f MB in %u of max %u x 4 MB pages)%s, %u doodad models (%.0f KB), %u shaders",
+                                  st.slotsCached, st.instanceMB, st.poolPages, st.poolLimitPages,
+                                  st.memoryTight ? " AT LIMIT" : "", st.geometries, st.geometryKB, st.shaders);
                     g_api->UiText(line);
+                    // Density preview: our own extra plants around a picked spot, to judge the look.
+                    g_api->UiSeparator();
+                    g_api->UiText("Density near the player (instanced grass only; multiplier 1 = off):");
+                    g_api->UiSliderFloat("Density multiplier", &is.densityMultiplier, 1.0f, 8.0f);
+                    g_api->UiSliderFloat("Density radius (yards)", &is.densityRadius, 10.0f, 1000.0f);
+                    g_api->UiSliderFloat("Copy spread (yards)", &is.densitySpread, 0.2f, 3.0f);
+                    std::snprintf(line, sizeof(line), "last frame: %u layers densified, %u extra plants drawn", st.densifiedLayers, st.densityCopies);
+                    g_api->UiText(line);
+                    g_api->UiSeparator();
+
                     if (g_api->UiButton(grassinst::VerifyPending() ? "verifying... (waits for a layer build)##iv"
                                                                    : "Verify against the client's bake (next layer build)##iv"))
                         grassinst::RequestVerify();

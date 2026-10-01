@@ -2,6 +2,7 @@
 
 #include "GrassPerf.hpp"
 
+#include "../env/WorldQuery.hpp"
 #include "../render/ShaderPatch.hpp"
 
 #include "game/Gx.hpp"
@@ -75,6 +76,7 @@ namespace wxl_livingazeroth::grassinst
 
         // Evict slot buffers not drawn for this many frames (checked every kEvictEvery frames).
         constexpr uint32_t kEvictAfter = 900, kEvictEvery = 128;
+        constexpr uint32_t kEvictAfterTight = 60; // at the memory cap: anything not drawn for ~1 s
 
         // --- GPU layouts ---------------------------------------------------------------------------
         struct GpuVertex { float pos[3]; float uv[2]; };
@@ -86,15 +88,78 @@ namespace wxl_livingazeroth::grassinst
         static_assert(sizeof(GpuInstance) == 64, "GpuInstance");
 
         // The instanced shader's extra inputs (see MakeInstanced), inserted after the last dcl.
+        // Density copies are made on the GPU: stream 1 repeats each plant for `multiplier`
+        // instances (frequency divider) and stream 2 gives every instance a copy entry
+        // (a, b, turn, weight); weight 0 = the original. A copy turns the model about its own up
+        // axis and moves toward a random point of the plant's OWN terrain triangle -- at most
+        // c153.x yards -- so the triangle's plane (normal = v1) gives its exact height. Placement
+        // (0x7D3390): chunk-local coordinates run from the chunk corner into the negatives, the 8x8
+        // cells are 4.1667 yd, each cell split into 4 triangles by its diagonals; a triangle is
+        // convex, so moving toward a point inside it never leaves it.
+        constexpr unsigned kCopyReg = 153;
         const char* kInstancedInputs =
             "    dcl_texcoord1 v4\n"
             "    dcl_texcoord2 v5\n"
             "    dcl_texcoord3 v6\n"
+            "    dcl_texcoord4 v7\n"
+            "    def c154, 1, 0, 0.0001, -2\n"
+            "    def c155, 4.16666651, 0.24, 0.5, 0\n"
+            // the copy's turn about the model's up axis, then the plant transform
             "    mov r30, v0\n"
-            "    dp4 r31.x, r30, v4\n"
-            "    dp4 r31.y, r30, v5\n"
-            "    dp4 r31.z, r30, v6\n"
-            "    mov r31.w, r30.w\n";
+            "    sincos r29.xy, v7.z\n"
+            "    mul r28.x, r30.x, r29.x\n"
+            "    mad r28.x, -r30.y, r29.y, r28.x\n"
+            "    mul r28.y, r30.x, r29.y\n"
+            "    mad r28.y, r30.y, r29.x, r28.y\n"
+            "    mov r28.zw, r30\n"
+            "    dp4 r31.x, r28, v4\n"
+            "    dp4 r31.y, r28, v5\n"
+            "    dp4 r31.z, r28, v6\n"
+            "    mov r31.w, r30.w\n"
+            // the plant's cell and triangle (in |chunk-local| cell units)
+            "    mov r20.x, v4.w\n"
+            "    mov r20.y, v5.w\n"
+            "    slt r20.zw, r20.xxxy, c154.y\n"
+            "    mad r20.zw, r20, c154.w, c154.x\n"     // sign of each coordinate
+            "    abs r21.xy, r20\n"
+            "    mul r21.xy, r21, c155.y\n"
+            "    frc r22.xy, r21\n"                     // position in the cell, 0..1
+            "    add r21.xy, r21, -r22\n"               // cell corner
+            "    slt r23.x, r22.y, r22.x\n"             // d1: below the diagonal y = x
+            "    add r23.w, c154.x, -r22.x\n"
+            "    slt r23.y, r22.y, r23.w\n"             // d2: below the diagonal y = 1 - x
+            "    add r24.x, c154.x, -r23.y\n"           // corner A = (1 - d2, 1 - d1)
+            "    add r24.y, c154.x, -r23.x\n"
+            "    mov r25.x, r23.x\n"                    // corner B = (d1, 1 - d2); C = cell centre
+            "    mov r25.y, r24.x\n"
+            "    add r24.xy, r24, -c155.z\n"
+            "    add r25.xy, r25, -c155.z\n"
+            // a uniform point of the triangle from (a, b), folded when a + b > 1
+            "    add r26.x, v7.x, v7.y\n"
+            "    slt r26.y, c154.x, r26.x\n"
+            "    add r27.xy, c154.x, -v7\n"
+            "    lrp r27.xy, r26.y, r27, v7\n"
+            "    mad r26.xy, r27.x, r24, c155.z\n"
+            "    mad r26.xy, r27.y, r25, r26\n"
+            "    add r26.xy, r21, r26\n"
+            "    mul r26.xy, r26, c155.x\n"
+            "    mul r26.xy, r26, r20.zwzw\n"           // back to chunk-local
+            "    add r26.xy, r26, -r20\n"               // offset from the plant
+            // at most c153.x yards of it; none for the original (weight 0)
+            "    mul r27.zw, r26.xxxy, r26.xxxy\n"
+            "    add r27.z, r27.z, r27.w\n"
+            "    add r27.z, r27.z, c154.z\n"
+            "    rsq r27.w, r27.z\n"
+            "    mul r27.w, r27.w, c153.x\n"
+            "    min r27.w, r27.w, c154.x\n"
+            "    mul r27.w, r27.w, v7.w\n"
+            "    mul r29.xy, r26, r27.w\n"
+            // height from the triangle's plane
+            "    mul r29.z, v1.x, r29.x\n"
+            "    mad r29.z, v1.y, r29.y, r29.z\n"
+            "    rcp r29.w, v1.z\n"
+            "    mul r29.z, -r29.z, r29.w\n"
+            "    add r31.xyz, r31, r29\n";
 
         // --- state ---------------------------------------------------------------------------------
         const WXL_Api* g_api = nullptr;
@@ -120,8 +185,14 @@ namespace wxl_livingazeroth::grassinst
         constexpr uint32_t kPageInstances = 65536; // 4 MB; also the most plants a slot can hold
         constexpr uint32_t kReuseDelay = 4;
 
+        // Dynamic buffers usually live in system memory mapped into this 32-bit process, so the pool
+        // has a hard cap (Settings::memoryLimitMB): past it, no new pages; stale layers are dropped
+        // and pages that empty out are released. Growing unchecked (800 MB after teleporting) left
+        // the client's own heap without address space (MapMem.cpp out-of-memory).
+        constexpr uint32_t kPageBytes = kPageInstances * 64;
+
         struct Block { uint32_t offset, size; }; // in instances
-        struct Page { IDirect3DVertexBuffer9* vb = nullptr; std::vector<Block> free; };
+        struct Page { IDirect3DVertexBuffer9* vb = nullptr; std::vector<Block> free; }; // vb null = released
         struct Retired { uint32_t page; Block block; uint32_t frame; };
         std::vector<Page>    g_pages;
         std::vector<Retired> g_retired;
@@ -133,6 +204,8 @@ namespace wxl_livingazeroth::grassinst
             uint32_t  count = 0, fingerprint = 0;
             int       page = -1; // -1 = nothing allocated
             uint32_t  offset = 0;
+            uint32_t  allocated = 0;  // instances in the page range
+            float     center[2] = {}; // chunk-local centre of the plants (density distance)
             gd::SlotDoodads sd{};
             std::vector<Range> ranges;
             uint32_t  lastFrame = 0;
@@ -143,6 +216,21 @@ namespace wxl_livingazeroth::grassinst
         std::unordered_map<IDirect3DVertexShader9*, Derived> g_shaders; // key: the client's grass shader (held)
         IDirect3DVertexDeclaration9* g_decl = nullptr;
         bool  g_declFailed = false;
+
+        // Density near the player: each layer draws (multiplier) instances per plant, full within
+        // half the radius and fading to 1 at the radius, by the distance of its plants' centre.
+        // Decided per draw, so nothing is rebuilt when the player moves or a setting changes.
+        constexpr unsigned kMaxMultiplier = 8;
+        constexpr unsigned kCopyPlants = 8192;     // plants per instanced draw (bigger ranges split)
+        constexpr unsigned kCopyTableSpan = 16384; // table entries per multiplier, in plants
+        struct CopyEntry { float a, b, turn, weight; };
+        IDirect3DVertexBuffer9* g_copyTable = nullptr; // per multiplier m: kCopyTableSpan * m entries
+        uint32_t g_copyBase[kMaxMultiplier + 1] = {};  // first entry of multiplier m's region
+        bool     g_memoryTight = false;    // at the instance pool's page cap
+        int      g_lastMapId = -1;
+        float    g_chunkOrigin[3] = {};    // world position of the chunk whose layers draw next
+        bool     g_chunkOriginValid = false;
+
 
         Stats  g_frameStats, g_lastStats;
         double g_frameBuildMs = 0; // against Settings::buildBudgetMs
@@ -292,6 +380,24 @@ namespace wxl_livingazeroth::grassinst
             std::memcpy(g.normal, up, sizeof(up));
         }
 
+        // --- density preview: extra plants of our own ------------------------------------------
+        // A plant's up vector is the normal of the terrain triangle it stands on, and its position
+        // lies on that triangle's plane, so a copy moved by (dx, dy) gets its height from the
+        // plane: exact while it stays on the triangle (~2 yd across), very close just past it.
+        // The shader does the moving (kInstancedInputs); this builds the table of copy entries.
+        uint32_t Mix(uint32_t x)
+        {
+            x ^= x >> 16; x *= 0x7FEB352Du; x ^= x >> 15; x *= 0x846CA68Bu; x ^= x >> 16;
+            return x;
+        }
+
+        float Unit(uint32_t& state)
+        {
+            state = Mix(state + 0x9E3779B9u);
+            return static_cast<float>(state >> 8) * (1.0f / 16777216.0f);
+        }
+
+
         // --- doodad model geometry ----------------------------------------------------------------
         // The bake writes, per plant, one vertex per skin vertex-lookup entry (skin +4 count, +8 u16
         // model vertex indices), and 0x7B12B0 indexes them with the skin's triangle list (+0xC
@@ -398,10 +504,14 @@ namespace wxl_livingazeroth::grassinst
             return h;
         }
 
+        unsigned LivePages();
+        unsigned PageLimit();
+
         bool Allocate(IDirect3DDevice9* d3d, uint32_t count, int& page, uint32_t& offset)
         {
             for (size_t p = 0; p < g_pages.size(); ++p)
             {
+                if (!g_pages[p].vb) continue;
                 std::vector<Block>& free = g_pages[p].free;
                 for (size_t i = 0; i < free.size(); ++i)
                 {
@@ -414,15 +524,32 @@ namespace wxl_livingazeroth::grassinst
                     return true;
                 }
             }
-            Page fresh;
-            if (FAILED(d3d->CreateVertexBuffer(kPageInstances * sizeof(GpuInstance), D3DUSAGE_WRITEONLY | D3DUSAGE_DYNAMIC, 0,
-                                               D3DPOOL_DEFAULT, &fresh.vb, nullptr)))
+            if (LivePages() >= PageLimit()) { g_memoryTight = true; return false; }
+
+            IDirect3DVertexBuffer9* vb = nullptr;
+            if (FAILED(d3d->CreateVertexBuffer(kPageBytes, D3DUSAGE_WRITEONLY | D3DUSAGE_DYNAMIC, 0, D3DPOOL_DEFAULT, &vb, nullptr)))
                 return false;
-            fresh.free.push_back({ count, kPageInstances - count });
-            g_pages.push_back(std::move(fresh));
-            page = static_cast<int>(g_pages.size() - 1);
+            size_t p = 0;
+            while (p < g_pages.size() && g_pages[p].vb) ++p; // reuse a released page's index
+            if (p == g_pages.size()) g_pages.emplace_back();
+            g_pages[p].vb = vb;
+            g_pages[p].free.assign(1, { count, kPageInstances - count });
+            page = static_cast<int>(p);
             offset = 0;
             return true;
+        }
+
+        unsigned LivePages()
+        {
+            unsigned n = 0;
+            for (const Page& p : g_pages) n += p.vb ? 1 : 0;
+            return n;
+        }
+
+        unsigned PageLimit()
+        {
+            const float mb = g_settings.memoryLimitMB < 16.0f ? 16.0f : g_settings.memoryLimitMB;
+            return static_cast<unsigned>(mb * 1024.0f * 1024.0f / kPageBytes);
         }
 
         // Back into the page's free list (sorted by offset), merged with its neighbours.
@@ -446,7 +573,7 @@ namespace wxl_livingazeroth::grassinst
 
         void ReleaseSlot(SlotEntry& e)
         {
-            if (e.page >= 0) g_retired.push_back({ static_cast<uint32_t>(e.page), { e.offset, e.count }, g_frame });
+            if (e.page >= 0) g_retired.push_back({ static_cast<uint32_t>(e.page), { e.offset, e.allocated }, g_frame });
             e.page = -1;
             e.ranges.clear();
         }
@@ -498,23 +625,29 @@ namespace wxl_livingazeroth::grassinst
                 plants[i].color = BakeColor((color & ~gd::kIndexMask) | gd::IndexTag(entry), k);
             }
 
+            // The plants' centre, for the per-draw density distance.
+            float center[2] = {};
+            for (uint32_t i = 0; i < count; ++i) { center[0] += plants[i].x[3]; center[1] += plants[i].y[3]; }
+            center[0] /= count; center[1] /= count;
+            const uint32_t total = static_cast<uint32_t>(plants.size());
+
             // Group the plants by doodad so each doodad's plants are one contiguous instance range.
             std::vector<uint32_t> start(order.size(), 0), fill(order.size(), 0);
             for (uint32_t g : group) ++fill[g];
             for (size_t g = 1; g < order.size(); ++g) start[g] = start[g - 1] + fill[g - 1];
-            std::vector<GpuInstance> sorted(count);
+            std::vector<GpuInstance> sorted(total);
             std::copy(start.begin(), start.end(), fill.begin());
-            for (uint32_t i = 0; i < count; ++i) sorted[fill[group[i]]++] = plants[i];
+            for (uint32_t i = 0; i < total; ++i) sorted[fill[group[i]]++] = plants[i];
 
             // Into a pool range: the range is free, so the GPU isn't reading it (NOOVERWRITE).
             const double t0 = grassperf::Now();
             int page = -1;
             uint32_t offset = 0;
-            bool uploaded = Allocate(d3d, count, page, offset);
+            bool uploaded = Allocate(d3d, total, page, offset);
             if (uploaded)
             {
                 void* p = nullptr;
-                const UINT bytes = count * static_cast<UINT>(sizeof(GpuInstance));
+                const UINT bytes = total * static_cast<UINT>(sizeof(GpuInstance));
                 uploaded = SUCCEEDED(g_pages[page].vb->Lock(offset * static_cast<UINT>(sizeof(GpuInstance)), bytes, &p,
                                                              D3DLOCK_NOOVERWRITE)) && p;
                 if (uploaded)
@@ -522,17 +655,20 @@ namespace wxl_livingazeroth::grassinst
                     std::memcpy(p, sorted.data(), bytes);
                     g_pages[page].vb->Unlock();
                 }
-                else g_retired.push_back({ static_cast<uint32_t>(page), { offset, count }, g_frame });
+                else g_retired.push_back({ static_cast<uint32_t>(page), { offset, total }, g_frame });
             }
             deviceMs = grassperf::Now() - t0;
             if (!uploaded) return Need::Failed;
 
             e.page = page;
             e.offset = offset;
+            e.allocated = total;
+            e.center[0] = center[0];
+            e.center[1] = center[1];
             e.sd = sd;
             e.ranges.clear();
             for (size_t g = 0; g < order.size(); ++g)
-                e.ranges.push_back({ orderGeo[g], offset + start[g], (g + 1 < order.size() ? start[g + 1] : count) - start[g] });
+                e.ranges.push_back({ orderGeo[g], offset + start[g], (g + 1 < order.size() ? start[g + 1] : total) - start[g] });
             gd::NoteSlot(sd, overflow);
             return Need::Ok;
         }
@@ -568,8 +704,9 @@ namespace wxl_livingazeroth::grassinst
         // (v2) and uv (v3) keep their registers: stream 1 carries the first two, stream 0 the uv.
         bool MakeInstanced(const std::string& src, std::string& out, std::string& error)
         {
-            if (src.find("r30") != std::string::npos || src.find("r31") != std::string::npos)
-            { error = "the shader already uses r30/r31"; return false; }
+            for (const char* reg : { "r20", "r21", "r22", "r23", "r24", "r25", "r26", "r27", "r28", "r29", "r30", "r31",
+                                     "c153", "c154", "c155" })
+                if (src.find(reg) != std::string::npos) { error = std::string("the shader already uses ") + reg; return false; }
 
             std::vector<std::string> lines;
             for (size_t at = 0; at <= src.size();)
@@ -688,6 +825,7 @@ namespace wxl_livingazeroth::grassinst
                 { 1, 32, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 3 },
                 { 1, 48, el[nrm].Type,       D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL, 0 },
                 { 1, 60, el[col].Type,       D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0 },
+                { 2, 0,  D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 4 },
                 D3DDECL_END()
             };
             if (FAILED(d3d->CreateVertexDeclaration(ours, &g_decl)) || !g_decl)
@@ -717,6 +855,52 @@ namespace wxl_livingazeroth::grassinst
             static_cast<uint8_t*>(buf)[kBufBuilt] = 1; // as the layer build does after its unlock
             reinterpret_cast<PrimVertexPtrFn>(kPrimVertexPtr)(buf, kGrassFormat);
             return true;
+        }
+
+        // Multiplier m's region holds kCopyTableSpan groups of m entries: entry 0 of a group is the
+        // original (weight 0), the rest a random point of the triangle (a, b in 0..1) and a random
+        // turn in -pi..pi (what sincos takes).
+        bool EnsureCopyTable(IDirect3DDevice9* d3d)
+        {
+            if (g_copyTable) return true;
+            uint32_t total = 0;
+            for (unsigned m = 1; m <= kMaxMultiplier; ++m) { g_copyBase[m] = total; total += kCopyTableSpan * m; }
+            std::vector<CopyEntry> table(total);
+            uint32_t state = 0x6A09E667u;
+            for (unsigned m = 1; m <= kMaxMultiplier; ++m)
+                for (uint32_t g = 0; g < kCopyTableSpan; ++g)
+                    for (unsigned k = 0; k < m; ++k)
+                    {
+                        CopyEntry& c = table[g_copyBase[m] + g * m + k];
+                        if (k == 0) { c = { 0.0f, 0.0f, 0.0f, 0.0f }; continue; }
+                        c = { Unit(state), Unit(state), (Unit(state) - 0.5f) * 6.2831853f, 1.0f };
+                    }
+            const UINT bytes = total * static_cast<UINT>(sizeof(CopyEntry));
+            if (FAILED(d3d->CreateVertexBuffer(bytes, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &g_copyTable, nullptr))
+                || !Upload(g_copyTable, table.data(), bytes))
+            {
+                Release(g_copyTable);
+                g_copyTable = nullptr;
+                return false;
+            }
+            return true;
+        }
+
+        // Full multiplier within half the radius, fading to 1 at the radius.
+        unsigned LayerMultiplier(const SlotEntry& e)
+        {
+            const float mult = g_settings.densityMultiplier;
+            if (mult < 1.5f || !g_chunkOriginValid) return 1;
+            const world::Snapshot& w = world::Current();
+            if (!w.inWorld) return 1;
+            const float dx = g_chunkOrigin[0] + e.center[0] - w.playerPos[0];
+            const float dy = g_chunkOrigin[1] + e.center[1] - w.playerPos[1];
+            const float r = g_settings.densityRadius > 1.0f ? g_settings.densityRadius : 1.0f;
+            const float d = std::sqrt(dx * dx + dy * dy);
+            const float full = r * 0.5f;
+            const float t = d <= full ? 1.0f : (d >= r ? 0.0f : 1.0f - (d - full) / (r - full));
+            const unsigned m = static_cast<unsigned>(1.0f + (mult - 1.0f) * t + 0.5f);
+            return m < 1 ? 1 : (m > kMaxMultiplier ? kMaxMultiplier : m);
         }
 
         bool CheckCaps(IDirect3DDevice9* d3d)
@@ -928,7 +1112,7 @@ namespace wxl_livingazeroth::grassinst
         IDirect3DVertexShader9* clientVs = nullptr;
         d3d->GetVertexShader(&clientVs);
         IDirect3DVertexShader9* ours = DerivedShader(d3d, clientVs);
-        if (!ours || !EnsureDecl(d3d))
+        if (!ours || !EnsureDecl(d3d) || !EnsureCopyTable(d3d))
         {
             Release(clientVs);
             ++g_frameStats.fallbackFailed;
@@ -936,11 +1120,13 @@ namespace wxl_livingazeroth::grassinst
         }
 
         IDirect3DVertexDeclaration9* savedDecl = nullptr;
-        IDirect3DVertexBuffer9* savedVb[2] = {};
-        UINT savedOffset[2] = {}, savedStride[2] = {}, savedFreq[2] = { 1, 1 };
+        IDirect3DVertexBuffer9* savedVb[3] = {};
+        UINT savedOffset[3] = {}, savedStride[3] = {}, savedFreq[3] = { 1, 1, 1 };
+        float savedCopyReg[4] = {};
+        d3d->GetVertexShaderConstantF(kCopyReg, savedCopyReg, 1);
         IDirect3DIndexBuffer9* savedIb = nullptr;
         d3d->GetVertexDeclaration(&savedDecl);
-        for (UINT i = 0; i < 2; ++i)
+        for (UINT i = 0; i < 3; ++i)
         {
             d3d->GetStreamSource(i, &savedVb[i], &savedOffset[i], &savedStride[i]);
             d3d->GetStreamSourceFreq(i, &savedFreq[i]);
@@ -949,20 +1135,35 @@ namespace wxl_livingazeroth::grassinst
 
         d3d->SetVertexShader(ours);
         d3d->SetVertexDeclaration(g_decl);
-        unsigned calls = 0;
+        const unsigned m = LayerMultiplier(e);
+        const float copyReg[4] = { g_settings.densitySpread, 0.0f, 0.0f, 0.0f };
+        d3d->SetVertexShaderConstantF(kCopyReg, copyReg, 1);
+        // A per-layer start in the table, so layers don't all repeat the same copy pattern.
+        const uint32_t group0 = Mix(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(slot))) % (kCopyTableSpan - kCopyPlants);
+
+        unsigned calls = 0, copies = 0;
         for (const Range& r : e.ranges)
         {
             if (!r.count || !r.geo->vb) continue;
             d3d->SetStreamSource(0, r.geo->vb, 0, sizeof(GpuVertex));
-            d3d->SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | r.count);
-            d3d->SetStreamSource(1, g_pages[e.page].vb, r.start * sizeof(GpuInstance), sizeof(GpuInstance));
-            d3d->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | 1u);
             d3d->SetIndices(r.geo->ib);
-            d3d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, r.geo->vertices, 0, r.geo->indices / 3);
-            ++calls;
+            for (uint32_t first = 0; first < r.count; first += kCopyPlants)
+            {
+                const uint32_t n = (r.count - first < kCopyPlants) ? r.count - first : kCopyPlants;
+                d3d->SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | (n * m));
+                d3d->SetStreamSource(1, g_pages[e.page].vb, (r.start + first) * sizeof(GpuInstance), sizeof(GpuInstance));
+                d3d->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | m);
+                d3d->SetStreamSource(2, g_copyTable, (g_copyBase[m] + group0 * m) * sizeof(CopyEntry), sizeof(CopyEntry));
+                d3d->SetStreamSourceFreq(2, D3DSTREAMSOURCE_INSTANCEDATA | 1u);
+                d3d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, r.geo->vertices, 0, r.geo->indices / 3);
+                ++calls;
+                copies += n * (m - 1);
+            }
         }
+        d3d->SetVertexShaderConstantF(kCopyReg, savedCopyReg, 1);
+        if (m > 1) { ++g_frameStats.densifiedLayers; g_frameStats.densityCopies += copies; }
 
-        for (UINT i = 0; i < 2; ++i)
+        for (UINT i = 0; i < 3; ++i)
         {
             d3d->SetStreamSourceFreq(i, savedFreq[i]);
             d3d->SetStreamSource(i, savedVb[i], savedOffset[i], savedStride[i]);
@@ -977,7 +1178,7 @@ namespace wxl_livingazeroth::grassinst
 
         ++g_frameStats.slotsInstanced;
         g_frameStats.drawCalls += calls;
-        grassperf::OnInstancedDraw(calls, e.count);
+        grassperf::OnInstancedDraw(calls, e.allocated);
         return true;
     }
 
@@ -1035,10 +1236,23 @@ namespace wxl_livingazeroth::grassinst
             }
             return;
         }
-        if (g_frame % kEvictEvery == 0)
+        // A new map: nothing cached is coming back.
+        const int mapId = world::Current().mapId;
+        if (mapId != g_lastMapId)
+        {
+            g_lastMapId = mapId;
+            g_slots.clear();
+            ReleasePool();
+            g_memoryTight = false;
+            return;
+        }
+
+        // At the cap, layers not drawn for a second go at once; otherwise the slow sweep.
+        const uint32_t evictAfter = g_memoryTight ? kEvictAfterTight : kEvictAfter;
+        if (g_memoryTight || g_frame % kEvictEvery == 0)
             for (auto it = g_slots.begin(); it != g_slots.end();)
             {
-                if (g_frame - it->second.lastFrame > kEvictAfter) { ReleaseSlot(it->second); it = g_slots.erase(it); }
+                if (g_frame - it->second.lastFrame > evictAfter) { ReleaseSlot(it->second); it = g_slots.erase(it); }
                 else ++it;
             }
 
@@ -1053,6 +1267,16 @@ namespace wxl_livingazeroth::grassinst
             }
             else ++i;
         }
+
+        // Pages with nothing left in them go back to the driver.
+        for (Page& p : g_pages)
+            if (p.vb && p.free.size() == 1 && p.free[0].offset == 0 && p.free[0].size == kPageInstances)
+            {
+                Release(p.vb);
+                p.vb = nullptr;
+                p.free.clear();
+            }
+        g_memoryTight = LivePages() >= PageLimit();
     }
 
     void OnDeviceLost()
@@ -1061,6 +1285,8 @@ namespace wxl_livingazeroth::grassinst
         // demand. Shaders and the declaration survive a reset.
         g_slots.clear();
         ReleasePool();
+        Release(g_copyTable);
+        g_copyTable = nullptr;
         for (auto& [id, g] : g_geometry) { Release(g.vb); Release(g.ib); }
         g_geometry.clear();
     }
@@ -1070,8 +1296,10 @@ namespace wxl_livingazeroth::grassinst
         Stats s = g_lastStats;
         s.slotsCached = static_cast<unsigned>(g_slots.size());
         size_t instanceBytes = 0, geometryBytes = 0;
-        for (const auto& [slot, e] : g_slots) instanceBytes += static_cast<size_t>(e.count) * sizeof(GpuInstance);
-        s.poolPages = static_cast<unsigned>(g_pages.size());
+        for (const auto& [slot, e] : g_slots) instanceBytes += static_cast<size_t>(e.allocated) * sizeof(GpuInstance);
+        s.poolPages = LivePages();
+        s.poolLimitPages = PageLimit();
+        s.memoryTight = g_memoryTight;
         for (const auto& [id, g] : g_geometry)
             if (g.vb) { ++s.geometries; geometryBytes += g.vertices * sizeof(GpuVertex) + g.indices * sizeof(uint16_t); }
         s.instanceMB = instanceBytes / (1024.0 * 1024.0);
@@ -1081,6 +1309,14 @@ namespace wxl_livingazeroth::grassinst
     }
 
     const char* Problem() { return g_problem; }
+
+    void SetChunkOrigin(const float origin[3])
+    {
+        std::memcpy(g_chunkOrigin, origin, sizeof(g_chunkOrigin));
+        g_chunkOriginValid = true;
+    }
+
+
 
     void RequestVerify()
     {

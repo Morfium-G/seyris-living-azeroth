@@ -1,6 +1,7 @@
 ﻿#include "GrassMotion.hpp"
 
 #include "GrassDoodads.hpp"
+#include "GrassInstanced.hpp"
 #include "GrassPerf.hpp"
 
 #include "../env/Actors.hpp"
@@ -320,6 +321,20 @@ namespace wxl_livingazeroth::grass
             g_origChunk(mtx, group);
             if (group != 0) return; // the dormant point-light path isn't patched
             grassperf::OnChunk();
+
+            // The chunk's world origin, as the shader works out world positions: c0..c2 are the pure
+            // view rotation (grass chunks are unrotated), c3 is the chunk origin in view space.
+            {
+                const float* c = reinterpret_cast<const float*>(ge::kVsConstantBlock);
+                float cam[3];
+                wxl::game::camera::GetPosition(cam);
+                const float origin[3] = {
+                    c[0] * c[12] + c[1] * c[13] + c[2] * c[14] + cam[0],
+                    c[4] * c[12] + c[5] * c[13] + c[6] * c[14] + cam[1],
+                    c[8] * c[12] + c[9] * c[13] + c[10] * c[14] + cam[2],
+                };
+                grassinst::SetChunkOrigin(origin);
+            }
             if (auto* dev = static_cast<IDirect3DDevice9*>(wxl::game::gx::RawDevice()))
             {
                 dev->SetVertexShaderConstantF(kGridFirstReg, &g_grid[0][0], kGrid * kGrid);

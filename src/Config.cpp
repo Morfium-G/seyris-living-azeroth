@@ -60,6 +60,13 @@ namespace wxl_livingazeroth::config
         inst.buildBudgetMs = Float(s, "InstancedGrassBuildBudgetMs",
             "Milliseconds per frame spent preparing grass coming into view; the rest is drawn the client's way until a later frame.",
             inst.buildBudgetMs);
+        inst.memoryLimitMB = Float(s, "InstancedGrassMemoryMB",
+            "Most memory (MB) the instanced grass may use. It shares the client's 32-bit address space; too high can crash the client.",
+            inst.memoryLimitMB);
+        inst.densityMultiplier = Float(s, "GrassDensityMultiplier",
+            "Instanced grass only: plant density near the player, as a multiplier (1 = off, up to 8).", inst.densityMultiplier);
+        inst.densityRadius = Float(s, "GrassDensityRadius", "Yards around the player where the density multiplier applies.", inst.densityRadius);
+        inst.densitySpread = Float(s, "GrassDensitySpread", "Yards an extra plant may sit from the plant it copies.", inst.densitySpread);
 
         grass::Settings& g = grass::Tunables();
         g.enabled = Bool(s, "GrassMotion", "Grass sways in the wind and parts around characters.", g.enabled);
