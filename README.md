@@ -1,17 +1,111 @@
 # wxl-seyris-living-azeroth
 
-Purely cosmetic, client-side features for WoW 3.3.5 that make the world feel more alive: wind and
-weather that everything reacts to, snow/sand/mud with footprints, puddles, wetness, better water,
-fog, clouds and lighting, and characters that plant their feet on the ground.
+A [WarcraftXL](https://github.com/WarcraftXL/wxl-core) v1.1 extension for the WoW 3.3.5a client
+(build 12340) that makes the world feel more alive. Everything is client-side and purely cosmetic:
+a wind model that the world reacts to, grass that moves with it and parts around characters, and
+a grass renderer fast enough for long grass distances and higher density.
 
-Features share one environment state (wind, temperature, precipitation), so each one makes the
-others better. Every feature reads the stock DBC/ADT settings it extends first; custom cdbc tables
-(through `wxl-seyris-tools`) only add what stock data can't express. Each feature can be toggled
-on its own.
+Features read the stock data they extend first (weather, areas, ground effects). Custom tables
+only add what stock data can't express, and every feature can be switched off.
 
-Planning and research: `orchestration/docs/r&d/immersion/` (`README.md` is the index).
+## Features
 
-## Status
+**Wind**
+- Steady wind and travelling gusts per map and area (`WindProfile.cdbc`), stronger in bad
+  weather.
+- Shelter: roofs and overhangs keep the ground below calm.
+- Lee: walls and cliffs cast a wind shadow on their downwind side.
 
-Skeleton only. First planned spike: a readable scene depth buffer (INTZ), shown as a greyscale
-image in a debug panel. See `orchestration/docs/r&d/immersion/rendering-foundation.md`.
+**Grass motion**
+- Grass sways with the local wind, with a little per-blade flutter.
+- It parts around every nearby creature and player, sized by their own collision; mounts push
+  wider.
+- Each ground-effect doodad bends from its root: the root and tip are worked out from the model
+  itself. Pebbles and other flat doodads stay still.
+- Per-doodad overrides in `GroundEffectDoodadWind.cdbc`: wind/push off, stiffness, manual
+  root/tip. They can be edited and saved from the in-game panel.
+
+**Instanced grass renderer** (on by default)
+- The client re-bakes most visible grass on the CPU every frame at long grass distances. This
+  draws the same plants from static GPU buffers instead: one measurement at 1024 yards went from
+  9 to 45+ fps.
+- Grass looks the same as the client's own: plant positions, tilt, colour and shading match it
+  exactly (a built-in check compares the two).
+- A memory limit keeps it safe in the 32-bit client.
+- **Density near the player:** extra plants drawn on the GPU (no extra memory), each on its own
+  plant's terrain triangle so it sits exactly on the ground. Content decides how dense
+  (`GroundEffectDoodadDensity.cdbc`, per area, map or globally, per doodad or ground effect). The
+  player's own limits cap it, like a graphics setting.
+- **Grass distance:** the client's hard limit of 140 yards for `groundEffectDist` is raised, with
+  no exe patch. It's left alone if the exe or another module already allows more.
+
+**Readable scene depth**
+- The world's depth buffer made readable for later effects (fog, footprints, water edges). It's
+  off while the client's multisampling is on.
+
+## Requirements
+
+- WoW 3.3.5a (12340) with **WarcraftXL v1.1**.
+- **[wxl-seyris-tools](https://github.com/Morfium-G/wxl-seyris-tools)**: config settings and the
+  custom tables. Without it the built-in defaults apply, and the log says so.
+- A GPU with shader model 3.0, and `d3dcompiler_47.dll` (part of Windows 10/11).
+
+## Installation
+
+1. Put `wxl-seyris-living-azeroth.dll` into `<client>\Extensions\wxl-seyris-living-azeroth\`.
+2. Optional data, into `<client>\DBFilesClient\`:
+   - `GroundEffectDoodadDensity.cdbc`: grass density. Generate the shipped baseline with
+     `python tools/gen_default_density.py`. Without it there are no extra plants.
+   - `WindProfile.cdbc`: wind per map/area. It needs a Global row for any wind at all; without
+     the file, grass still parts around characters but doesn't sway. `tools/gen_test_wind.py`
+     writes an example: a global wind plus a few areas around Orgrimmar.
+   - `GroundEffectDoodadWind.cdbc`: per-doodad grass overrides, written by the in-game panel.
+3. Start the client. `Logs\wxl-core.log` lists what loaded.
+
+## Configuration
+
+Settings live in `WTF\WXL\WarcraftXL.ini`, section `[LivingAzeroth]`. Missing keys are written with
+their defaults and a comment on first launch. All keys are listed in [docs/config.md](docs/config.md).
+
+The in-game overlay (**F9**) has panels for wind, grass and grass performance. Everything can be
+tuned live there; the ini sets what each launch starts with.
+
+## Custom tables
+
+Plain WDBC files (`.cdbc` is only a naming convention for custom tables), documented in
+[docs/cdbc-tables.md](docs/cdbc-tables.md). Editor definitions (WDBC editor XML) are in `docs/`.
+
+Tables with several scopes (global, map, area) follow one rule: the most specific matching row
+wins, and a `-1` field takes its value from the next, less specific row.
+
+## Building from source
+
+The extension builds inside the WarcraftXL core tree. Core picks up every folder under
+`src/extensions/` as an extension:
+
+1. Make this repository's `src` folder available as `<wxl-core>/src/extensions/wxl-seyris-living-azeroth`,
+   e.g. with a directory junction:
+   ```powershell
+   New-Item -ItemType Junction -Path "<wxl-core>\src\extensions\wxl-seyris-living-azeroth" -Target "<this repo>\src"
+   ```
+2. Re-run CMake's configure step once (new extension folders are only found at configure time),
+   then build as usual (Win32, Release). The DLL lands under `Extensions\wxl-seyris-living-azeroth\`.
+
+## Compatibility
+
+- **wxl-grasswind:** both patch the same grass shaders. If it's loaded, this module's grass motion
+  stays off and logs why; the rest keeps working.
+- **Multisampling:** fine for everything except the readable scene depth, which is off while
+  multisampling is on. Changing multisampling in-game is handled.
+
+## Planned
+
+Weather and wetness, snow/sand/mud with footprints, puddles, better water and fog, wind on trees
+and bushes, a data-driven sky, foot placement on slopes.
+
+## License and credits
+
+GPL-3.0, see [LICENSE](LICENSE).
+
+The approach of patching the client's own grass shaders (rather than replacing them) follows the
+official [wxl-grasswind](https://github.com/WarcraftXL/wxl-grasswind) module (GPL-3.0).
