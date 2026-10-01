@@ -19,6 +19,7 @@ namespace wxl_livingazeroth::world
         int      areaCount = 0;
 
         bool     outdoors = true;          // the client's verdict (gates fog/sky/outdoor light)
+        int      playerTerrainType = -1;   // TerrainType ID the client says the player stands on (-1 = none)
 
         float    weatherRaw = 0.0f;        // storm intensity as the weather object stores it
         float    weatherIntensity = 0.0f;  // 0..1, after the engine's own dead zone

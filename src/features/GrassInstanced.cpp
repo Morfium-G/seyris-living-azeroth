@@ -659,6 +659,76 @@ namespace wxl_livingazeroth::grassinst
             return 0;
         }
 
+        // --- debug: the terrain under the player ---------------------------------------------
+        // Placement (0x7D3390) picks each cell's layer from the chunk's low-res layer map at
+        // chunk +0x114: one u16 per cell row, 2 bits per cell, with a mask/shift table per column
+        // (0xA3FB88 u16 masks, 0xA3FB98 shift bytes at stride 4). Row index from the cell along
+        // local x, column from local y (as the placement's own reads pair them).
+        constexpr size_t    kChunkLowResLayers = 0x114;
+        constexpr uintptr_t kLowResMasks = 0x00A3FB88, kLowResShifts = 0x00A3FB98;
+        constexpr float     kCellYards = 33.3333333f / 8.0f;
+        constexpr size_t    kEffectTerrainType = 0x28;
+        TerrainProbe        g_probe;
+
+        int EffectTerrainType(uint32_t effectId)
+        {
+            int32_t minId = 0, maxId = 0;
+            uint32_t table = 0, row = 0, value = 0;
+            if (!ReadU32(kEffectMinId, reinterpret_cast<uint32_t&>(minId)) || !ReadU32(kEffectMaxId, reinterpret_cast<uint32_t&>(maxId))
+                || !ReadU32(kEffectTable, table) || !table)
+                return -1;
+            const int32_t id = static_cast<int32_t>(effectId);
+            if (id < minId || id > maxId) return -1;
+            if (!ReadU32(table + static_cast<uint32_t>(id - minId) * 4, row) || !row) return -1;
+            return ReadU32(row + kEffectTerrainType, value) ? static_cast<int>(value) : -1;
+        }
+
+        int LowResLayer(uint32_t chunk, int row, int col)
+        {
+            uint32_t map = 0, word = 0, mask = 0, shift = 0;
+            if (row < 0 || row > 7 || col < 0 || col > 7) return -1;
+            if (!ReadU32(chunk + kChunkLowResLayers, map) || !map) return -1;
+            if (!ReadU32(map + row * 2, word) || !ReadU32(kLowResMasks + col * 2, mask) || !ReadU32(kLowResShifts + col * 4, shift))
+                return -1;
+            return static_cast<int>(((word & 0xFFFF) & (mask & 0xFFFF)) >> (shift & 0xFF));
+        }
+
+        void ProbeIfPlayerChunk(const void* slot)
+        {
+            if (!g_chunkOriginValid || g_probe.frame == g_frame) return;
+            const world::Snapshot& w = world::Current();
+            if (!w.inWorld) return;
+            const float lx = w.playerPos[0] - g_chunkOrigin[0], ly = w.playerPos[1] - g_chunkOrigin[1];
+            if (lx > 0.0f || ly > 0.0f || lx <= -33.3334f || ly <= -33.3334f) return;
+
+            const uintptr_t s = reinterpret_cast<uintptr_t>(slot);
+            for (uintptr_t k = 0; k < 4; ++k)
+            {
+                const uintptr_t grass = s - kGrassSlotsStart - k * kGrassSlotStride;
+                uint32_t chunk = 0, back = 0, header = 0, layers = 0, count = 0;
+                if (!ReadU32(grass + kGrassChunk, chunk) || !chunk || !ReadU32(chunk + kChunkGrass, back) || back != grass) continue;
+                TerrainProbe p;
+                p.valid = true;
+                p.frame = g_frame;
+                p.chunk = chunk;
+                p.local[0] = lx; p.local[1] = ly;
+                p.cellA[0] = static_cast<int>(-lx / kCellYards);
+                p.cellA[1] = static_cast<int>(-ly / kCellYards);
+                if (ReadU32(chunk + kChunkHeader, header) && header && ReadU32(header + kHeaderLayers, count)
+                    && ReadU32(chunk + kChunkLayers, layers) && layers)
+                {
+                    p.layers = count > 4 ? 4 : count;
+                    for (unsigned i = 0; i < p.layers; ++i)
+                        if (ReadU32(layers + i * kLayerStride + kLayerEffect, p.effect[i]) && p.effect[i])
+                            p.effectTerrain[i] = EffectTerrainType(p.effect[i]);
+                }
+                p.dominantA = LowResLayer(chunk, p.cellA[0], p.cellA[1]);
+                p.dominantB = LowResLayer(chunk, p.cellA[1], p.cellA[0]);
+                g_probe = p;
+                return;
+            }
+        }
+
         ChunkContext g_lastContext; // of the last layer built (panel)
         unsigned g_lastEffectsFound = 0, g_lastDoodads = 0;
 
@@ -1144,6 +1214,7 @@ namespace wxl_livingazeroth::grassinst
     const grassdoodads::SlotDoodads* Prepare(void* slot)
     {
         if (!g_settings.enabled || g_problem || g_cap.pending) return nullptr;
+        ProbeIfPlayerChunk(slot);
         auto* d3d = static_cast<IDirect3DDevice9*>(wxl::game::gx::RawDevice());
         if (!d3d) return nullptr;
         if (d3d != g_device)
@@ -1440,6 +1511,8 @@ namespace wxl_livingazeroth::grassinst
     }
 
     const char* Problem() { return g_problem; }
+
+    const TerrainProbe& Probe() { return g_probe; }
 
     void SetChunkOrigin(const float origin[3])
     {

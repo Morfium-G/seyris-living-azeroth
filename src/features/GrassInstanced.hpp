@@ -18,6 +18,7 @@
 
 #include "wxl/PluginApi.h"
 
+#include <cstdint>
 #include <string>
 
 namespace wxl_livingazeroth::grassinst
@@ -53,6 +54,23 @@ namespace wxl_livingazeroth::grassinst
     /// Per grass chunk, after the client uploaded its constants: the chunk's world origin (its
     /// layers draw next). Chunk axes are world axes.
     void SetChunkOrigin(const float origin[3]);
+
+    /// Debug: the terrain under the player, from the chunk whose grass layers are drawn there. Used
+    /// to check which data the client's own TerrainType (unit +0xA40) comes from.
+    struct TerrainProbe
+    {
+        bool     valid = false;      // the player's chunk was seen this frame
+        uint32_t chunk = 0;
+        float    local[2] = {};      // the player's chunk-local position (both <= 0)
+        int      cellA[2] = {};      // cell under the player: (from x, from y)
+        unsigned layers = 0;
+        uint32_t effect[4] = {};     // each layer's GroundEffectTexture ID (MCLY)
+        int      effectTerrain[4] = { -1, -1, -1, -1 }; // that row's last column (+0x28)
+        int      dominantA = -1;     // the cell's layer from the low-res map: word by x-cell, bits by y-cell (as placement reads it)
+        int      dominantB = -1;     // the same with the axes swapped (for comparison)
+        uint32_t frame = 0;          // frame it was taken
+    };
+    const TerrainProbe& Probe();
 
     // --- lifecycle ---
     void OnFrameEnd();

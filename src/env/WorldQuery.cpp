@@ -18,6 +18,10 @@ namespace wxl_livingazeroth::world
         // own callers pass exactly `[object + 0xB8]`.
         constexpr uintptr_t kObjectLocationField = 0xB8;
 
+        // A unit's current TerrainType ID (init -1 by the unit constructor 0x73F660, set from the
+        // location record at unit setup; read by footstep/death-thud sounds, e.g. 0x746610).
+        constexpr uintptr_t kUnitTerrainTypeField = 0xA40;
+
         // CMap::QueryAreaId(location, &areaId) -> non-zero on success. WMO area first (so interiors
         // resolve to their own areas), terrain area otherwise. __cdecl.
         using QueryAreaIdFn = int(__cdecl*)(void* location, uint32_t* outAreaId);
@@ -89,6 +93,7 @@ namespace wxl_livingazeroth::world
         {
             s.inWorld = true;
             gw::Position(player, s.playerPos);
+            s.playerTerrainType = *reinterpret_cast<const int*>(reinterpret_cast<uintptr_t>(player) + kUnitTerrainTypeField);
 
             void* location = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(player) + kObjectLocationField);
             if (location)

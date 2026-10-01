@@ -15,6 +15,7 @@
 #include "Config.hpp"
 
 #include "debug/DepthView.hpp"
+#include "debug/SurfaceView.hpp"
 #include "debug/WindView.hpp"
 #include "env/Actors.hpp"
 #include "env/Wind.hpp"
@@ -120,6 +121,7 @@ int __cdecl WXL_Load(const WXL_Api* api)
     wxl_livingazeroth::postaa::RegisterPanel(api);
     wxl_livingazeroth::debug::RegisterPanel(api);
     wxl_livingazeroth::debug::RegisterWindPanel(api);
+    wxl_livingazeroth::debug::RegisterSurfacePanel(api);
 
     api->Log(WXL_LOG_INFO, "wxl-seyris-living-azeroth", "v1.1 loaded (WXL_Load reached).");
     return 1;
