@@ -117,6 +117,21 @@ namespace wxl_livingazeroth::terrain
         const unsigned count = *reinterpret_cast<const uint32_t*>(header + kHeaderLayerCount);
         if (!layers || layer >= count) return true; // no layer: bare ground with no ground effect
 
+        // The layer's texture: MCLY +0x00 indexes the tile's texture list. The chunk's tile is
+        // [[chunk +0x20] +0x08] (the chunk build 0x7C64B0 registers the chunk in that tile's grid);
+        // the list is a growable array at tile +0x58 (count +0x5C, entries +0x60, 8 bytes each:
+        // the name, pointing into the MTEX block, then the texture handle -- 0x7D6D20 builds it).
+        constexpr size_t kChunkTileLink = 0x20, kLinkTile = 0x08, kTileTexCount = 0x5C, kTileTexEntries = 0x60;
+        const uint32_t textureIndex = *reinterpret_cast<const uint32_t*>(layers + layer * kLayerStride);
+        const uintptr_t link = *reinterpret_cast<const uintptr_t*>(chunk + kChunkTileLink);
+        if (link && !(link & 1))
+            if (const auto* tile = *reinterpret_cast<const uint8_t* const*>(link + kLinkTile))
+            {
+                const uint32_t texCount = *reinterpret_cast<const uint32_t*>(tile + kTileTexCount);
+                const auto* entries = *reinterpret_cast<const char* const* const*>(tile + kTileTexEntries);
+                if (entries && textureIndex < texCount) out.texture = entries[textureIndex * 2];
+            }
+
         out.groundEffect = *reinterpret_cast<const uint32_t*>(layers + layer * kLayerStride + kLayerEffect);
         const int32_t minId = *reinterpret_cast<const int32_t*>(kEffectMinId);
         const int32_t maxId = *reinterpret_cast<const int32_t*>(kEffectMaxId);

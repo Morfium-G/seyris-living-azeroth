@@ -45,8 +45,10 @@ only add what stock data can't express, and every feature can be switched off.
 - A real layer of snow on top of the terrain, not just a texture: characters sink in, and they
   and nearby creatures carve trenches with a raised rim that slowly fill back in. Grass and small
   doodads are buried under it.
-- Content decides where (`SurfaceCover.cdbc`, per area, map or globally, per ground effect or
-  terrain material) and how deep. The shipped sample covers snowy ground and leaves sand off.
+- Content decides where and how (`SurfaceCover.cdbc`, per area, map or globally, per painted
+  texture, ground effect or terrain material): depth, slope limit, drifts, edge shape, trench rim
+  and fill-in time, tint. The shipped sample covers snowy ground and leaves sand off. The F9 panel
+  shows what's under your feet, to write rows on the spot.
 - Soft, ragged edges where snowy ground meets bare ground, bare steep slopes, gentle drifts.
 - Lit and fogged like the terrain, so it follows the time of day and zone fog. Reaches 640 yards
   in rings that get coarser with distance; only the nearest 40 yards deform.

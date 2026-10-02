@@ -2,10 +2,20 @@
     <Field Name="ID" Type="int" IsIndex="true" />
     <Field Name="ScopeType" Type="int" />
     <Field Name="ScopeID" Type="int" />
+    <Field Name="TexturePath" Type="string" />
     <Field Name="GroundEffectID" Type="int" />
     <Field Name="TerrainType" Type="int" />
     <Field Name="Depth" Type="float" />
+    <Field Name="MaxSlope" Type="float" />
+    <Field Name="SlopeFade" Type="float" />
+    <Field Name="DriftNoise" Type="float" />
+    <Field Name="EdgeBreakup" Type="float" />
     <Field Name="Rim" Type="float" />
     <Field Name="RelaxSeconds" Type="float" />
+    <Field Name="TintColor" Type="uint" />
+    <Field Name="TintStrength" Type="float" />
+    <Field Name="CoverTexture" Type="string" />
+    <Field Name="Opacity" Type="float" />
+    <Field Name="Flatten" Type="float" />
     <Field Name="Flags" Type="int" />
   </Table>

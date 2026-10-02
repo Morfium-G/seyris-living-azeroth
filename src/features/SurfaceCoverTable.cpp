@@ -8,6 +8,7 @@
 #include <map>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace wxl_livingazeroth::covertable
@@ -16,26 +17,44 @@ namespace wxl_livingazeroth::covertable
     {
         constexpr const char* kFile = "DBFilesClient\\SurfaceCover.cdbc";
         constexpr WXL_SeyrisCdbcField kFields[] = {
-            {"ID",             0, WXL_CDBC_FIELD_VALUE},
-            {"ScopeType",      1, WXL_CDBC_FIELD_VALUE},
-            {"ScopeID",        2, WXL_CDBC_FIELD_VALUE},
-            {"GroundEffectID", 3, WXL_CDBC_FIELD_VALUE},
-            {"TerrainType",    4, WXL_CDBC_FIELD_VALUE},
-            {"Depth",          5, WXL_CDBC_FIELD_VALUE},
-            {"Rim",            6, WXL_CDBC_FIELD_VALUE},
-            {"RelaxSeconds",   7, WXL_CDBC_FIELD_VALUE},
-            {"Flags",          8, WXL_CDBC_FIELD_VALUE},
+            {"ID",             0,  WXL_CDBC_FIELD_VALUE},
+            {"ScopeType",      1,  WXL_CDBC_FIELD_VALUE},
+            {"ScopeID",        2,  WXL_CDBC_FIELD_VALUE},
+            {"TexturePath",    3,  WXL_CDBC_FIELD_STRING},
+            {"GroundEffectID", 4,  WXL_CDBC_FIELD_VALUE},
+            {"TerrainType",    5,  WXL_CDBC_FIELD_VALUE},
+            {"Depth",          6,  WXL_CDBC_FIELD_VALUE},
+            {"MaxSlope",       7,  WXL_CDBC_FIELD_VALUE},
+            {"SlopeFade",      8,  WXL_CDBC_FIELD_VALUE},
+            {"DriftNoise",     9,  WXL_CDBC_FIELD_VALUE},
+            {"EdgeBreakup",    10, WXL_CDBC_FIELD_VALUE},
+            {"Rim",            11, WXL_CDBC_FIELD_VALUE},
+            {"RelaxSeconds",   12, WXL_CDBC_FIELD_VALUE},
+            {"TintColor",      13, WXL_CDBC_FIELD_VALUE},
+            {"TintStrength",   14, WXL_CDBC_FIELD_VALUE},
+            {"CoverTexture",   15, WXL_CDBC_FIELD_STRING}, // reserved: not used yet
+            {"Opacity",        16, WXL_CDBC_FIELD_VALUE},  // reserved: not used yet
+            {"Flatten",        17, WXL_CDBC_FIELD_VALUE},  // reserved: not used yet
+            {"Flags",          18, WXL_CDBC_FIELD_VALUE},
         };
-        constexpr WXL_SeyrisCdbcDefinition kDef = { "SurfaceCover", kFile, kFields, 9 };
+        constexpr WXL_SeyrisCdbcDefinition kDef = { "SurfaceCover", kFile, kFields, 19 };
 
         enum Scope : uint32_t { kGlobal = 0, kMap = 1, kArea = 2 };
-        constexpr int kFieldCount = 3; // depth, rim, relax
+
+        // The float fields that inherit with -1, in Values order. TintStrength carries TintColor
+        // with it: the row that decides the strength also decides the colour.
+        enum Field { kDepth, kMaxSlope, kSlopeFade, kDrift, kBreakup, kRim, kRelax, kTint, kFieldCount };
+        constexpr const char* kFloatColumns[kFieldCount] = {
+            "Depth", "MaxSlope", "SlopeFade", "DriftNoise", "EdgeBreakup", "Rim", "RelaxSeconds", "TintStrength",
+        };
 
         struct Row
         {
-            uint32_t effect = 0;   // 0 = any ground effect
-            int32_t  terrain = -1; // -1 = any TerrainType (TerrainType 0 is Dirt, so 0 can't mean "any")
-            float    value[kFieldCount] = { -1.0f, -1.0f, -1.0f };
+            std::string texture;   // normalized (lower case, backslashes); empty = any texture
+            uint32_t    effect = 0;   // 0 = any ground effect
+            int32_t     terrain = -1; // -1 = any TerrainType (TerrainType 0 is Dirt, so 0 can't mean "any")
+            float       value[kFieldCount];
+            uint32_t    tintColor = 0;
         };
 
         // Rows by place: (scope type, scope id) -> rows there.
@@ -44,21 +63,50 @@ namespace wxl_livingazeroth::covertable
         std::string g_status = "not loaded yet";
         uint32_t    g_generation = 1;
 
-        std::map<std::tuple<uint32_t, int, uint32_t, int>, Values> g_cache;
+        struct Key
+        {
+            uint32_t area; int map; uint32_t effect; int terrain; std::string texture;
+            bool operator==(const Key& o) const
+            { return area == o.area && map == o.map && effect == o.effect && terrain == o.terrain && texture == o.texture; }
+        };
+        struct KeyHash
+        {
+            size_t operator()(const Key& k) const
+            {
+                size_t h = std::hash<std::string>()(k.texture);
+                h ^= (static_cast<size_t>(k.area) * 0x9E3779B1u) ^ (static_cast<size_t>(k.map) << 7) ^ (static_cast<size_t>(k.effect) << 13) ^ static_cast<size_t>(k.terrain + 1);
+                return h;
+            }
+        };
+        std::unordered_map<Key, Values, KeyHash> g_cache;
 
         float BitsToFloat(uint32_t b) { float f; std::memcpy(&f, &b, sizeof(f)); return f; }
 
-        // The row of one "what" level at one place, if any. Levels: 0 ground effect, 1 TerrainType,
-        // 2 everything.
-        const Row* AtLevel(const std::vector<Row>& rows, int level, uint32_t effect, int terrain)
+        // Lower case, forward slashes to backslashes: texture paths compare the way the client's
+        // archive lookups do.
+        std::string Normalize(const char* path)
+        {
+            std::string s = path ? path : "";
+            for (char& c : s)
+            {
+                if (c == '/') c = '\\';
+                else if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            }
+            return s;
+        }
+
+        // The row of one "what" level at one place, if any. Levels: 0 texture, 1 ground effect,
+        // 2 TerrainType, 3 everything.
+        const Row* AtLevel(const std::vector<Row>& rows, int level, const std::string& texture, uint32_t effect, int terrain)
         {
             for (const Row& r : rows)
             {
                 switch (level)
                 {
-                    case 0: if (r.effect && effect && r.effect == effect) return &r; break;
-                    case 1: if (!r.effect && r.terrain >= 0 && r.terrain == terrain) return &r; break;
-                    case 2: if (!r.effect && r.terrain < 0) return &r; break;
+                    case 0: if (!r.texture.empty() && r.texture == texture) return &r; break;
+                    case 1: if (r.texture.empty() && r.effect && effect && r.effect == effect) return &r; break;
+                    case 2: if (r.texture.empty() && !r.effect && r.terrain >= 0 && r.terrain == terrain) return &r; break;
+                    case 3: if (r.texture.empty() && !r.effect && r.terrain < 0) return &r; break;
                 }
             }
             return nullptr;
@@ -87,11 +135,11 @@ namespace wxl_livingazeroth::covertable
             Row r;
             const uint32_t scope = cdbc->Value(table, rec, "ScopeType", 0);
             const uint32_t id = scope == kGlobal ? 0 : cdbc->Value(table, rec, "ScopeID", 0);
+            r.texture = Normalize(cdbc->GetString(table, rec, "TexturePath"));
             r.effect = cdbc->Value(table, rec, "GroundEffectID", 0);
             r.terrain = static_cast<int32_t>(cdbc->Value(table, rec, "TerrainType", 0));
-            r.value[0] = BitsToFloat(cdbc->Value(table, rec, "Depth", 0));
-            r.value[1] = BitsToFloat(cdbc->Value(table, rec, "Rim", 0));
-            r.value[2] = BitsToFloat(cdbc->Value(table, rec, "RelaxSeconds", 0));
+            for (int f = 0; f < kFieldCount; ++f) r.value[f] = BitsToFloat(cdbc->Value(table, rec, kFloatColumns[f], 0));
+            r.tintColor = cdbc->Value(table, rec, "TintColor", 0);
             g_rows[{ scope, id }].push_back(r);
             ++g_rowCount;
         }
@@ -106,9 +154,9 @@ namespace wxl_livingazeroth::covertable
     const char* Status()     { return g_status.c_str(); }
     uint32_t    Generation() { return g_generation; }
 
-    Values Resolve(uint32_t areaId, int mapId, uint32_t groundEffectId, int terrainType)
+    Values Resolve(uint32_t areaId, int mapId, const char* texturePath, uint32_t groundEffectId, int terrainType)
     {
-        const auto key = std::make_tuple(areaId, mapId, groundEffectId, terrainType);
+        Key key{ areaId, mapId, groundEffectId, terrainType, Normalize(texturePath) };
         if (auto it = g_cache.find(key); it != g_cache.end()) return it->second;
 
         // Places, most specific first: the cell's area chain, its map, global.
@@ -119,23 +167,34 @@ namespace wxl_livingazeroth::covertable
         if (mapId >= 0) places.push_back({ kMap, static_cast<uint32_t>(mapId) });
         places.push_back({ kGlobal, 0 });
 
-        float value[kFieldCount] = { -1.0f, -1.0f, -1.0f };
+        float value[kFieldCount];
+        for (float& v : value) v = -1.0f;
+        uint32_t tint = 0;
         for (const auto& place : places)
         {
             auto rows = g_rows.find(place);
             if (rows == g_rows.end()) continue;
-            for (int level = 0; level < 3; ++level)
-                if (const Row* r = AtLevel(rows->second, level, groundEffectId, terrainType))
+            for (int level = 0; level < 4; ++level)
+                if (const Row* r = AtLevel(rows->second, level, key.texture, groundEffectId, terrainType))
                     for (int f = 0; f < kFieldCount; ++f)
-                        if (value[f] < 0.0f && r->value[f] >= 0.0f) value[f] = r->value[f];
+                        if (value[f] < 0.0f && r->value[f] >= 0.0f)
+                        {
+                            value[f] = r->value[f];
+                            if (f == kTint) tint = r->tintColor;
+                        }
         }
 
-        Values v;
-        if (value[0] >= 0.0f) v.depth = value[0];
-        v.rim = value[1];
-        v.relaxSeconds = value[2];
+        Values v; // fields no row sets keep the defaults
+        if (value[kDepth] >= 0.0f)    v.depth = value[kDepth];
+        if (value[kMaxSlope] >= 0.0f) v.maxSlope = value[kMaxSlope];
+        if (value[kSlopeFade] >= 0.0f) v.slopeFade = value[kSlopeFade];
+        if (value[kDrift] >= 0.0f)    v.driftNoise = value[kDrift];
+        if (value[kBreakup] >= 0.0f)  v.edgeBreakup = value[kBreakup];
+        if (value[kRim] >= 0.0f)      v.rim = value[kRim];
+        if (value[kRelax] >= 0.0f)    v.relaxSeconds = value[kRelax];
+        if (value[kTint] >= 0.0f)     { v.tintStrength = value[kTint]; v.tintColor = tint; }
         if (g_cache.size() > 20000) g_cache.clear();
-        g_cache[key] = v;
+        g_cache.emplace(std::move(key), v);
         return v;
     }
 }

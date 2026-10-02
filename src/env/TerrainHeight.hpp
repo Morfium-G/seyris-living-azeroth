@@ -15,8 +15,10 @@ namespace wxl_livingazeroth::terrain
     bool TerrainTypeAt(float x, float y, int& outType);
 
     /// What the terrain cell at world (x, y) is made of, for scoped tables: the chunk's area, the
-    /// cell's dominant layer's ground effect (GroundEffectTexture ID, 0 = none) and its TerrainType
-    /// (-1 = none). Same chain as the client's own query. False on holes or unloaded chunks.
-    struct Surface { unsigned area = 0; unsigned groundEffect = 0; int terrainType = -1; };
+    /// cell's dominant layer's texture path (points into the tile's file data, valid while the tile
+    /// is loaded; null if unknown), ground effect (GroundEffectTexture ID, 0 = none) and its
+    /// TerrainType (-1 = none). Same chain as the client's own query. False on holes or unloaded
+    /// chunks.
+    struct Surface { unsigned area = 0; const char* texture = nullptr; unsigned groundEffect = 0; int terrainType = -1; };
     bool SurfaceAt(float x, float y, Surface& out);
 }

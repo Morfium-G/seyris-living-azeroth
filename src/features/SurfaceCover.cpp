@@ -66,18 +66,13 @@ namespace wxl_livingazeroth::cover
             int   enabled = 0;
             int   coverage = static_cast<int>(Coverage::Table);
             int   levels = 5;               // 1..5: 40, 80, 160, 320, 640 yd
-            float depthScale = 1.0f;        // x the table's depth
-            float rim = 0.3f;               // rim height as a share of the depth (default when the table says -1)
-            float relaxSeconds = 30.0f;     // trench back to flat (default when the table says -1)
+            // Player/testing multipliers on what SurfaceCover.cdbc says; 1 = exactly the table.
+            float depthMul = 1.0f, driftMul = 1.0f, breakupMul = 1.0f, rimMul = 1.0f, relaxMul = 1.0f;
             int   stamp = 1;
             float stampScale = 1.0f;        // trench radius x the unit's size
             float farLift = 0.75f;          // yd added far away, against terrain drawn simpler than its heights
             int   sceneLight = 1;           // light and fog the cover like the terrain just drawn (in-pass only)
             float brightness = 0.93f;       // cover albedo
-            float maxSlope = 45.0f;         // degrees: steeper ground holds no cover...
-            float slopeBand = 15.0f;        // ...and it thins out over this many degrees below that
-            float noise = 0.35f;            // depth variation (drifts), share of the depth
-            float edgeBreakup = 0.5f;       // 0 = smooth rounded material edges, 1 = ragged, patchy ones
             int   wireframe = 0;
             int   drawPoint = 0;            // 0 right after the terrain (inside the world pass), 1 end of the scene
         };
@@ -89,14 +84,21 @@ namespace wxl_livingazeroth::cover
         {
             float cell = kCell0;
             std::vector<float>   base = std::vector<float>(kTex * kTex, kHole);
-            // Coverage parts per slot, combined at upload (so the slope/noise sliders need no refill):
-            // material 0..255 (soft across terrain cells), the terrain's up-ness (normal z) 0..255,
-            // and the drift noise 0..255.
-            std::vector<uint8_t> material = std::vector<uint8_t>(kTex * kTex, 0);
-            std::vector<float>   depth = std::vector<float>(kTex * kTex, 0.0f); // the table's depth here, yd
-            std::vector<uint8_t> upness = std::vector<uint8_t>(kTex * kTex, 255);
-            std::vector<uint8_t> drift = std::vector<uint8_t>(kTex * kTex, 128);
-            std::vector<uint8_t> edgeNoise = std::vector<uint8_t>(kTex * kTex, 128);
+            // Coverage parts per slot, from the table rows of the terrain cells around (blended),
+            // combined at upload (so the panel's multipliers need no refill): how covered (0..255,
+            // soft across terrain cells), the table's depth (yd), the slope factor (0..255, from the
+            // terrain's steepness and the rows' MaxSlope/SlopeFade), the rows' drift and breakup
+            // amounts (0..255 = 0..1), the drift and edge noise (0..255), and the tint (ARGB, A =
+            // strength).
+            std::vector<uint8_t>  material = std::vector<uint8_t>(kTex * kTex, 0);
+            std::vector<float>    depth = std::vector<float>(kTex * kTex, 0.0f);
+            std::vector<uint8_t>  slope = std::vector<uint8_t>(kTex * kTex, 255);
+            std::vector<uint8_t>  driftAmp = std::vector<uint8_t>(kTex * kTex, 0);
+            std::vector<uint8_t>  breakup = std::vector<uint8_t>(kTex * kTex, 0);
+            std::vector<uint8_t>  drift = std::vector<uint8_t>(kTex * kTex, 128);
+            std::vector<uint8_t>  edgeNoise = std::vector<uint8_t>(kTex * kTex, 128);
+            std::vector<uint32_t> tint = std::vector<uint32_t>(kTex * kTex, 0);
+            bool lookDirty = true;
             int boostRows = 0;              // rows left to re-sample at full speed after a setting change
             bool  haveGrid = false;
             int   gridI = 0, gridJ = 0;     // world cell index (of this level) of the grid's first vertex
@@ -106,6 +108,7 @@ namespace wxl_livingazeroth::cover
             double   fillMs = 0, firstFillMs = 0;
             IDirect3DTexture9* baseTex = nullptr;
             IDirect3DTexture9* coverTex = nullptr;
+            IDirect3DTexture9* lookTex = nullptr;  // A8R8G8B8 tint per slot (when the GPU can fetch it in the VS)
         };
         Level g_levels[kMaxLevels];
 
@@ -114,22 +117,26 @@ namespace wxl_livingazeroth::cover
         std::vector<float> g_press(kTex * kTex, 0.0f);
         std::vector<float> g_rim(kTex * kTex, 0.0f);
 
-        // Rim share and relax time where the player is (the table's row there, or the panel's defaults).
+        // Rim share and relax time where the player is (the table's row there, x the multipliers),
+        // and what the table sees there (for the panel, so rows can be authored on the spot).
         float g_rimShareNow = 0.3f, g_relaxNow = 30.0f;
+        terrain::Surface   g_hereSurface;
+        covertable::Values g_hereValues;
+        std::string        g_hereTexture;
+        bool               g_hereValid = false;
+        bool               g_tintSupported = false;
         const void* g_cdbcApi = nullptr;
         uint32_t    g_tableGeneration = 0;
 
         int   g_lastCoverage = -1;
         int   g_lastMap = -1;
-        float g_lastDepthScale = -1.0f, g_lastMaxSlope = -1.0f, g_lastSlopeBand = -1.0f, g_lastNoise = -1.0f;
-        float g_lastEdgeBreakup = -1.0f;
+        float g_lastDepthMul = -1.0f, g_lastDriftMul = -1.0f, g_lastBreakupMul = -1.0f;
         constexpr float kEdgeWarpYards = 5.0f; // how far the material edge wanders at full breakup
 
-        // Cover depth per terrain cell from SurfaceCover.cdbc (what the cell is made of is constant
-        // over one: it's the cell's dominant layer): 0 = bare. Unloaded cells aren't cached, so
-        // they're asked again.
+        // The table's values per terrain cell (what the cell is made of is constant over one: it's
+        // the cell's dominant layer). Unloaded cells aren't cached, so they're asked again.
         constexpr float kTerrainCell = 33.3333333f / 8.0f;
-        std::unordered_map<int64_t, float> g_cellDepth;
+        std::unordered_map<int64_t, covertable::Values> g_cellValues;
         int g_mapNow = -1;
 
         // The terrain's lighting and fog as last read (for the panel): VS c12 fog, c24 sun direction
@@ -179,7 +186,7 @@ namespace wxl_livingazeroth::cover
         // size); c5 = (level centre cell i, j, half extent, morph band) in cells; c6 = the camera
         // position (the scene is drawn about the camera); c7 = (fade start, fade end, fade on) in cells;
         // c8 = (far lift start, end, height) in yd from the camera; c9..c11 = the view rotation rows
-        // (identity when not lit like the scene); c12 = the terrain's fog parameters.
+        // (identity when not lit like the scene); c12 = the terrain's fog parameters; c13.x = tint on.
         const char* kVsHlsl = R"(
 float4 vp0 : register(c0); float4 vp1 : register(c1); float4 vp2 : register(c2); float4 vp3 : register(c3);
 float4 grid : register(c4);
@@ -189,10 +196,14 @@ float4 fade : register(c7);
 float4 lift : register(c8);
 float4 vr0 : register(c9); float4 vr1 : register(c10); float4 vr2 : register(c11);
 float4 fogp : register(c12);
+float4 look : register(c13);
 sampler2D baseTex : register(s0);
 sampler2D coverTex : register(s1);
+sampler2D lookTex : register(s2);
 
-struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1; float2 rel : TEXCOORD2; float fog : TEXCOORD3; };
+struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1; float2 rel : TEXCOORD2; float fog : TEXCOORD3; float4 tint : TEXCOORD4; };
+
+float4 Tint(float2 idx) { return look.x > 0.5 ? tex2Dlod(lookTex, float4((idx + 0.5) * grid.w, 0, 0)) : 0; }
 
 float Cheb(float2 idx) { float2 a = abs(idx - lod.xy); return max(a.x, a.y); }
 float Fade(float2 idx) { return fade.z > 0.5 ? saturate((fade.y - Cheb(idx)) / (fade.y - fade.x)) : 1; }
@@ -220,6 +231,7 @@ VOut main(float2 ij : POSITION)
     float2 idx = grid.xy + ij;
     float3 p, n; float2 s;
     Vertex(idx, 1, p, n, s);
+    o.tint = Tint(idx);
 
     // Border band: odd vertices slide onto their even neighbours, so the edge becomes the coarser
     // level's triangles.
@@ -231,8 +243,9 @@ VOut main(float2 ij : POSITION)
         Vertex(idx - odd, 2, p1, n1, s1);
         // Fully morphed takes the coarser vertex exactly: lerp(p, p1, 1) = p + (p1 - p) rounds off p1
         // at world-sized coordinates, and the two levels' edges no longer meet (hairline cracks).
-        if (m >= 1) { p = p1; n = n1; s = s1; }
-        else        { p = lerp(p, p1, m); n = lerp(normalize(n), normalize(n1), m); s = lerp(s, s1, m); }
+        float4 t1 = Tint(idx - odd);
+        if (m >= 1) { p = p1; n = n1; s = s1; o.tint = t1; }
+        else        { p = lerp(p, p1, m); n = lerp(normalize(n), normalize(n1), m); s = lerp(s, s1, m); o.tint = lerp(o.tint, t1, m); }
     }
 
     // Far away the client draws simpler terrain than its heights, which pokes through a thin
@@ -256,7 +269,8 @@ VOut main(float2 ij : POSITION)
 
         // PS: c0 = light direction, c1 = colour, c2.x = smallest drawn depth, c3 = the next finer
         // level's box (camera-relative min x, min y, max x, max y): this level isn't drawn there;
-        // c4 = ambient, c5 = diffuse, c6 = fog colour. Lit the way the terrain shader lights:
+        // c4 = ambient, c5 = diffuse, c6 = fog colour; the tint (rgb, a = strength) comes from the VS.
+        // Lit the way the terrain shader lights:
         // min(ambient + diffuse * saturate(N.L), 1), then fogged towards the fog colour.
         const char* kPsHlsl = R"(
 float4 light : register(c0);
@@ -267,7 +281,7 @@ float4 ambient : register(c4);
 float4 diffuse : register(c5);
 float4 fogColor : register(c6);
 
-float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float fog : TEXCOORD3) : COLOR
+float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float fog : TEXCOORD3, float4 tint : TEXCOORD4) : COLOR
 {
     clip(d.x - opts.x);
     clip(0.5 - d.y);
@@ -275,7 +289,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
     clip(0.5 - a.x * a.y);
     float ndl = saturate(dot(normalize(n), normalize(light.xyz)));
     float3 lit = min(ambient.rgb + diffuse.rgb * ndl, 1);
-    return float4(lerp(fogColor.rgb, albedo.rgb * lit, fog), 1);
+    float3 colour = lerp(albedo.rgb, tint.rgb, saturate(tint.a));
+    return float4(lerp(fogColor.rgb, colour * lit, fog), 1);
 }
 )";
 
@@ -289,41 +304,69 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             return n < 1 ? 1 : (n > kMaxLevels ? kMaxLevels : n);
         }
 
-        // The table's cover depth at the centre of terrain cell (cx, cy); 0 = bare, -1 while its
-        // chunk isn't loaded.
-        float CellDepth(int cx, int cy)
+        // The table's values at the centre of terrain cell (cx, cy); false while its chunk isn't loaded.
+        bool CellValues(int cx, int cy, covertable::Values& out)
         {
             const int64_t key = (static_cast<int64_t>(cx) << 32) ^ static_cast<uint32_t>(cy);
-            const auto it = g_cellDepth.find(key);
-            if (it != g_cellDepth.end()) return it->second;
+            const auto it = g_cellValues.find(key);
+            if (it != g_cellValues.end()) { out = it->second; return true; }
             terrain::Surface surface;
             if (!terrain::SurfaceAt((cx + 0.5f) * kTerrainCell, (cy + 0.5f) * kTerrainCell, surface))
-                return -1.0f; // not loaded (or a hole): ask again later
-            const float depth = covertable::Resolve(surface.area, g_mapNow, surface.groundEffect, surface.terrainType).depth;
-            if (g_cellDepth.size() > 400000) g_cellDepth.clear(); // far beyond any grid's reach
-            g_cellDepth.emplace(key, depth);
-            return depth;
+                return false; // not loaded (or a hole): ask again later
+            out = covertable::Resolve(surface.area, g_mapNow, surface.texture, surface.groundEffect, surface.terrainType);
+            if (g_cellValues.size() > 400000) g_cellValues.clear(); // far beyond any grid's reach
+            g_cellValues.emplace(key, out);
+            return true;
         }
 
-        // Soft cover between terrain cell centres: how covered (0..1, blended, so the cover tapers out
-        // over about one terrain cell instead of stopping in a staircase) and how deep (the covered
-        // neighbours' depths, weighted the same way, so an edge isn't thinned twice).
-        void SoftCover(float x, float y, float& material, float& depth)
+        // The cover between terrain cell centres: how covered (0..1, blended, so the cover tapers out
+        // over about one terrain cell instead of stopping in a staircase), and every other property
+        // as the covered neighbours' values weighted the same way (so an edge isn't thinned twice,
+        // and two materials meeting blend their depth, slope limits, tint, ...).
+        struct Blend
         {
+            float covered = 0.0f, depth = 0.0f, maxSlope = 45.0f, slopeFade = 15.0f, drift = 0.0f, breakup = 0.5f;
+            float tint[3] = {}, tintStrength = 0.0f;
+        };
+
+        Blend BlendAt(float x, float y)
+        {
+            Blend b;
+            if (static_cast<Coverage>(g_settings.coverage) == Coverage::Everywhere)
+            {
+                const covertable::Values v;
+                b.covered = 1.0f; b.depth = kTestDepth; b.maxSlope = v.maxSlope; b.slopeFade = v.slopeFade;
+                b.drift = v.driftNoise; b.breakup = v.edgeBreakup;
+                return b;
+            }
             const float u = x / kTerrainCell - 0.5f, v = y / kTerrainCell - 0.5f;
             const int cx = static_cast<int>(std::floor(u)), cy = static_cast<int>(std::floor(v));
             const float fx = u - cx, fy = v - cy;
             const int c[4][2] = { { cx, cy }, { cx + 1, cy }, { cx, cy + 1 }, { cx + 1, cy + 1 } };
             const float w[4] = { (1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy };
-            float covered = 0.0f, weighted = 0.0f;
+            float sum[9] = {};
             for (int k = 0; k < 4; ++k)
             {
-                const float d = CellDepth(c[k][0], c[k][1]);
-                if (d > 0.0f) { covered += w[k]; weighted += w[k] * d; }
+                covertable::Values cv;
+                if (!CellValues(c[k][0], c[k][1], cv) || cv.depth <= 0.0f) continue;
+                const float wk = w[k];
+                b.covered += wk;
+                sum[0] += wk * cv.depth;      sum[1] += wk * cv.maxSlope;   sum[2] += wk * cv.slopeFade;
+                sum[3] += wk * cv.driftNoise; sum[4] += wk * cv.edgeBreakup;
+                sum[5] += wk * ((cv.tintColor >> 16) & 0xFF) / 255.0f;
+                sum[6] += wk * ((cv.tintColor >> 8) & 0xFF) / 255.0f;
+                sum[7] += wk * (cv.tintColor & 0xFF) / 255.0f;
+                sum[8] += wk * cv.tintStrength;
             }
-            material = covered;
-            depth = covered > 0.0f ? weighted / covered : 0.0f;
+            if (b.covered <= 0.0f) return b;
+            const float inv = 1.0f / b.covered;
+            b.depth = sum[0] * inv; b.maxSlope = sum[1] * inv; b.slopeFade = sum[2] * inv;
+            b.drift = sum[3] * inv; b.breakup = sum[4] * inv;
+            b.tint[0] = sum[5] * inv; b.tint[1] = sum[6] * inv; b.tint[2] = sum[7] * inv; b.tintStrength = sum[8] * inv;
+            return b;
         }
+
+        uint8_t ToByte(float v) { return static_cast<uint8_t>((v <= 0.0f ? 0.0f : (v >= 1.0f ? 1.0f : v)) * 255.0f + 0.5f); }
 
         // Smooth value noise in world space, 0..1. `seed` gives independent fields.
         float Hash(int x, int y, uint32_t seed = 0)
@@ -362,35 +405,45 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             const float base = ok ? z : kHole;
             if (base != L.base[s]) { L.base[s] = base; L.baseDirty = true; }
 
-            uint8_t material = 0, up = 255;
-            float depth = 0.0f;
+            Blend b;
+            uint8_t slopeF = 0;
             if (ok)
             {
                 // The material edge wanders: the lookup point is pushed around by broad noise, so a
                 // snowy terrain cell's border follows an irregular line instead of a rounded square.
-                const float warp = kEdgeWarpYards * g_settings.edgeBreakup;
+                // How far comes from the rows near the unwarped point.
+                const Blend around = BlendAt(x, y);
+                const float breakup0 = (around.covered > 0.0f ? around.breakup : covertable::Values().edgeBreakup) * g_settings.breakupMul;
+                const float warp = kEdgeWarpYards * (breakup0 > 1.0f ? 1.0f : breakup0);
                 const float mx = x + warp * (2.0f * ValueNoise(x / 7.0f, y / 7.0f, 1) - 1.0f);
                 const float my = y + warp * (2.0f * ValueNoise(x / 7.0f, y / 7.0f, 2) - 1.0f);
-                if (static_cast<Coverage>(g_settings.coverage) == Coverage::Everywhere) { material = 255; depth = kTestDepth; }
-                else
-                {
-                    float m;
-                    SoftCover(mx, my, m, depth);
-                    material = static_cast<uint8_t>(m * 255.0f + 0.5f);
-                }
-                // Steepness 1 yd around (fixed, so every level gets the same value at the same spot).
+                b = BlendAt(mx, my);
+
+                // Steepness 1 yd around (fixed, so every level gets the same value at the same spot),
+                // against the rows' slope limit.
                 float zx, zy;
                 const float gx = terrain::HeightAt(x + 1.0f, y, zx) ? zx - z : 0.0f;
                 const float gy = terrain::HeightAt(x, y + 1.0f, zy) ? zy - z : 0.0f;
-                up = static_cast<uint8_t>(255.0f / std::sqrt(1.0f + gx * gx + gy * gy) + 0.5f);
+                const float up = 1.0f / std::sqrt(1.0f + gx * gx + gy * gy);
+                const float rad = 3.14159265f / 180.0f;
+                const float cosMax = std::cos(b.maxSlope * rad), cosFull = std::cos((b.maxSlope - b.slopeFade) * rad);
+                float t = cosFull > cosMax ? (up - cosMax) / (cosFull - cosMax) : (up >= cosMax ? 1.0f : 0.0f);
+                t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+                slopeF = ToByte(t * t * (3.0f - 2.0f * t));
             }
+            const uint8_t material = ToByte(b.covered), driftAmp = ToByte(b.drift), breakup = ToByte(b.breakup);
             const uint8_t drift = static_cast<uint8_t>(Drift(x, y) * 255.0f + 0.5f);
             const uint8_t edge = static_cast<uint8_t>(EdgeNoise(x, y) * 255.0f + 0.5f);
-            if (material != L.material[s] || depth != L.depth[s] || up != L.upness[s] || drift != L.drift[s] || edge != L.edgeNoise[s])
+            const uint32_t tint = (static_cast<uint32_t>(ToByte(b.tintStrength)) << 24) | (static_cast<uint32_t>(ToByte(b.tint[0])) << 16) |
+                                  (static_cast<uint32_t>(ToByte(b.tint[1])) << 8) | ToByte(b.tint[2]);
+            if (material != L.material[s] || b.depth != L.depth[s] || slopeF != L.slope[s] || driftAmp != L.driftAmp[s] ||
+                breakup != L.breakup[s] || drift != L.drift[s] || edge != L.edgeNoise[s])
             {
-                L.material[s] = material; L.depth[s] = depth; L.upness[s] = up; L.drift[s] = drift; L.edgeNoise[s] = edge;
+                L.material[s] = material; L.depth[s] = b.depth; L.slope[s] = slopeF; L.driftAmp[s] = driftAmp;
+                L.breakup[s] = breakup; L.drift[s] = drift; L.edgeNoise[s] = edge;
                 L.coverDirty = true;
             }
+            if (tint != L.tint[s]) { L.tint[s] = tint; L.lookDirty = true; }
             if (isLevel0 && fresh) { g_press[s] = 0.0f; g_rim[s] = 0.0f; }
         }
 
@@ -489,7 +542,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         {
             auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
             rel(g_vb); rel(g_ib); rel(g_decl); rel(g_vs); rel(g_ps);
-            for (Level& L : g_levels) { rel(L.baseTex); rel(L.coverTex); L.baseDirty = L.coverDirty = true; }
+            for (Level& L : g_levels) { rel(L.baseTex); rel(L.coverTex); rel(L.lookTex); L.baseDirty = L.coverDirty = L.lookDirty = true; }
         }
 
         void* Compile(IDirect3DDevice9* dev, const char* hlsl, const char* target, bool pixel)
@@ -515,7 +568,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             return shader;
         }
 
-        bool VertexTexturesSupported(IDirect3DDevice9* dev)
+        bool VertexTexturesSupported(IDirect3DDevice9* dev, D3DFORMAT format = D3DFMT_R32F)
         {
             IDirect3D9* d3d = nullptr;
             D3DDEVICE_CREATION_PARAMETERS cp{};
@@ -523,7 +576,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             if (FAILED(dev->GetDirect3D(&d3d)) || !d3d) return false;
             const bool ok = SUCCEEDED(dev->GetCreationParameters(&cp)) && SUCCEEDED(dev->GetDisplayMode(0, &mode)) &&
                             SUCCEEDED(d3d->CheckDeviceFormat(cp.AdapterOrdinal, cp.DeviceType, mode.Format,
-                                                             D3DUSAGE_QUERY_VERTEXTEXTURE, D3DRTYPE_TEXTURE, D3DFMT_R32F));
+                                                             D3DUSAGE_QUERY_VERTEXTEXTURE, D3DRTYPE_TEXTURE, format));
             d3d->Release();
             return ok;
         }
@@ -533,7 +586,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             if (dev != g_device) { ReleaseGpu(); g_gpuFailed = false; g_device = dev; }
             if (g_gpuFailed) return false;
             bool texturesReady = true;
-            for (const Level& L : g_levels) texturesReady &= L.baseTex && L.coverTex;
+            for (const Level& L : g_levels) texturesReady &= L.baseTex && L.coverTex && (!g_tintSupported || L.lookTex);
             if (g_vb && g_ib && g_decl && g_vs && g_ps && texturesReady) return true;
             ReleaseGpu();
 
@@ -573,6 +626,12 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 if (FAILED(dev->CreateTexture(kTex, kTex, 1, 0, D3DFMT_R32F, D3DPOOL_MANAGED, &L.baseTex, nullptr)) ||
                     FAILED(dev->CreateTexture(kTex, kTex, 1, 0, D3DFMT_R32F, D3DPOOL_MANAGED, &L.coverTex, nullptr)))
                     return fail("R32F textures failed");
+            // The tint is optional: only where the GPU can fetch A8R8G8B8 in the vertex shader.
+            g_tintSupported = VertexTexturesSupported(dev, D3DFMT_A8R8G8B8);
+            if (g_tintSupported)
+                for (Level& L : g_levels)
+                    if (FAILED(dev->CreateTexture(kTex, kTex, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &L.lookTex, nullptr)))
+                    { L.lookTex = nullptr; g_tintSupported = false; }
 
             g_vs = static_cast<IDirect3DVertexShader9*>(Compile(dev, kVsHlsl, "vs_3_0", false));
             g_ps = static_cast<IDirect3DPixelShader9*>(Compile(dev, kPsHlsl, "ps_3_0", true));
@@ -594,26 +653,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             // Level 0 changes every frame (trenches); the others only when their mask or the depth does.
             if (!isLevel0 && !L.coverDirty) return true;
             if (FAILED(L.coverTex->LockRect(0, &lr, nullptr, 0))) return false;
-            const float depthScale = g_settings.depthScale;
-
-            // Lookup tables for this upload: steepness -> factor, drift -> factor.
-            float slopeF[256], driftF[256];
-            const float rad = 3.14159265f / 180.0f;
-            const float cosMax = std::cos(g_settings.maxSlope * rad);
-            const float cosFull = std::cos((g_settings.maxSlope - g_settings.slopeBand) * rad);
-            for (int k = 0; k < 256; ++k)
-            {
-                const float up = k / 255.0f;
-                float t = cosFull > cosMax ? (up - cosMax) / (cosFull - cosMax) : (up >= cosMax ? 1.0f : 0.0f);
-                t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
-                slopeF[k] = t * t * (3.0f - 2.0f * t);
-                const float d = 1.0f + g_settings.noise * (k / 127.5f - 1.0f);
-                driftF[k] = d < 0.0f ? 0.0f : d;
-            }
-            // Material shaping: steeper with more breakup, and the fine edge noise moves the threshold,
-            // so the transition breaks into patches. Fully covered (1) and bare (0) stay as they are.
-            const float b = g_settings.edgeBreakup;
-            const float contrast = 1.0f + 2.0f * b, jitter = 1.5f * b;
+            const float depthMul = g_settings.depthMul, driftMul = g_settings.driftMul, breakupMul = g_settings.breakupMul;
             const int slotI0 = Slot(L.gridI), slotJ0 = Slot(L.gridJ);
             for (int row = 0; row < kTex; ++row)
             {
@@ -624,9 +664,15 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 for (int col = 0; col < kTex; ++col)
                 {
                     const int s = row * kTex + col;
-                    float m = (L.material[s] / 255.0f - 0.5f) * contrast + 0.5f + jitter * (L.edgeNoise[s] / 255.0f - 0.5f);
+                    // Material shaping: steeper with more breakup, and the fine edge noise moves the
+                    // threshold, so the transition breaks into patches. Fully covered and bare stay so.
+                    float b = L.breakup[s] / 255.0f * breakupMul;
+                    b = b > 1.0f ? 1.0f : b;
+                    float m = (L.material[s] / 255.0f - 0.5f) * (1.0f + 2.0f * b) + 0.5f + 1.5f * b * (L.edgeNoise[s] / 255.0f - 0.5f);
                     m = m <= 0.0f ? 0.0f : (m >= 1.0f ? 1.0f : m * m * (3.0f - 2.0f * m));
-                    const float cover = depthScale * L.depth[s] * m * slopeF[L.upness[s]] * driftF[L.drift[s]];
+                    float driftF = 1.0f + L.driftAmp[s] / 255.0f * driftMul * (L.drift[s] / 127.5f - 1.0f);
+                    driftF = driftF < 0.0f ? 0.0f : driftF;
+                    const float cover = depthMul * L.depth[s] * m * (L.slope[s] / 255.0f) * driftF;
                     if (cover <= 0.0f) { out[col] = 0.0f; continue; }
                     if (!isLevel0) { out[col] = cover; continue; }
                     const int di = (col - slotI0 + kTex) % kTex;
@@ -642,6 +688,15 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             }
             L.coverTex->UnlockRect(0);
             L.coverDirty = false;
+
+            if (L.lookTex && L.lookDirty)
+            {
+                if (FAILED(L.lookTex->LockRect(0, &lr, nullptr, 0))) return false;
+                for (int row = 0; row < kTex; ++row)
+                    std::memcpy(static_cast<uint8_t*>(lr.pBits) + row * lr.Pitch, &L.tint[row * kTex], kTex * 4);
+                L.lookTex->UnlockRect(0);
+                L.lookDirty = false;
+            }
             return true;
         }
 
@@ -740,6 +795,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 std::memcpy(ps0 + 24, g_seenFogColor, 3 * sizeof(float));
             }
             dev->SetVertexShaderConstantF(9, vs9, 4);
+            const float c13[4] = { g_tintSupported ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+            dev->SetVertexShaderConstantF(13, c13, 1);
             dev->SetPixelShaderConstantF(0, ps0, 7);
 
             dev->SetVertexDeclaration(g_decl);
@@ -747,7 +804,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             dev->SetIndices(g_ib);
             dev->SetVertexShader(g_vs);
             dev->SetPixelShader(g_ps);
-            for (int s = 0; s < 2; ++s)
+            for (int s = 0; s < 3; ++s)
             {
                 const DWORD sampler = D3DVERTEXTEXTURESAMPLER0 + s;
                 dev->SetSamplerState(sampler, D3DSAMP_MINFILTER, D3DTEXF_POINT);
@@ -779,6 +836,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 const bool outermost = k == levels - 1;
                 dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, L.baseTex);
                 dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, L.coverTex);
+                dev->SetTexture(D3DVERTEXTEXTURESAMPLER2, g_tintSupported ? L.lookTex : nullptr);
 
                 const float c5[4] = { static_cast<float>(L.gridI + kHalfCells), static_cast<float>(L.gridJ + kHalfCells),
                                       static_cast<float>(kHalfCells), outermost ? 0.0f : static_cast<float>(kMorphCells) };
@@ -813,6 +871,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
 
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, nullptr);
+            dev->SetTexture(D3DVERTEXTEXTURESAMPLER2, nullptr);
             if (swapDepth) dev->SetDepthStencilSurface(oldDepth);
             if (oldDepth) oldDepth->Release();
             saved->Apply(); // includes the viewport
@@ -863,15 +922,14 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             static const char* const coverage[] = { "Everywhere (test)", "From SurfaceCover.cdbc" };
             g_api->UiCombo("Where", &g_settings.coverage, coverage, 2);
             g_api->UiSliderInt("Levels (40 / 80 / 160 / 320 / 640 yd)", &g_settings.levels, 1, kMaxLevels);
-            g_api->UiSliderFloat("Depth scale (x table)", &g_settings.depthScale, 0.0f, 3.0f);
-            g_api->UiSliderFloat("Rim (x depth, default)", &g_settings.rim, 0.0f, 1.0f);
-            g_api->UiSliderFloat("Max slope (deg)", &g_settings.maxSlope, 10.0f, 90.0f);
-            g_api->UiSliderFloat("Slope fade (deg)", &g_settings.slopeBand, 0.0f, 40.0f);
-            g_api->UiSliderFloat("Drift noise (x depth)", &g_settings.noise, 0.0f, 1.0f);
-            g_api->UiSliderFloat("Edge breakup", &g_settings.edgeBreakup, 0.0f, 1.0f);
+            g_api->UiText("Multipliers on SurfaceCover.cdbc (1 = exactly the table):");
+            g_api->UiSliderFloat("Depth (x table)", &g_settings.depthMul, 0.0f, 3.0f);
+            g_api->UiSliderFloat("Drift noise (x table)", &g_settings.driftMul, 0.0f, 3.0f);
+            g_api->UiSliderFloat("Edge breakup (x table)", &g_settings.breakupMul, 0.0f, 3.0f);
+            g_api->UiSliderFloat("Rim (x table)", &g_settings.rimMul, 0.0f, 3.0f);
+            g_api->UiSliderFloat("Relax time (x table)", &g_settings.relaxMul, 0.1f, 10.0f);
             g_api->UiCheckbox("Units carve trenches", &g_settings.stamp);
             g_api->UiSliderFloat("Trench width (x unit size)", &g_settings.stampScale, 0.3f, 3.0f);
-            g_api->UiSliderFloat("Relax time (s, default)", &g_settings.relaxSeconds, 1.0f, 300.0f);
             g_api->UiSliderFloat("Far lift (yd, 80 -> 400 yd away)", &g_settings.farLift, 0.0f, 3.0f);
             g_api->UiCheckbox("Light and fog like the terrain", &g_settings.sceneLight);
             g_api->UiSliderFloat("Snow brightness", &g_settings.brightness, 0.3f, 1.5f);
@@ -894,9 +952,18 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 std::snprintf(line, sizeof(line), "level %d: %.2f yd cells, %.0f yd out, first cell (%d, %d), holes/unloaded %u, full fill %.2f ms, last recentre %.2f ms",
                               k, L.cell, kHalfCells * L.cell, L.gridI, L.gridJ, L.holes, L.firstFillMs, L.fillMs); add();
             }
-            std::snprintf(line, sizeof(line), "%d x %d vertices; units stamping %u; terrain cells cached %zu",
-                          levels * kPatches * kPatches, kPatchVerts * kPatchVerts, g_stamps, g_cellDepth.size()); add();
-            std::snprintf(line, sizeof(line), "here: rim %.2f x depth, relax %.0f s", g_rimShareNow, g_relaxNow); add();
+            std::snprintf(line, sizeof(line), "%d x %d vertices; units stamping %u; terrain cells cached %zu; tint %s",
+                          levels * kPatches * kPatches, kPatchVerts * kPatchVerts, g_stamps, g_cellValues.size(),
+                          g_tintSupported ? "on" : "not supported by this GPU"); add();
+            if (g_hereValid)
+            {
+                std::snprintf(line, sizeof(line), "here: texture \"%s\", ground effect %u, TerrainType %d, area %u",
+                              g_hereTexture.c_str(), g_hereSurface.groundEffect, g_hereSurface.terrainType, g_hereSurface.area); add();
+                const covertable::Values& v = g_hereValues;
+                std::snprintf(line, sizeof(line), "here (table): depth %.2f, max slope %.0f, fade %.0f, drift %.2f, breakup %.2f, rim %.2f, relax %.0f s, tint %08X x %.2f",
+                              v.depth, v.maxSlope, v.slopeFade, v.driftNoise, v.edgeBreakup, v.rim, v.relaxSeconds, v.tintColor, v.tintStrength); add();
+            }
+            else { std::snprintf(line, sizeof(line), "here: no terrain under the player"); add(); }
             std::snprintf(line, sizeof(line), "CPU: sim %.2f ms, upload %.2f ms, draw submit %.2f ms", g_simMs, g_uploadMs, g_drawMs); add();
             if (g_seenScene)
             {
@@ -948,20 +1015,18 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         g_mapNow = snap.mapId;
         const bool refill = g_lastCoverage != g_settings.coverage || g_lastMap != snap.mapId ||
                             g_tableGeneration != covertable::Generation();
-        if (refill) g_cellDepth.clear();
+        if (refill) g_cellValues.clear();
         g_lastCoverage = g_settings.coverage;
         g_lastMap = snap.mapId;
         g_tableGeneration = covertable::Generation();
-        if (g_lastDepthScale != g_settings.depthScale || g_lastMaxSlope != g_settings.maxSlope ||
-            g_lastSlopeBand != g_settings.slopeBand || g_lastNoise != g_settings.noise)
+        if (g_lastDepthMul != g_settings.depthMul || g_lastDriftMul != g_settings.driftMul)
         {
-            g_lastDepthScale = g_settings.depthScale; g_lastMaxSlope = g_settings.maxSlope;
-            g_lastSlopeBand = g_settings.slopeBand; g_lastNoise = g_settings.noise;
+            g_lastDepthMul = g_settings.depthMul; g_lastDriftMul = g_settings.driftMul;
             for (Level& L : g_levels) L.coverDirty = true;
         }
-        if (g_lastEdgeBreakup != g_settings.edgeBreakup)
+        if (g_lastBreakupMul != g_settings.breakupMul)
         {
-            g_lastEdgeBreakup = g_settings.edgeBreakup;
+            g_lastBreakupMul = g_settings.breakupMul;
             for (Level& L : g_levels) { L.coverDirty = true; L.boostRows = kFilled; } // the warp is sampled
         }
 
@@ -994,16 +1059,19 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         for (int k = levels; k < kMaxLevels; ++k) g_levels[k].haveGrid = false;
 
         // Rim and relax time come from the table's row where the player is (trenches are made around
-        // the player); -1 there falls back to the panel's defaults.
-        g_rimShareNow = g_settings.rim;
-        g_relaxNow = g_settings.relaxSeconds;
-        terrain::Surface here;
-        if (static_cast<Coverage>(g_settings.coverage) == Coverage::Table && terrain::SurfaceAt(snap.playerPos[0], snap.playerPos[1], here))
+        // the player), times the panel's multipliers. The same lookup feeds the panel's "here" lines.
+        covertable::Values here;
+        if (static_cast<Coverage>(g_settings.coverage) == Coverage::Everywhere) here.depth = kTestDepth;
+        g_hereValid = terrain::SurfaceAt(snap.playerPos[0], snap.playerPos[1], g_hereSurface);
+        if (g_hereValid)
         {
-            const covertable::Values v = covertable::Resolve(here.area, snap.mapId, here.groundEffect, here.terrainType);
-            if (v.rim >= 0.0f) g_rimShareNow = v.rim;
-            if (v.relaxSeconds > 0.0f) g_relaxNow = v.relaxSeconds;
+            g_hereTexture = g_hereSurface.texture ? g_hereSurface.texture : "";
+            if (static_cast<Coverage>(g_settings.coverage) == Coverage::Table)
+                here = covertable::Resolve(g_hereSurface.area, snap.mapId, g_hereSurface.texture, g_hereSurface.groundEffect, g_hereSurface.terrainType);
         }
+        g_hereValues = here;
+        g_rimShareNow = here.rim * g_settings.rimMul;
+        g_relaxNow = here.relaxSeconds * g_settings.relaxMul;
 
         Simulate(dt);
         g_simMs = grassperf::Now() - t0;

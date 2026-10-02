@@ -70,35 +70,54 @@ Generator: `tools/gen_default_density.py` (shipped baseline; `--examples` adds e
 
 ## SurfaceCover.cdbc — `SurfaceCover.xml`
 
-Which ground gets a cover (snow, sand, ...) and how deep. The cover is a real layer on top of the
-terrain: units sink in and carve trenches with a rim, which relax over time. Looked up per terrain
-cell (about 4 yd) from what the cell is painted with: its dominant texture layer's ground effect and
-that effect's TerrainType. Edges between cells blend, and the slope and drift-noise settings shape
-the rest.
+Which ground gets a cover (snow, sand, ...), how deep, and how it looks and behaves. The cover is
+a real layer on top of the terrain: units sink in and carve trenches with a rim, which fill back in
+over time. Grass and small doodads are buried under it.
+
+Looked up per terrain cell (about 4 yd) from what the cell is painted with: its dominant texture
+layer's **texture**, that layer's **ground effect**, and the ground effect's **TerrainType**. Between
+cells everything blends (depth, slope limits, tint, ...), so two materials meeting mix smoothly.
+**The F9 surface cover panel shows these for the spot you stand on** ("here:" lines), plus the
+values the table gives there, so rows can be written on the spot.
 
 | Field | Meaning |
 |---|---|
 | ID | row id |
 | ScopeType | 0 = Global, 1 = Map, 2 = Area |
 | ScopeID | Map.dbc ID or AreaTable ID (ignored for Global) |
-| GroundEffectID | GroundEffectTexture.dbc ID (what the map designer painted); 0 = any |
+| TexturePath | the painted texture's path, e.g. as the panel shows it; **empty = any**. Case and `/` vs `\` don't matter |
+| GroundEffectID | GroundEffectTexture.dbc ID (the effect painted with the texture); **0 = any** |
 | TerrainType | TerrainType.dbc ID; **-1 = any** (0 is Dirt). Stock: 0 Dirt, 1 Metallic, 2 Stone, 3 Snow, 4 Wood, 5 Grass, 6 Leaves, 7 Sand, 8 Soggy, 9 Dusty Grass, 10 None, 11 Water |
 | Depth | yards of cover; **0 = no cover** (switches a material off) |
-| Rim | height of the rim pushed up beside a trench, as a share of the depth |
+| MaxSlope | degrees: steeper ground holds no cover |
+| SlopeFade | degrees below MaxSlope over which the cover thins out |
+| DriftNoise | depth variation (drifts and lumps), share of the depth (0.35 = ±35%) |
+| EdgeBreakup | 0 = smooth, rounded edges where covered ground meets bare ground .. 1 = ragged, patchy ones |
+| Rim | height of the rim pushed up beside a trench, share of the depth |
 | RelaxSeconds | how long a trench takes to fill back in |
+| TintColor | colour as 0xRRGGBB, used with TintStrength |
+| TintStrength | 0 = the plain cover colour .. 1 = TintColor. TintColor comes from the same row |
+| CoverTexture | **reserved, not used yet** (a texture on the cover itself) |
+| Opacity | **reserved, not used yet** (see-through covers: slush, goo) |
+| Flatten | **reserved, not used yet** (liquid-like covers that fill hollows) |
 | Flags | reserved, 0 |
 
-A float of **-1 takes that field from the next, less specific row**. No row at all = no cover.
+A float of **-1 takes that field from the next, less specific row**. Fields no row sets use the
+defaults: MaxSlope 45, SlopeFade 15, DriftNoise 0.35, EdgeBreakup 0.5, Rim 0.3, RelaxSeconds 30,
+no tint. No row at all (or Depth 0) = no cover.
 
 **The most specific row wins** (workspace rule for scoped tables): place first, then what.
 Places: the terrain cell's own area (sub-zone), its parent zones, the map, global. Within each
-place: GroundEffectID → TerrainType → everything (GroundEffectID 0 and TerrainType -1). Values are
-never added or multiplied across rows.
+place: TexturePath → GroundEffectID → TerrainType → everything (empty texture, GroundEffectID 0,
+TerrainType -1). Values are never added or multiplied across rows. So "snow everywhere" is one
+Global row with TerrainType 3; one texture that should look different gets a TexturePath row; a
+zone that's different gets Area rows.
 
 Rim and RelaxSeconds are taken from the row where the player stands (trenches are made around the
-player); -1 all the way down falls back to the panel's defaults. The panel's "Depth scale" multiplies
-every depth.
+player). The panel's multipliers (Depth, Drift noise, Edge breakup, Rim, Relax time) scale the
+table for testing or taste; at 1 the table applies exactly.
 
-Shipped baseline: snow 0.35 yd everywhere, sand off (Depth 0). Generator:
-`tools/gen_default_surface_cover.py` (`--examples` adds a deeper Icecrown and a thin Kalimdor sand
-row). After editing, press "Reload table" in the surface cover panel.
+Shipped baseline: snow 0.35 yd everywhere it's painted (bare above ~40°), sand listed but off
+(Depth 0, with a sandy tint ready). Generator: `tools/gen_default_surface_cover.py` (`--examples`
+adds a deeper Icecrown, one example texture row and a thin Kalimdor sand). After editing, press
+"Reload table" in the surface cover panel.
