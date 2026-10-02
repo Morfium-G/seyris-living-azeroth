@@ -77,6 +77,7 @@ namespace wxl_livingazeroth::cover
             float maxSlope = 45.0f;         // degrees: steeper ground holds no cover...
             float slopeBand = 15.0f;        // ...and it thins out over this many degrees below that
             float noise = 0.35f;            // depth variation (drifts), share of the depth
+            float edgeBreakup = 0.5f;       // 0 = smooth rounded material edges, 1 = ragged, patchy ones
             int   wireframe = 0;
             int   drawPoint = 0;            // 0 right after the terrain (inside the world pass), 1 end of the scene
         };
@@ -94,6 +95,8 @@ namespace wxl_livingazeroth::cover
             std::vector<uint8_t> material = std::vector<uint8_t>(kTex * kTex, 0);
             std::vector<uint8_t> upness = std::vector<uint8_t>(kTex * kTex, 255);
             std::vector<uint8_t> drift = std::vector<uint8_t>(kTex * kTex, 128);
+            std::vector<uint8_t> edgeNoise = std::vector<uint8_t>(kTex * kTex, 128);
+            int boostRows = 0;              // rows left to re-sample at full speed after a setting change
             bool  haveGrid = false;
             int   gridI = 0, gridJ = 0;     // world cell index (of this level) of the grid's first vertex
             int   refreshRow = 0;
@@ -112,6 +115,8 @@ namespace wxl_livingazeroth::cover
         int   g_lastCoverage = -1;
         int   g_lastMap = -1;
         float g_lastDepth = -1.0f, g_lastMaxSlope = -1.0f, g_lastSlopeBand = -1.0f, g_lastNoise = -1.0f;
+        float g_lastEdgeBreakup = -1.0f;
+        constexpr float kEdgeWarpYards = 5.0f; // how far the material edge wanders at full breakup
 
         // Material per terrain cell (the client's lookup is constant over one: it's the cell's
         // dominant layer): 0 bare, 1 covered. Unloaded cells aren't cached, so they're asked again.
@@ -297,30 +302,33 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) 
                 m[k] = r < 0 ? 0.0f : static_cast<float>(r);
             }
             const float a = m[0] + (m[1] - m[0]) * fx, b = m[2] + (m[3] - m[2]) * fx;
-            const float t = a + (b - a) * fy;
-            return t * t * (3.0f - 2.0f * t);
+            return a + (b - a) * fy;
         }
 
-        // Smooth value noise in world space, two scales (broad drifts and small lumps), 0..1.
-        float Hash(int x, int y)
+        // Smooth value noise in world space, 0..1. `seed` gives independent fields.
+        float Hash(int x, int y, uint32_t seed = 0)
         {
-            uint32_t h = static_cast<uint32_t>(x) * 374761393u + static_cast<uint32_t>(y) * 668265263u;
+            uint32_t h = static_cast<uint32_t>(x) * 374761393u + static_cast<uint32_t>(y) * 668265263u + seed * 2246822519u;
             h = (h ^ (h >> 13)) * 1274126177u;
             return static_cast<float>((h ^ (h >> 16)) & 0xFFFFu) / 65535.0f;
         }
 
-        float ValueNoise(float x, float y)
+        float ValueNoise(float x, float y, uint32_t seed = 0)
         {
             const int ix = static_cast<int>(std::floor(x)), iy = static_cast<int>(std::floor(y));
             float fx = x - ix, fy = y - iy;
             fx = fx * fx * (3.0f - 2.0f * fx);
             fy = fy * fy * (3.0f - 2.0f * fy);
-            const float a = Hash(ix, iy) + (Hash(ix + 1, iy) - Hash(ix, iy)) * fx;
-            const float b = Hash(ix, iy + 1) + (Hash(ix + 1, iy + 1) - Hash(ix, iy + 1)) * fx;
+            const float a = Hash(ix, iy, seed) + (Hash(ix + 1, iy, seed) - Hash(ix, iy, seed)) * fx;
+            const float b = Hash(ix, iy + 1, seed) + (Hash(ix + 1, iy + 1, seed) - Hash(ix, iy + 1, seed)) * fx;
             return a + (b - a) * fy;
         }
 
+        // Two scales: broad drifts and small lumps.
         float Drift(float x, float y) { return 0.65f * ValueNoise(x / 9.0f, y / 9.0f) + 0.35f * ValueNoise(x / 2.5f, y / 2.5f); }
+
+        // Fine noise for ragged, patchy material edges.
+        float EdgeNoise(float x, float y) { return 0.6f * ValueNoise(x / 1.6f, y / 1.6f, 3) + 0.4f * ValueNoise(x / 0.7f, y / 0.7f, 4); }
 
         // Base height and coverage parts of one world cell of a level (level 0 also resets its trench
         // state when `fresh`). Everything depends only on the world position, so the levels agree
@@ -337,8 +345,13 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) 
             uint8_t material = 0, up = 255;
             if (ok)
             {
+                // The material edge wanders: the lookup point is pushed around by broad noise, so a
+                // snowy terrain cell's border follows an irregular line instead of a rounded square.
+                const float warp = kEdgeWarpYards * g_settings.edgeBreakup;
+                const float mx = x + warp * (2.0f * ValueNoise(x / 7.0f, y / 7.0f, 1) - 1.0f);
+                const float my = y + warp * (2.0f * ValueNoise(x / 7.0f, y / 7.0f, 2) - 1.0f);
                 material = static_cast<Coverage>(g_settings.coverage) == Coverage::Everywhere
-                         ? 255 : static_cast<uint8_t>(SoftMaterial(x, y) * 255.0f + 0.5f);
+                         ? 255 : static_cast<uint8_t>(SoftMaterial(mx, my) * 255.0f + 0.5f);
                 // Steepness 1 yd around (fixed, so every level gets the same value at the same spot).
                 float zx, zy;
                 const float gx = terrain::HeightAt(x + 1.0f, y, zx) ? zx - z : 0.0f;
@@ -346,9 +359,10 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) 
                 up = static_cast<uint8_t>(255.0f / std::sqrt(1.0f + gx * gx + gy * gy) + 0.5f);
             }
             const uint8_t drift = static_cast<uint8_t>(Drift(x, y) * 255.0f + 0.5f);
-            if (material != L.material[s] || up != L.upness[s] || drift != L.drift[s])
+            const uint8_t edge = static_cast<uint8_t>(EdgeNoise(x, y) * 255.0f + 0.5f);
+            if (material != L.material[s] || up != L.upness[s] || drift != L.drift[s] || edge != L.edgeNoise[s])
             {
-                L.material[s] = material; L.upness[s] = up; L.drift[s] = drift;
+                L.material[s] = material; L.upness[s] = up; L.drift[s] = drift; L.edgeNoise[s] = edge;
                 L.coverDirty = true;
             }
             if (isLevel0 && fresh) { g_press[s] = 0.0f; g_rimH[s] = 0.0f; }
@@ -378,6 +392,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) 
             {
                 SampleRect(L, isLevel0, fi, fi + span, fj, fj + span, true);
                 L.firstFillMs = grassperf::Now() - t0;
+                L.boostRows = kFilled; // chunks still streaming in get picked up quickly
             }
             else
             {
@@ -571,6 +586,10 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) 
                 const float d = 1.0f + g_settings.noise * (k / 127.5f - 1.0f);
                 driftF[k] = d < 0.0f ? 0.0f : d;
             }
+            // Material shaping: steeper with more breakup, and the fine edge noise moves the threshold,
+            // so the transition breaks into patches. Fully covered (1) and bare (0) stay as they are.
+            const float b = g_settings.edgeBreakup;
+            const float contrast = 1.0f + 2.0f * b, jitter = 1.5f * b;
             const int slotI0 = Slot(L.gridI), slotJ0 = Slot(L.gridJ);
             for (int row = 0; row < kTex; ++row)
             {
@@ -581,7 +600,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) 
                 for (int col = 0; col < kTex; ++col)
                 {
                     const int s = row * kTex + col;
-                    const float cover = depth * (L.material[s] / 255.0f) * slopeF[L.upness[s]] * driftF[L.drift[s]];
+                    float m = (L.material[s] / 255.0f - 0.5f) * contrast + 0.5f + jitter * (L.edgeNoise[s] / 255.0f - 0.5f);
+                    m = m <= 0.0f ? 0.0f : (m >= 1.0f ? 1.0f : m * m * (3.0f - 2.0f * m));
+                    const float cover = depth * m * slopeF[L.upness[s]] * driftF[L.drift[s]];
                     if (cover <= 0.0f) { out[col] = 0.0f; continue; }
                     if (!isLevel0) { out[col] = cover; continue; }
                     const int di = (col - slotI0 + kTex) % kTex;
@@ -793,6 +814,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) 
             g_api->UiSliderFloat("Max slope (deg)", &g_settings.maxSlope, 10.0f, 90.0f);
             g_api->UiSliderFloat("Slope fade (deg)", &g_settings.slopeBand, 0.0f, 40.0f);
             g_api->UiSliderFloat("Drift noise (x depth)", &g_settings.noise, 0.0f, 1.0f);
+            g_api->UiSliderFloat("Edge breakup", &g_settings.edgeBreakup, 0.0f, 1.0f);
             g_api->UiCheckbox("Units carve trenches", &g_settings.stamp);
             g_api->UiSliderFloat("Trench width (x unit size)", &g_settings.stampScale, 0.3f, 3.0f);
             g_api->UiSliderFloat("Relax time (s)", &g_settings.relaxSeconds, 1.0f, 300.0f);
@@ -859,6 +881,11 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) 
             g_lastSlopeBand = g_settings.slopeBand; g_lastNoise = g_settings.noise;
             for (Level& L : g_levels) L.coverDirty = true;
         }
+        if (g_lastEdgeBreakup != g_settings.edgeBreakup)
+        {
+            g_lastEdgeBreakup = g_settings.edgeBreakup;
+            for (Level& L : g_levels) { L.coverDirty = true; L.boostRows = kFilled; } // the warp is sampled
+        }
 
         const int levels = ActiveLevels();
         for (int k = 0; k < levels; ++k)
@@ -866,14 +893,18 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) 
             Level& L = g_levels[k];
             Recentre(L, k == 0, snap.playerPos, refill);
             // Chunks stream in after the grid saw them: re-sample a few rows per frame, keeping trenches.
-            const int rows = k == 0 ? 8 : 4;
+            // Once nothing is missing one row is enough, except for a pass at full speed after a
+            // setting that's applied while sampling changed.
+            const int fast = k == 0 ? 8 : 4;
+            const int rows = (L.holes || L.boostRows > 0) ? fast : 1;
+            if (L.boostRows > 0) L.boostRows -= rows;
             for (int r = 0; r < rows; ++r)
             {
                 const int row = L.gridJ - kApron + L.refreshRow;
                 SampleRect(L, k == 0, L.gridI - kApron, L.gridI - kApron + kFilled - 1, row, row, false);
                 L.refreshRow = (L.refreshRow + 1) % kFilled;
             }
-            if (L.refreshRow < rows) // once per round: count what's still missing
+            if (L.refreshRow < rows) // once per pass: count what's still missing
             {
                 unsigned holes = 0;
                 for (int j = 0; j < kGridVerts; ++j)
