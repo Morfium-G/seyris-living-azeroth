@@ -74,6 +74,8 @@ namespace wxl_livingazeroth::cover
             int   stamp = 1;
             float stampScale = 1.0f;        // trench radius x the unit's size
             float farLift = 0.75f;          // yd added far away, against terrain drawn simpler than its heights
+            int   sceneLight = 1;           // light and fog the cover like the terrain just drawn (in-pass only)
+            float brightness = 0.93f;       // cover albedo
             float maxSlope = 45.0f;         // degrees: steeper ground holds no cover...
             float slopeBand = 15.0f;        // ...and it thins out over this many degrees below that
             float noise = 0.35f;            // depth variation (drifts), share of the depth
@@ -123,6 +125,11 @@ namespace wxl_livingazeroth::cover
         constexpr float kTerrainCell = 33.3333333f / 8.0f;
         std::unordered_map<int64_t, uint8_t> g_cellMaterial;
 
+        // The terrain's lighting and fog as last read (for the panel): VS c12 fog, c24 sun direction
+        // (view space), c25 ambient, c26 diffuse, PS c2 fog colour.
+        float g_seenFog[4] = {}, g_seenLight[12] = {}, g_seenFogColor[4] = {};
+        bool  g_seenScene = false;
+
         // stats
         double   g_simMs = 0, g_uploadMs = 0, g_drawMs = 0;
         unsigned g_stamps = 0;
@@ -162,9 +169,10 @@ namespace wxl_livingazeroth::cover
         bool                         g_gpuFailed = false;
 
         // VS: c0..c3 view-projection columns; c4 = (patch first cell i, j, cell size, 1 / texture
-                // size); c5 = (level centre cell i, j, half extent, morph band) in cells; c6 = the camera
+        // size); c5 = (level centre cell i, j, half extent, morph band) in cells; c6 = the camera
         // position (the scene is drawn about the camera); c7 = (fade start, fade end, fade on) in cells;
-        // c8 = (far lift start, end, height) in yd from the camera.
+        // c8 = (far lift start, end, height) in yd from the camera; c9..c11 = the view rotation rows
+        // (identity when not lit like the scene); c12 = the terrain's fog parameters.
         const char* kVsHlsl = R"(
 float4 vp0 : register(c0); float4 vp1 : register(c1); float4 vp2 : register(c2); float4 vp3 : register(c3);
 float4 grid : register(c4);
@@ -172,10 +180,12 @@ float4 lod : register(c5);
 float4 eye : register(c6);
 float4 fade : register(c7);
 float4 lift : register(c8);
+float4 vr0 : register(c9); float4 vr1 : register(c10); float4 vr2 : register(c11);
+float4 fogp : register(c12);
 sampler2D baseTex : register(s0);
 sampler2D coverTex : register(s1);
 
-struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1; float2 rel : TEXCOORD2; };
+struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1; float2 rel : TEXCOORD2; float fog : TEXCOORD3; };
 
 float Cheb(float2 idx) { float2 a = abs(idx - lod.xy); return max(a.x, a.y); }
 float Fade(float2 idx) { return fade.z > 0.5 ? saturate((fade.y - Cheb(idx)) / (fade.y - fade.x)) : 1; }
@@ -223,31 +233,42 @@ VOut main(float2 ij : POSITION)
     float dist = length(float3(p.xy - eye.xy, p.z - eye.z));
     p.z += lift.z * saturate((dist - lift.x) / (lift.y - lift.x)) * saturate(s.y * 10);
 
-    o.n = normalize(n);
+    // Normal and position into view space, where the terrain shader lights and fogs (its sun
+    // direction is view space; its fog runs on the view depth).
+    float3 nw = normalize(n);
+    o.n = nw.x * vr0.xyz + nw.y * vr1.xyz + nw.z * vr2.xyz;
     o.rel = p.xy - eye.xy;
     float4 q = float4(o.rel, p.z - eye.z, 1);
     o.pos = float4(dot(q, vp0), dot(q, vp1), dot(q, vp2), dot(q, vp3));
+    float viewZ = dot(q.xyz, float3(vr0.z, vr1.z, vr2.z));
+    o.fog = min(pow(max(viewZ * fogp.x + fogp.y, 0), fogp.z), 1);
     o.d = float2(s.y, s.x < -10000 ? 1 : 0);
     return o;
 }
 )";
 
-        // PS: c0 = (light direction, ambient), c1 = colour, c2.x = smallest drawn depth, c3 = the next
-        // finer level's box (camera-relative min x, min y, max x, max y): this level isn't drawn there.
+        // PS: c0 = light direction, c1 = colour, c2.x = smallest drawn depth, c3 = the next finer
+        // level's box (camera-relative min x, min y, max x, max y): this level isn't drawn there;
+        // c4 = ambient, c5 = diffuse, c6 = fog colour. Lit the way the terrain shader lights:
+        // min(ambient + diffuse * saturate(N.L), 1), then fogged towards the fog colour.
         const char* kPsHlsl = R"(
 float4 light : register(c0);
 float4 albedo : register(c1);
 float4 opts : register(c2);
 float4 inner : register(c3);
+float4 ambient : register(c4);
+float4 diffuse : register(c5);
+float4 fogColor : register(c6);
 
-float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) : COLOR
+float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float fog : TEXCOORD3) : COLOR
 {
     clip(d.x - opts.x);
     clip(0.5 - d.y);
     float2 a = step(inner.xy, rel) * step(rel, inner.zw);
     clip(0.5 - a.x * a.y);
-    float lit = light.w + (1 - light.w) * saturate(dot(normalize(n), light.xyz));
-    return float4(albedo.rgb * lit, 1);
+    float ndl = saturate(dot(normalize(n), normalize(light.xyz)));
+    float3 lit = min(ambient.rgb + diffuse.rgb * ndl, 1);
+    return float4(lerp(fogColor.rgb, albedo.rgb * lit, fog), 1);
 }
 )";
 
@@ -642,6 +663,18 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) 
             g_uploadMs = grassperf::Now() - t0;
             t0 = grassperf::Now();
 
+            // Right after the terrain stage its shader constants are still on the device: read them
+            // before setting ours. Terrain VS (dumped 2026-10-02): c12 fog (min(pow(max(viewZ * x + y,
+            // 0), z), 1)), c24 sun direction in view space, c25 ambient, c26 diffuse; PS c2 fog colour.
+            const bool sceneLit = inPass && g_settings.sceneLight;
+            if (sceneLit)
+            {
+                dev->GetVertexShaderConstantF(12, g_seenFog, 1);
+                dev->GetVertexShaderConstantF(24, g_seenLight, 3);
+                dev->GetPixelShaderConstantF(2, g_seenFogColor, 1);
+                g_seenScene = true;
+            }
+
             IDirect3DStateBlock9* saved = nullptr;
             if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &saved)) || !saved) return;
             // Depth-test against the surface the world was drawn into; at the end of the scene whatever
@@ -680,13 +713,31 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) 
             const float c8[4] = { 80.0f, 400.0f, g_settings.farLift, 0.0f };
             dev->SetVertexShaderConstantF(8, c8, 1);
 
-            const float lx = 0.35f, ly = 0.45f, lz = 0.82f, inv = 1.0f / std::sqrt(lx * lx + ly * ly + lz * lz);
-            const float ps[12] = {
-                lx * inv, ly * inv, lz * inv, 0.45f, // light, ambient
-                0.93f, 0.95f, 1.0f, 1.0f,             // snow-ish white
-                0.004f, 0.0f, 0.0f, 0.0f,             // smallest depth drawn (no z-fighting with the terrain)
+            // Lighting: the terrain's (view space) when lit like the scene, else a fixed sun from
+            // above in world space, no fog.
+            const float a = g_settings.brightness;
+            float vs9[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 1, 1, 0 }; // c9..c11 rows, c12 fog (none)
+            float ps0[28] = {
+                0.35f, 0.45f, 0.82f, 0.0f,       // c0 light direction
+                a, a * 1.02f, a * 1.07f, 1.0f,   // c1 snow colour (a touch blue)
+                0.004f, 0.0f, 0.0f, 0.0f,        // c2 smallest depth drawn (no z-fighting with the terrain)
+                0.0f, 0.0f, 0.0f, 0.0f,          // c3 inner box (set per level)
+                0.45f, 0.45f, 0.45f, 0.0f,       // c4 ambient
+                0.55f, 0.55f, 0.55f, 0.0f,       // c5 diffuse
+                0.0f, 0.0f, 0.0f, 0.0f,          // c6 fog colour
             };
-            dev->SetPixelShaderConstantF(0, ps, 3);
+            if (sceneLit)
+            {
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c) vs9[r * 4 + c] = V[r * 4 + c];
+                std::memcpy(vs9 + 12, g_seenFog, sizeof(g_seenFog));
+                std::memcpy(ps0 + 0, g_seenLight + 0, 3 * sizeof(float));
+                std::memcpy(ps0 + 16, g_seenLight + 4, 3 * sizeof(float));
+                std::memcpy(ps0 + 20, g_seenLight + 8, 3 * sizeof(float));
+                std::memcpy(ps0 + 24, g_seenFogColor, 3 * sizeof(float));
+            }
+            dev->SetVertexShaderConstantF(9, vs9, 4);
+            dev->SetPixelShaderConstantF(0, ps0, 7);
 
             dev->SetVertexDeclaration(g_decl);
             dev->SetStreamSource(0, g_vb, 0, 8);
@@ -819,6 +870,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) 
             g_api->UiSliderFloat("Trench width (x unit size)", &g_settings.stampScale, 0.3f, 3.0f);
             g_api->UiSliderFloat("Relax time (s)", &g_settings.relaxSeconds, 1.0f, 300.0f);
             g_api->UiSliderFloat("Far lift (yd, 80 -> 400 yd away)", &g_settings.farLift, 0.0f, 3.0f);
+            g_api->UiCheckbox("Light and fog like the terrain", &g_settings.sceneLight);
+            g_api->UiSliderFloat("Snow brightness", &g_settings.brightness, 0.3f, 1.5f);
             g_api->UiCheckbox("Wireframe", &g_settings.wireframe);
             static const char* const drawPoints[] = { "Right after the terrain (inside the world pass)", "End of the scene (old)" };
             g_api->UiCombo("Draw point", &g_settings.drawPoint, drawPoints, 2);
@@ -837,6 +890,14 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) 
             std::snprintf(line, sizeof(line), "%d x %d vertices; units stamping %u; terrain cells cached %zu",
                           levels * kPatches * kPatches, kPatchVerts * kPatchVerts, g_stamps, g_cellMaterial.size()); add();
             std::snprintf(line, sizeof(line), "CPU: sim %.2f ms, upload %.2f ms, draw submit %.2f ms", g_simMs, g_uploadMs, g_drawMs); add();
+            if (g_seenScene)
+            {
+                std::snprintf(line, sizeof(line), "terrain light: sun (view) %.3f %.3f %.3f, ambient %.3f %.3f %.3f, diffuse %.3f %.3f %.3f",
+                              g_seenLight[0], g_seenLight[1], g_seenLight[2], g_seenLight[4], g_seenLight[5], g_seenLight[6],
+                              g_seenLight[8], g_seenLight[9], g_seenLight[10]); add();
+                std::snprintf(line, sizeof(line), "terrain fog: params %.6f %.4f %.4f %.4f, colour %.3f %.3f %.3f",
+                              g_seenFog[0], g_seenFog[1], g_seenFog[2], g_seenFog[3], g_seenFogColor[0], g_seenFogColor[1], g_seenFogColor[2]); add();
+            }
 
             static char status[64] = "";
             if (g_api->UiButton("Copy status to clipboard"))
