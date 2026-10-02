@@ -117,6 +117,26 @@ namespace wxl_livingazeroth::cover
         std::vector<float> g_press(kTex * kTex, 0.0f);
         std::vector<float> g_rim(kTex * kTex, 0.0f);
 
+        // Only cells with a trench change from frame to frame. They're kept in a list (relaxed, and
+        // re-uploaded with a dirty rectangle) instead of walking all 147k cells twice per frame. The
+        // rest of level 0 keeps its static cover and the trench fade-out factor from the last full
+        // pass (a full pass runs whenever coverDirty is set: recentre, refill, settings).
+        std::vector<int>     g_active;                            // slots with press or rim > 0
+        std::vector<uint8_t> g_isActive(kTex * kTex, 0);
+        std::vector<int>     g_changed;                           // slots to re-upload this frame
+        bool                 g_changedPending = false;            // changes not uploaded yet
+        std::vector<float>   g_static0(kTex * kTex, 0.0f);        // level 0 cover without trenches
+        std::vector<float>   g_deformK(kTex * kTex, 0.0f);        // level 0 trench strength (fade-out)
+        unsigned             g_frame = 0;
+
+        void MarkActive(int s)
+        {
+            if (g_isActive[s]) return;
+            g_isActive[s] = 1;
+            g_active.push_back(s);
+            g_changed.push_back(s);
+        }
+
         // Rim share and relax time where the player is (the table's row there, x the multipliers),
         // and what the table sees there (for the panel, so rows can be authored on the spot).
         float g_rimShareNow = 0.3f, g_relaxNow = 30.0f;
@@ -510,20 +530,31 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                     if (d < radius)
                     {
                         const float t = d < radius * 0.7f ? 1.0f : (radius - d) / (radius * 0.3f);
-                        if (t > g_press[s]) g_press[s] = t;
+                        if (t > g_press[s]) { g_press[s] = t; MarkActive(s); }
                     }
                     const float r = 1.0f - std::fabs(d - rimPeak) / rimHalf;
-                    if (r > g_rim[s]) g_rim[s] = r;
+                    if (r > g_rim[s]) { g_rim[s] = r; MarkActive(s); }
                 }
         }
 
         void Simulate(float dt)
         {
+            // Changes the last frame didn't upload (the cover wasn't drawn) would be lost: redo level 0
+            // in full instead.
+            if (g_changedPending) g_levels[0].coverDirty = true;
+            g_changed.clear();
+
             const float relax = g_relaxNow > 0.1f ? dt / g_relaxNow : 1.0f;
-            for (int s = 0; s < kTex * kTex; ++s)
+            for (size_t k = 0; k < g_active.size();)
             {
-                if (g_press[s] > 0.0f) g_press[s] = g_press[s] > relax ? g_press[s] - relax : 0.0f;
-                if (g_rim[s] > 0.0f)   g_rim[s]   = g_rim[s] > relax ? g_rim[s] - relax : 0.0f;
+                const int s = g_active[k];
+                g_press[s] = g_press[s] > relax ? g_press[s] - relax : 0.0f;
+                g_rim[s]   = g_rim[s] > relax ? g_rim[s] - relax : 0.0f;
+                g_changed.push_back(s);
+                if (g_press[s] > 0.0f || g_rim[s] > 0.0f) { ++k; continue; }
+                g_isActive[s] = 0; // flat again: uploaded once more, then left alone
+                g_active[k] = g_active.back();
+                g_active.pop_back();
             }
 
             g_stamps = 0;
@@ -535,6 +566,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 if (r > 2.5f) r = 2.5f;
                 Stamp(a.pos, r);
             }
+            g_changedPending = !g_changed.empty();
         }
 
         // --- GPU ---------------------------------------------------------------------------------
@@ -639,6 +671,18 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             return true;
         }
 
+        bool UploadLook(Level& L)
+        {
+            if (!L.lookTex || !L.lookDirty) return true;
+            D3DLOCKED_RECT lr{};
+            if (FAILED(L.lookTex->LockRect(0, &lr, nullptr, 0))) return false;
+            for (int row = 0; row < kTex; ++row)
+                std::memcpy(static_cast<uint8_t*>(lr.pBits) + row * lr.Pitch, &L.tint[row * kTex], kTex * 4);
+            L.lookTex->UnlockRect(0);
+            L.lookDirty = false;
+            return true;
+        }
+
         bool UploadLevel(Level& L, bool isLevel0)
         {
             D3DLOCKED_RECT lr{};
@@ -650,8 +694,34 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 L.baseTex->UnlockRect(0);
                 L.baseDirty = false;
             }
-            // Level 0 changes every frame (trenches); the others only when their mask or the depth does.
-            if (!isLevel0 && !L.coverDirty) return true;
+            // Level 0's trenches: only the changed cells, inside one dirty rectangle.
+            if (isLevel0 && !L.coverDirty)
+            {
+                if (g_changed.empty()) { g_changedPending = false; return UploadLook(L); }
+                int c0 = kTex, c1 = -1, r0 = kTex, r1 = -1;
+                for (int sl : g_changed)
+                {
+                    const int c = sl % kTex, r = sl / kTex;
+                    c0 = c < c0 ? c : c0; c1 = c > c1 ? c : c1;
+                    r0 = r < r0 ? r : r0; r1 = r > r1 ? r : r1;
+                }
+                RECT rect{ c0, r0, c1 + 1, r1 + 1 };
+                if (FAILED(L.coverTex->LockRect(0, &lr, &rect, 0))) return false;
+                for (int sl : g_changed)
+                {
+                    const int c = sl % kTex, r = sl / kTex;
+                    float* out = reinterpret_cast<float*>(static_cast<uint8_t*>(lr.pBits) + (r - r0) * lr.Pitch) + (c - c0);
+                    const float cover = g_static0[sl];
+                    const float deformed = cover * (1.0f + g_rimShareNow * g_rim[sl]) * (1.0f - g_press[sl]);
+                    *out = cover + (deformed - cover) * g_deformK[sl];
+                }
+                L.coverTex->UnlockRect(0);
+                g_changed.clear();
+                g_changedPending = false;
+                return UploadLook(L);
+            }
+            // The others only change when their coverage or a multiplier does.
+            if (!L.coverDirty) return UploadLook(L);
             if (FAILED(L.coverTex->LockRect(0, &lr, nullptr, 0))) return false;
             const float depthMul = g_settings.depthMul, driftMul = g_settings.driftMul, breakupMul = g_settings.breakupMul;
             const int slotI0 = Slot(L.gridI), slotJ0 = Slot(L.gridJ);
@@ -673,8 +743,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                     float driftF = 1.0f + L.driftAmp[s] / 255.0f * driftMul * (L.drift[s] / 127.5f - 1.0f);
                     driftF = driftF < 0.0f ? 0.0f : driftF;
                     const float cover = depthMul * L.depth[s] * m * (L.slope[s] / 255.0f) * driftF;
-                    if (cover <= 0.0f) { out[col] = 0.0f; continue; }
-                    if (!isLevel0) { out[col] = cover; continue; }
+                    if (!isLevel0) { out[col] = cover > 0.0f ? cover : 0.0f; continue; }
+                    g_static0[s] = cover > 0.0f ? cover : 0.0f;
+                    if (cover <= 0.0f) { g_deformK[s] = 0.0f; out[col] = 0.0f; continue; }
                     const int di = (col - slotI0 + kTex) % kTex;
                     const int ci = std::abs(di - kHalfCells);
                     const int cheb = ci > cj ? ci : cj;
@@ -682,22 +753,15 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                     float k = cheb <= kDeformFullCells ? 1.0f
                             : (cheb >= kDeformZeroCells ? 0.0f : float(kDeformZeroCells - cheb) / float(kDeformZeroCells - kDeformFullCells));
                     if (dj >= kGridVerts || di >= kGridVerts) k = 0.0f;
+                    g_deformK[s] = k;
                     const float deformed = cover * (1.0f + g_rimShareNow * g_rim[s]) * (1.0f - g_press[s]);
                     out[col] = cover + (deformed - cover) * k;
                 }
             }
             L.coverTex->UnlockRect(0);
             L.coverDirty = false;
-
-            if (L.lookTex && L.lookDirty)
-            {
-                if (FAILED(L.lookTex->LockRect(0, &lr, nullptr, 0))) return false;
-                for (int row = 0; row < kTex; ++row)
-                    std::memcpy(static_cast<uint8_t*>(lr.pBits) + row * lr.Pitch, &L.tint[row * kTex], kTex * 4);
-                L.lookTex->UnlockRect(0);
-                L.lookDirty = false;
-            }
-            return true;
+            if (isLevel0) { g_changed.clear(); g_changedPending = false; } // the full pass included them
+            return UploadLook(L);
         }
 
         // inPass: called inside the world pass, where the world's viewport and depth surface are still
@@ -1030,6 +1094,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             for (Level& L : g_levels) { L.coverDirty = true; L.boostRows = kFilled; } // the warp is sampled
         }
 
+        ++g_frame;
         const int levels = ActiveLevels();
         for (int k = 0; k < levels; ++k)
         {
@@ -1039,7 +1104,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             // Once nothing is missing one row is enough, except for a pass at full speed after a
             // setting that's applied while sampling changed.
             const int fast = k == 0 ? 8 : 4;
-            const int rows = (L.holes || L.boostRows > 0) ? fast : 1;
+            const bool idle = !L.holes && L.boostRows <= 0;
+            const int rows = !idle ? fast : ((g_frame % 8) == static_cast<unsigned>(k) ? 1 : 0);
             if (L.boostRows > 0) L.boostRows -= rows;
             for (int r = 0; r < rows; ++r)
             {
@@ -1047,7 +1113,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 SampleRect(L, k == 0, L.gridI - kApron, L.gridI - kApron + kFilled - 1, row, row, false);
                 L.refreshRow = (L.refreshRow + 1) % kFilled;
             }
-            if (L.refreshRow < rows) // once per pass: count what's still missing
+            if (rows && L.refreshRow < rows) // once per pass: count what's still missing
             {
                 unsigned holes = 0;
                 for (int j = 0; j < kGridVerts; ++j)
