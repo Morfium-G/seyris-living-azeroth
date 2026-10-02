@@ -4,6 +4,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <unordered_map>
+#include <vector>
 
 namespace wxl_livingazeroth::terrain
 {
@@ -81,67 +84,225 @@ namespace wxl_livingazeroth::terrain
         return std::isfinite(outZ);
     }
 
-    bool SurfaceAt(float x, float y, Surface& out)
+    namespace
     {
-        // The client's query (0x7A0530) walks the same chain: the chunk, the hole test, the cell's
-        // dominant layer from the low-res layer map (chunk +0x114 -> 8 u16 rows, one per cell along
-        // local x; the 2-bit field per cell along local y via the mask/shift tables), that layer's
-        // MCLY ground effect (+0x0C), GroundEffectTexture +0x28 = TerrainType. The chunk's area ID is
-        // at +0xB0 (copied from the MCNK header by the chunk build 0x7C64B0).
-        constexpr size_t    kChunkLowRes = 0x114, kChunkLayers = 0x12C, kChunkArea = 0xB0;
-        constexpr size_t    kHeaderLayerCount = 0x0C, kLayerStride = 0x10, kLayerEffect = 0x0C;
+        // The client's TerrainType query (0x7A0530) walks the same chain as SurfaceAt: the chunk, the
+        // hole test, the cell's dominant layer from the low-res layer map (chunk +0x114 -> 8 u16
+        // rows, one per cell along local x; the 2-bit field per cell along local y via the
+        // mask/shift tables), that layer's MCLY ground effect (+0x0C), GroundEffectTexture +0x28 =
+        // TerrainType. The chunk's area ID is at +0xB0 (copied from the MCNK header by the chunk
+        // build 0x7C64B0).
+        constexpr size_t    kChunkLowRes = 0x114, kChunkLayers = 0x12C, kChunkAlpha = 0x130, kChunkArea = 0xB0;
+        constexpr size_t    kHeaderFlags = 0x00, kHeaderLayerCount = 0x0C;
+        constexpr size_t    kLayerStride = 0x10, kLayerFlags = 0x04, kLayerAlphaOffset = 0x08, kLayerEffect = 0x0C;
         constexpr uintptr_t kLowResMasks = 0x00A3FB88, kLowResShifts = 0x00A3FB98;
         constexpr uintptr_t kEffectMaxId = 0x00AD3AF4, kEffectMinId = 0x00AD3AF8, kEffectTable = 0x00AD3B08;
         constexpr size_t    kEffectTerrainType = 0x28;
 
-        float pos[3] = { x, y, 0.0f };
-        const auto* chunk = static_cast<const uint8_t*>(wxl::game::adt::GetChunk(pos));
-        if (!chunk) return false;
-        const auto* header = *reinterpret_cast<const uint8_t* const*>(chunk + kChunkHeader);
-        const auto* lowRes = *reinterpret_cast<const uint16_t* const*>(chunk + kChunkLowRes);
-        const auto* layers = *reinterpret_cast<const uint8_t* const*>(chunk + kChunkLayers);
-        if (!header || !lowRes) return false;
-        const float* corner = reinterpret_cast<const float*>(chunk + kChunkCorner);
-
-        const float r = (corner[0] - x) / kCellSize, c = (corner[1] - y) / kCellSize;
-        const int row = r < 0.0f ? 0 : (r >= 8.0f ? 7 : static_cast<int>(r));
-        const int col = c < 0.0f ? 0 : (c >= 8.0f ? 7 : static_cast<int>(c));
-        const uint16_t holes = *reinterpret_cast<const uint16_t*>(header + kHeaderHoles);
-        if (holes & reinterpret_cast<const uint32_t*>(kHoleMaskTable)[(row >> 1) * 4 + (col >> 1)]) return false;
-
-        out = Surface{};
-        out.area = *reinterpret_cast<const uint32_t*>(chunk + kChunkArea);
-        const uint16_t mask = reinterpret_cast<const uint16_t*>(kLowResMasks)[col];
-        const uint8_t shift = static_cast<uint8_t>(reinterpret_cast<const uint32_t*>(kLowResShifts)[col]);
-        const unsigned layer = static_cast<unsigned>((lowRes[row] & mask) >> shift);
-        const unsigned count = *reinterpret_cast<const uint32_t*>(header + kHeaderLayerCount);
-        if (!layers || layer >= count) return true; // no layer: bare ground with no ground effect
-
         // The layer's texture: MCLY +0x00 indexes the tile's texture list. The chunk's tile is
         // [[chunk +0x20] +0x08] (the chunk build 0x7C64B0 registers the chunk in that tile's grid);
-        // the list is a growable array at tile +0x58 (count +0x5C, entries +0x60, 8 bytes each:
-        // the name, pointing into the MTEX block, then the texture handle -- 0x7D6D20 builds it).
+        // the list is a growable array at tile +0x58 (count +0x5C, entries +0x60, 8 bytes each: the
+        // name, pointing into the MTEX block, then the texture handle -- 0x7D6D20 builds it).
         constexpr size_t kChunkTileLink = 0x20, kLinkTile = 0x08, kTileTexCount = 0x5C, kTileTexEntries = 0x60;
-        const uint32_t textureIndex = *reinterpret_cast<const uint32_t*>(layers + layer * kLayerStride);
-        const uintptr_t link = *reinterpret_cast<const uintptr_t*>(chunk + kChunkTileLink);
-        if (link && !(link & 1))
-            if (const auto* tile = *reinterpret_cast<const uint8_t* const*>(link + kLinkTile))
-            {
-                const uint32_t texCount = *reinterpret_cast<const uint32_t*>(tile + kTileTexCount);
-                const auto* entries = *reinterpret_cast<const char* const* const*>(tile + kTileTexEntries);
-                if (entries && textureIndex < texCount) out.texture = entries[textureIndex * 2];
-            }
 
-        out.groundEffect = *reinterpret_cast<const uint32_t*>(layers + layer * kLayerStride + kLayerEffect);
-        const int32_t minId = *reinterpret_cast<const int32_t*>(kEffectMinId);
-        const int32_t maxId = *reinterpret_cast<const int32_t*>(kEffectMaxId);
-        const auto* table = *reinterpret_cast<const uint8_t* const* const*>(kEffectTable);
-        const int32_t id = static_cast<int32_t>(out.groundEffect);
-        if (table && id >= minId && id <= maxId)
-            if (const uint8_t* rec = table[id - minId])
-                out.terrainType = *reinterpret_cast<const int32_t*>(rec + kEffectTerrainType);
+        // Alpha maps (MCAL), as the client reads them (0x7B7860 / 0x7B74A0): a layer has one when
+        // its MCLY flags have 0x100, at MCAL + MCLY +0x08; 0x200 = RLE-compressed (8-bit, 64x64).
+        // Otherwise 8-bit uncompressed when the map's MPHD flags have 0x4 ("big alpha"), else
+        // 4-bit (2048 bytes, low nibble first) whose last row and column repeat the one before,
+        // unless the MCNK flags have 0x8000. The client keeps no decoded copy (it re-reads rows
+        // when it builds the blend texture), so we decode once per chunk and cache.
+        constexpr uint32_t  kLayerHasAlpha = 0x100, kLayerCompressed = 0x200;
+        constexpr uint32_t  kMphdBigAlpha = 0x4, kMcnkDoNotFixAlpha = 0x8000;
+        constexpr uintptr_t kMphdFlags = 0x00CF08D0;
+
+        void LayerSurface(const uint8_t* chunk, const uint8_t* layers, unsigned layer, Surface& out)
+        {
+            const uint32_t textureIndex = *reinterpret_cast<const uint32_t*>(layers + layer * kLayerStride);
+            const uintptr_t link = *reinterpret_cast<const uintptr_t*>(chunk + kChunkTileLink);
+            if (link && !(link & 1))
+                if (const auto* tile = *reinterpret_cast<const uint8_t* const*>(link + kLinkTile))
+                {
+                    const uint32_t texCount = *reinterpret_cast<const uint32_t*>(tile + kTileTexCount);
+                    const auto* entries = *reinterpret_cast<const char* const* const*>(tile + kTileTexEntries);
+                    if (entries && textureIndex < texCount) out.texture = entries[textureIndex * 2];
+                }
+
+            out.groundEffect = *reinterpret_cast<const uint32_t*>(layers + layer * kLayerStride + kLayerEffect);
+            const int32_t minId = *reinterpret_cast<const int32_t*>(kEffectMinId);
+            const int32_t maxId = *reinterpret_cast<const int32_t*>(kEffectMaxId);
+            const auto* table = *reinterpret_cast<const uint8_t* const* const*>(kEffectTable);
+            const int32_t id = static_cast<int32_t>(out.groundEffect);
+            if (table && id >= minId && id <= maxId)
+                if (const uint8_t* rec = table[id - minId])
+                    out.terrainType = *reinterpret_cast<const int32_t*>(rec + kEffectTerrainType);
+        }
+
+        // Where in the chunk (cells from its corner, 0..8 along local x and y), or false on a hole.
+        struct ChunkSpot
+        {
+            const uint8_t* chunk = nullptr;
+            const uint8_t* header = nullptr;
+            float r = 0, c = 0;
+            int   row = 0, col = 0;
+        };
+
+        bool Spot(float x, float y, ChunkSpot& out)
+        {
+            float pos[3] = { x, y, 0.0f };
+            out.chunk = static_cast<const uint8_t*>(wxl::game::adt::GetChunk(pos));
+            if (!out.chunk) return false;
+            out.header = *reinterpret_cast<const uint8_t* const*>(out.chunk + kChunkHeader);
+            if (!out.header) return false;
+            const float* corner = reinterpret_cast<const float*>(out.chunk + kChunkCorner);
+            out.r = (corner[0] - x) / kCellSize;
+            out.c = (corner[1] - y) / kCellSize;
+            out.row = out.r < 0.0f ? 0 : (out.r >= 8.0f ? 7 : static_cast<int>(out.r));
+            out.col = out.c < 0.0f ? 0 : (out.c >= 8.0f ? 7 : static_cast<int>(out.c));
+            const uint16_t holes = *reinterpret_cast<const uint16_t*>(out.header + kHeaderHoles);
+            return !(holes & reinterpret_cast<const uint32_t*>(kHoleMaskTable)[(out.row >> 1) * 4 + (out.col >> 1)]);
+        }
+
+        // The client's dominant layer for the spot's cell (the low-res layer map), -1 if none.
+        int DominantLayer(const ChunkSpot& at)
+        {
+            const auto* lowRes = *reinterpret_cast<const uint16_t* const*>(at.chunk + kChunkLowRes);
+            if (!lowRes) return -1;
+            const uint16_t mask = reinterpret_cast<const uint16_t*>(kLowResMasks)[at.col];
+            const uint8_t shift = static_cast<uint8_t>(reinterpret_cast<const uint32_t*>(kLowResShifts)[at.col]);
+            return static_cast<int>((lowRes[at.row] & mask) >> shift);
+        }
+
+        // --- decoded alpha per chunk -------------------------------------------------------------
+        struct DecodedChunk
+        {
+            const uint8_t* layers = nullptr; // the MCLY / MCAL the decode came from (a chunk object
+            const uint8_t* alpha = nullptr;  // reused for another place has other ones)
+            unsigned serial = 0;
+            int      count = 0;
+            std::vector<uint8_t> map;        // layers 1..count-1, 64x64 each (sized to what the chunk has)
+            Surface  surface[4];
+        };
+        std::unordered_map<const uint8_t*, DecodedChunk> g_decoded;
+        unsigned g_serial = 0;
+
+        void DecodeLayer(const uint8_t* src, uint32_t flags, bool fix, uint8_t* out)
+        {
+            if (flags & kLayerCompressed)
+            {
+                // RLE: a byte's top bit = fill (repeat the next byte) or copy (the next bytes), its
+                // low 7 bits the count.
+                int n = 0;
+                while (n < 64 * 64)
+                {
+                    const uint8_t head = *src++;
+                    int count = head & 0x7F;
+                    if (!count) break; // malformed: don't loop forever
+                    if (head & 0x80) { const uint8_t v = *src++; while (count-- && n < 64 * 64) out[n++] = v; }
+                    else             { while (count-- && n < 64 * 64) out[n++] = *src++; }
+                }
+                return;
+            }
+            if (*reinterpret_cast<const uint32_t*>(kMphdFlags) & kMphdBigAlpha)
+            {
+                std::memcpy(out, src, 64 * 64);
+                return;
+            }
+            for (int i = 0; i < 64 * 32; ++i)
+            {
+                out[i * 2]     = static_cast<uint8_t>((src[i] & 0x0F) * 17);
+                out[i * 2 + 1] = static_cast<uint8_t>((src[i] >> 4) * 17);
+            }
+            if (fix)
+            {
+                for (int r = 0; r < 64; ++r) out[r * 64 + 63] = out[r * 64 + 62];
+                std::memcpy(out + 63 * 64, out + 62 * 64, 64);
+            }
+        }
+
+        const DecodedChunk* Decoded(const ChunkSpot& at)
+        {
+            const auto* layers = *reinterpret_cast<const uint8_t* const*>(at.chunk + kChunkLayers);
+            const auto* alpha = *reinterpret_cast<const uint8_t* const*>(at.chunk + kChunkAlpha);
+            auto found = g_decoded.find(at.chunk);
+            if (found != g_decoded.end() && found->second.layers == layers && found->second.alpha == alpha) return &found->second;
+
+            // ~1500 chunks lie within the outermost level's reach; a few KB each.
+            if (g_decoded.size() > 2500) g_decoded.clear();
+            DecodedChunk& d = g_decoded[at.chunk];
+            d = DecodedChunk{};
+            d.layers = layers; d.alpha = alpha;
+            d.serial = ++g_serial;
+            const unsigned count = *reinterpret_cast<const uint32_t*>(at.header + kHeaderLayerCount);
+            d.count = layers ? static_cast<int>(count > 4 ? 4 : count) : 0;
+            const bool fix = !(*reinterpret_cast<const uint32_t*>(at.header + kHeaderFlags) & kMcnkDoNotFixAlpha);
+            if (d.count > 1) d.map.assign(static_cast<size_t>(d.count - 1) * 64 * 64, 0);
+            for (int l = 0; l < d.count; ++l)
+            {
+                LayerSurface(at.chunk, layers, static_cast<unsigned>(l), d.surface[l]);
+                d.surface[l].area = *reinterpret_cast<const uint32_t*>(at.chunk + kChunkArea);
+                if (l == 0) continue;
+                const uint32_t flags = *reinterpret_cast<const uint32_t*>(layers + l * kLayerStride + kLayerFlags);
+                if (!(flags & kLayerHasAlpha) || !alpha) continue; // no alpha map: not painted here
+                DecodeLayer(alpha + *reinterpret_cast<const uint32_t*>(layers + l * kLayerStride + kLayerAlphaOffset), flags, fix, d.map.data() + (l - 1) * 64 * 64);
+            }
+            return &d;
+        }
+
+        // Bilinear texel lookup, coordinates in texels (0..63), clamped to the chunk. Unswapped,
+        // the map's rows run along local x like the MCVT rows and the low-res layer map (confirmed
+        // in-client 2026-10-02: the strongest layer matches the client's dominant layer).
+        float Texel(const uint8_t* map, float u, float v, bool swapAxes)
+        {
+            u = u < 0.0f ? 0.0f : (u > 63.0f ? 63.0f : u);
+            v = v < 0.0f ? 0.0f : (v > 63.0f ? 63.0f : v);
+            const int u0 = static_cast<int>(u), v0 = static_cast<int>(v);
+            const int u1 = u0 < 63 ? u0 + 1 : 63, v1 = v0 < 63 ? v0 + 1 : 63;
+            const float fu = u - u0, fv = v - v0;
+            auto at = [&](int a, int b) { return static_cast<float>(swapAxes ? map[b * 64 + a] : map[a * 64 + b]); };
+            const float top = at(u0, v0) + (at(u0, v1) - at(u0, v0)) * fv;
+            const float bottom = at(u1, v0) + (at(u1, v1) - at(u1, v0)) * fv;
+            return (top + (bottom - top) * fu) / 255.0f;
+        }
+    }
+
+    bool SurfaceAt(float x, float y, Surface& out)
+    {
+        ChunkSpot at;
+        if (!Spot(x, y, at)) return false;
+        out = Surface{};
+        out.area = *reinterpret_cast<const uint32_t*>(at.chunk + kChunkArea);
+        const auto* layers = *reinterpret_cast<const uint8_t* const*>(at.chunk + kChunkLayers);
+        const int layer = DominantLayer(at);
+        const unsigned count = *reinterpret_cast<const uint32_t*>(at.header + kHeaderLayerCount);
+        if (!layers || layer < 0 || static_cast<unsigned>(layer) >= count) return true; // bare ground, no ground effect
+        LayerSurface(at.chunk, layers, static_cast<unsigned>(layer), out);
         return true;
     }
+
+    bool LayerWeightsAt(float x, float y, LayerWeights& out, bool swapAxes)
+    {
+        ChunkSpot at;
+        if (!Spot(x, y, at)) return false;
+        const DecodedChunk* d = Decoded(at);
+        out = LayerWeights{};
+        out.serial = d->serial;
+        out.layers = d->count;
+        out.dominantLowRes = DominantLayer(at);
+        if (!d->count) return true;
+        // Texel centres at (i + 0.5) / 8 cells.
+        const float u = at.r * 8.0f - 0.5f, v = at.c * 8.0f - 0.5f;
+        float rest = 1.0f;
+        for (int l = 1; l < d->count; ++l)
+        {
+            out.weight[l] = Texel(d->map.data() + (l - 1) * 64 * 64, u, v, swapAxes);
+            rest -= out.weight[l];
+        }
+        out.weight[0] = rest < 0.0f ? 0.0f : rest;
+        for (int l = 0; l < d->count; ++l) out.surface[l] = d->surface[l];
+        return true;
+    }
+
+    void ClearLayerCache() { g_decoded.clear(); }
 
     bool TerrainTypeAt(float x, float y, int& outType)
     {

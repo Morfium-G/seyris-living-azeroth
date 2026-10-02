@@ -21,4 +21,22 @@ namespace wxl_livingazeroth::terrain
     /// chunks.
     struct Surface { unsigned area = 0; const char* texture = nullptr; unsigned groundEffect = 0; int terrainType = -1; };
     bool SurfaceAt(float x, float y, Surface& out);
+
+    /// The painted strength of every texture layer at world (x, y), from the chunk's alpha maps
+    /// (decoded once per chunk and cached; bilinear between the 64x64 texels, ~0.5 yd). Layer 0
+    /// gets what the others leave (as the client blends). `serial` identifies the decoded chunk
+    /// (changes when a chunk object is reused for another place), for caches keyed by chunk.
+    /// False on holes or unloaded chunks.
+    struct LayerWeights
+    {
+        unsigned serial = 0;
+        int      layers = 0;
+        float    weight[4] = {};
+        Surface  surface[4];
+        int      dominantLowRes = -1; // the client's own dominant layer for the cell (low-res map)
+    };
+    bool LayerWeightsAt(float x, float y, LayerWeights& out, bool swapAxes = false);
+
+    /// Forgets every decoded chunk (call when the map changes).
+    void ClearLayerCache();
 }

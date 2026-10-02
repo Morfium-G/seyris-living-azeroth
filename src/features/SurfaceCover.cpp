@@ -16,9 +16,11 @@
 
 #include <cmath>
 #include <cstdio>
+#include <array>
 #include <climits>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace wxl_livingazeroth::cover
@@ -74,6 +76,8 @@ namespace wxl_livingazeroth::cover
             int   sceneLight = 1;           // light and fog the cover like the terrain just drawn (in-pass only)
             float brightness = 0.93f;       // cover albedo
             float fillBudgetMs = 2.0f;      // sampling work per frame for fills and recentres
+            int   materialSource = 0;       // 0 the painted strength of every layer (alpha maps), 1 the dominant layer per cell
+            int   alphaSwap = 0;            // debug: read the alpha maps with rows and columns swapped
             int   wireframe = 0;
             int   drawPoint = 0;            // 0 right after the terrain (inside the world pass), 1 end of the scene
         };
@@ -159,7 +163,7 @@ namespace wxl_livingazeroth::cover
         const void* g_cdbcApi = nullptr;
         uint32_t    g_tableGeneration = 0;
 
-        int   g_lastCoverage = -1;
+        int   g_lastCoverage = -1, g_lastMaterialSource = -1, g_lastAlphaSwap = -1;
         int   g_lastMap = -1;
         float g_lastDepthMul = -1.0f, g_lastDriftMul = -1.0f, g_lastBreakupMul = -1.0f;
         constexpr float kEdgeWarpYards = 5.0f; // how far the material edge wanders at full breakup
@@ -175,6 +179,14 @@ namespace wxl_livingazeroth::cover
         unsigned g_cellMisses = 0;
 
         void ClearCellCache() { for (CellEntry& e : g_cellCache) e.cx = INT_MIN; }
+
+        // The table's values for every layer of a decoded chunk, by the chunk's decode serial.
+        std::unordered_map<unsigned, std::array<covertable::Values, 4>> g_layerValues;
+
+        // Under the player, for the panel: the layer weights both ways round and the client's own
+        // dominant layer (the check that the alpha maps are read the right way round).
+        terrain::LayerWeights g_hereLayers, g_hereLayersSwapped;
+        bool g_hereLayersValid = false;
         int g_mapNow = -1;
 
         // The terrain's lighting and fog as last read (for the panel): VS c12 fog, c24 sun direction
@@ -367,6 +379,43 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             float tint[3] = {}, tintStrength = 0.0f;
         };
 
+        const std::array<covertable::Values, 4>& LayerValues(const terrain::LayerWeights& lw)
+        {
+            auto found = g_layerValues.find(lw.serial);
+            if (found != g_layerValues.end()) return found->second;
+            if (g_layerValues.size() > 3000) g_layerValues.clear();
+            std::array<covertable::Values, 4>& v = g_layerValues[lw.serial];
+            for (int l = 0; l < lw.layers; ++l)
+            {
+                const terrain::Surface& sf = lw.surface[l];
+                v[l] = covertable::Resolve(sf.area, g_mapNow, sf.texture, sf.groundEffect, sf.terrainType);
+            }
+            return v;
+        }
+
+        // From the painted strength of every texture layer: each layer's row values, weighted by
+        // how strongly it's painted here (alpha maps, ~0.5 yd). Edges follow what was painted, and
+        // two materials painted over each other mix.
+        void AccumulateLayers(float x, float y, float& covered, float sum[9])
+        {
+            terrain::LayerWeights lw;
+            if (!terrain::LayerWeightsAt(x, y, lw, g_settings.alphaSwap != 0)) return;
+            const std::array<covertable::Values, 4>& vals = LayerValues(lw);
+            for (int l = 0; l < lw.layers; ++l)
+            {
+                const float wk = lw.weight[l];
+                const covertable::Values& cv = vals[l];
+                if (wk <= 0.0f || cv.depth <= 0.0f) continue;
+                covered += wk;
+                sum[0] += wk * cv.depth;      sum[1] += wk * cv.maxSlope;   sum[2] += wk * cv.slopeFade;
+                sum[3] += wk * cv.driftNoise; sum[4] += wk * cv.edgeBreakup;
+                sum[5] += wk * ((cv.tintColor >> 16) & 0xFF) / 255.0f;
+                sum[6] += wk * ((cv.tintColor >> 8) & 0xFF) / 255.0f;
+                sum[7] += wk * (cv.tintColor & 0xFF) / 255.0f;
+                sum[8] += wk * cv.tintStrength;
+            }
+        }
+
         Blend BlendAt(float x, float y)
         {
             Blend b;
@@ -375,6 +424,18 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 const covertable::Values v;
                 b.covered = 1.0f; b.depth = kTestDepth; b.maxSlope = v.maxSlope; b.slopeFade = v.slopeFade;
                 b.drift = v.driftNoise; b.breakup = v.edgeBreakup;
+                return b;
+            }
+            if (g_settings.materialSource == 0)
+            {
+                float sum[9] = {};
+                AccumulateLayers(x, y, b.covered, sum);
+                if (b.covered <= 0.0f) return b;
+                const float inv = 1.0f / b.covered;
+                b.depth = sum[0] * inv; b.maxSlope = sum[1] * inv; b.slopeFade = sum[2] * inv;
+                b.drift = sum[3] * inv; b.breakup = sum[4] * inv;
+                b.tint[0] = sum[5] * inv; b.tint[1] = sum[6] * inv; b.tint[2] = sum[7] * inv; b.tintStrength = sum[8] * inv;
+                if (b.covered > 1.0f) b.covered = 1.0f;
                 return b;
             }
             const float u = x / kTerrainCell - 0.5f, v = y / kTerrainCell - 0.5f;
@@ -1068,6 +1129,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             g_api->UiCheckbox("Light and fog like the terrain", &g_settings.sceneLight);
             g_api->UiSliderFloat("Snow brightness", &g_settings.brightness, 0.3f, 1.5f);
             g_api->UiSliderFloat("Fill budget (ms per frame)", &g_settings.fillBudgetMs, 0.5f, 10.0f);
+            static const char* const sources[] = { "Painted strength of every layer (alpha maps)", "Dominant layer per terrain cell (old)" };
+            g_api->UiCombo("Material from", &g_settings.materialSource, sources, 2);
+            g_api->UiCheckbox("Swap alpha map axes (debug)", &g_settings.alphaSwap);
             g_api->UiCheckbox("Wireframe", &g_settings.wireframe);
             static const char* const drawPoints[] = { "Right after the terrain (inside the world pass)", "End of the scene (old)" };
             g_api->UiCombo("Draw point", &g_settings.drawPoint, drawPoints, 2);
@@ -1103,6 +1167,27 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                               v.depth, v.maxSlope, v.slopeFade, v.driftNoise, v.edgeBreakup, v.rim, v.relaxSeconds, v.tintColor, v.tintStrength); add();
             }
             else { std::snprintf(line, sizeof(line), "here: no terrain under the player"); add(); }
+            if (g_hereLayersValid)
+            {
+                auto dominant = [](const terrain::LayerWeights& lw)
+                {
+                    int best = -1; float w = -1.0f;
+                    for (int l = 0; l < lw.layers; ++l) if (lw.weight[l] > w) { w = lw.weight[l]; best = l; }
+                    return best;
+                };
+                std::snprintf(line, sizeof(line), "here (alpha): %d layer(s), weights %.2f %.2f %.2f %.2f | swapped %.2f %.2f %.2f %.2f",
+                              g_hereLayers.layers, g_hereLayers.weight[0], g_hereLayers.weight[1], g_hereLayers.weight[2], g_hereLayers.weight[3],
+                              g_hereLayersSwapped.weight[0], g_hereLayersSwapped.weight[1], g_hereLayersSwapped.weight[2], g_hereLayersSwapped.weight[3]); add();
+                const int a = dominant(g_hereLayers), b = dominant(g_hereLayersSwapped), c = g_hereLayers.dominantLowRes;
+                std::snprintf(line, sizeof(line), "here (check): strongest layer by alpha %d, swapped %d, the client's dominant layer %d -> %s",
+                              a, b, c, a == c && b != c ? "alpha read the right way" : (b == c && a != c ? "alpha axes SWAPPED" : "same either way here (try another spot)")); add();
+                for (int l = 0; l < g_hereLayers.layers; ++l)
+                {
+                    const terrain::Surface& sf = g_hereLayers.surface[l];
+                    std::snprintf(line, sizeof(line), "  layer %d: %.2f  \"%s\", effect %u, TerrainType %d", l, g_hereLayers.weight[l],
+                                  sf.texture ? sf.texture : "", sf.groundEffect, sf.terrainType); add();
+                }
+            }
             std::snprintf(line, sizeof(line), "CPU: sim %.2f ms, upload %.2f ms, draw submit %.2f ms", g_simMs, g_uploadMs, g_drawMs); add();
             if (g_seenScene)
             {
@@ -1168,8 +1253,12 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
 
         g_mapNow = snap.mapId;
         const bool newMap = g_lastMap != snap.mapId;
-        const bool refill = newMap || g_lastCoverage != g_settings.coverage || g_tableGeneration != covertable::Generation();
-        if (refill) ClearCellCache();
+        const bool refill = newMap || g_lastCoverage != g_settings.coverage || g_tableGeneration != covertable::Generation() ||
+                            g_lastMaterialSource != g_settings.materialSource || g_lastAlphaSwap != g_settings.alphaSwap;
+        if (refill) { ClearCellCache(); g_layerValues.clear(); }
+        if (newMap) terrain::ClearLayerCache();
+        g_lastMaterialSource = g_settings.materialSource;
+        g_lastAlphaSwap = g_settings.alphaSwap;
         g_lastCoverage = g_settings.coverage;
         g_lastMap = snap.mapId;
         g_tableGeneration = covertable::Generation();
@@ -1247,6 +1336,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 here = covertable::Resolve(g_hereSurface.area, snap.mapId, g_hereSurface.texture, g_hereSurface.groundEffect, g_hereSurface.terrainType);
         }
         g_hereValues = here;
+        g_hereLayersValid = terrain::LayerWeightsAt(snap.playerPos[0], snap.playerPos[1], g_hereLayers, false) &&
+                            terrain::LayerWeightsAt(snap.playerPos[0], snap.playerPos[1], g_hereLayersSwapped, true);
         g_rimShareNow = here.rim * g_settings.rimMul;
         g_relaxNow = here.relaxSeconds * g_settings.relaxMul;
 
