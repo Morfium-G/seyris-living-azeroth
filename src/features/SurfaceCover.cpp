@@ -58,6 +58,7 @@ namespace wxl_livingazeroth::cover
             float stampScale = 1.0f;    // trench radius x the unit's size
             float fadeStart = 32.0f, fadeEnd = 39.5f; // radius from the grid centre, yd
             int   wireframe = 0;
+            int   drawPoint = 0;          // 0 right after the terrain (inside the world pass), 1 end of the scene
         };
 
         const WXL_Api* g_api = nullptr;
@@ -91,6 +92,17 @@ namespace wxl_livingazeroth::cover
         //    The neighbouring 0xADEEE8/EC pair is the sky's range, not the world's.
         constexpr size_t    kDeviceRenderProjection = 0xFC8;
         constexpr uintptr_t kWorldPassMaxZ = 0x00ADEEE4;
+
+        // The scene render (0x79A870) draws its stages in a fixed order; the terrain stage 0x798DA0
+        // (state setup, then the terrain draws at 0x799263/68/6D, inside its own render-state
+        // push/pop) comes before the later stages that handle M2 models (0x793980) and WMO groups
+        // (0x793D20). Drawing the cover right after the terrain stage puts it where the terrain
+        // itself is, so what's drawn later -- transparent model parts above all -- depth-tests and
+        // blends against it. The world's viewport, projection and depth buffer are still bound there.
+        // __cdecl, no arguments; its only caller is 0x79AC30.
+        constexpr uintptr_t kTerrainStage = 0x00798DA0;
+        using TerrainStageFn = void(__cdecl*)();
+        TerrainStageFn g_origTerrainStage = nullptr;
 
         // GPU state (all managed, so a device reset keeps it; a new device drops it).
         IDirect3DDevice9*            g_device = nullptr;
@@ -400,11 +412,10 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
             return true;
         }
 
-        void __cdecl OnWorldSceneEnd(void* /*user*/, const void* args)
+        // inPass: called inside the world pass, where the world's viewport and depth surface are still
+        // bound. Otherwise (end of scene) both have to be put back first.
+        void Draw(IDirect3DDevice9* dev, IDirect3DSurface9* sceneDepth, bool inPass)
         {
-            if (!g_settings.enabled || !g_haveGrid) return;
-            const auto* a = static_cast<const ev::WorldSceneEndArgs*>(args);
-            auto* dev = static_cast<IDirect3DDevice9*>(a && a->device ? a->device : gx::RawDevice());
             if (!dev || !EnsureGpu(dev)) return;
 
             // The world's view (no translation: the scene is drawn about the camera, so positions go
@@ -421,18 +432,21 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
 
             IDirect3DStateBlock9* saved = nullptr;
             if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &saved)) || !saved) return;
-            // Depth-test against the surface the world was drawn into; whatever is bound now may not be it.
+            // Depth-test against the surface the world was drawn into; at the end of the scene whatever
+            // is bound may not be it.
             IDirect3DSurface9* oldDepth = nullptr;
             dev->GetDepthStencilSurface(&oldDepth);
-            auto* sceneDepth = a ? static_cast<IDirect3DSurface9*>(a->sceneDepth) : nullptr;
-            const bool swapDepth = sceneDepth && sceneDepth != oldDepth;
+            const bool swapDepth = !inPass && sceneDepth && sceneDepth != oldDepth;
             if (swapDepth) dev->SetDepthStencilSurface(sceneDepth);
 
-            D3DVIEWPORT9 vp{};
-            dev->GetViewport(&vp);
-            vp.MinZ = 0.0f;
-            vp.MaxZ = *reinterpret_cast<const float*>(kWorldPassMaxZ);
-            dev->SetViewport(&vp);
+            if (!inPass)
+            {
+                D3DVIEWPORT9 vp{};
+                dev->GetViewport(&vp);
+                vp.MinZ = 0.0f;
+                vp.MaxZ = *reinterpret_cast<const float*>(kWorldPassMaxZ);
+                dev->SetViewport(&vp);
+            }
 
             // View-projection (row-vector convention), uploaded as columns for dot products.
             float vpm[16];
@@ -514,6 +528,21 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
             g_inactive = nullptr;
         }
 
+        void __cdecl hkTerrainStage()
+        {
+            g_origTerrainStage();
+            if (g_settings.enabled && g_haveGrid && g_settings.drawPoint == 0)
+                Draw(static_cast<IDirect3DDevice9*>(gx::RawDevice()), nullptr, true);
+        }
+
+        void __cdecl OnWorldSceneEnd(void* /*user*/, const void* args)
+        {
+            if (!g_settings.enabled || !g_haveGrid || g_settings.drawPoint != 1) return;
+            const auto* a = static_cast<const ev::WorldSceneEndArgs*>(args);
+            auto* dev = static_cast<IDirect3DDevice9*>(a && a->device ? a->device : gx::RawDevice());
+            Draw(dev, a ? static_cast<IDirect3DSurface9*>(a->sceneDepth) : nullptr, false);
+        }
+
         bool CopyToClipboard(const std::string& text)
         {
             if (!OpenClipboard(nullptr)) return false;
@@ -548,6 +577,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
             g_api->UiSliderFloat("Fade start (yd)", &g_settings.fadeStart, 5.0f, 40.0f);
             g_api->UiSliderFloat("Fade end (yd)", &g_settings.fadeEnd, 5.0f, 40.0f);
             g_api->UiCheckbox("Wireframe", &g_settings.wireframe);
+            static const char* const drawPoints[] = { "Right after the terrain (inside the world pass)", "End of the scene (old)" };
+            g_api->UiCombo("Draw point", &g_settings.drawPoint, drawPoints, 2);
 
             g_api->UiSeparator();
             std::vector<std::string> lines;
@@ -575,6 +606,12 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
     {
         g_api = api;
         api->Subscribe(static_cast<uint32_t>(ev::Event::OnWorldSceneEnd), &OnWorldSceneEnd, nullptr);
+        if (!api->HookAttach("LivingAzeroth.TerrainStage", kTerrainStage, reinterpret_cast<void*>(&hkTerrainStage),
+                             reinterpret_cast<void**>(&g_origTerrainStage), WXL_HOOK_DEFAULT_PRIORITY))
+        {
+            api->Log(WXL_LOG_WARN, kTag, "surface cover: terrain stage hook failed; drawing at the end of the scene instead.");
+            g_settings.drawPoint = 1;
+        }
         api->UiAddPanel(kPanelTitle, &Panel, nullptr);
     }
 
