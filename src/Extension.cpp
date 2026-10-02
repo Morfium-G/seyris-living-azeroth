@@ -26,6 +26,7 @@
 #include "features/GrassInstanced.hpp"
 #include "features/GrassMotion.hpp"
 #include "features/GrassPerf.hpp"
+#include "features/SurfaceCover.hpp"
 #include "render/PostAA.hpp"
 #include "render/SceneDepth.hpp"
 #include "render/ShaderPatch.hpp"
@@ -81,6 +82,7 @@ namespace
         wxl_livingazeroth::wind::Update(a ? a->dt : 0.0f, snap);
         if (snap.inWorld)
             wxl_livingazeroth::actors::Refresh(snap.playerPos, wxl_livingazeroth::grass::kActorRange);
+        wxl_livingazeroth::cover::Update(a ? a->dt : 0.0f, snap);
     }
 
     void __cdecl OnDeviceLost(void* /*user*/, const void* /*args*/)
@@ -115,6 +117,9 @@ int __cdecl WXL_Load(const WXL_Api* api)
     // Features register their shader patches first; the single create hook goes in after.
     wxl_livingazeroth::grass::Install(api);
     wxl_livingazeroth::shaderpatch::Install(api);
+
+    // Surface cover spike: draws at the end of the world scene (before anti-aliasing's pass).
+    wxl_livingazeroth::cover::Install(api);
 
     // Anti-aliasing subscribes before the debug overlays, so it runs first and they stay sharp on top.
     wxl_livingazeroth::postaa::Install(api);
