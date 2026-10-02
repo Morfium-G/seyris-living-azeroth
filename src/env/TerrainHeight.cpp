@@ -81,6 +81,53 @@ namespace wxl_livingazeroth::terrain
         return std::isfinite(outZ);
     }
 
+    bool SurfaceAt(float x, float y, Surface& out)
+    {
+        // The client's query (0x7A0530) walks the same chain: the chunk, the hole test, the cell's
+        // dominant layer from the low-res layer map (chunk +0x114 -> 8 u16 rows, one per cell along
+        // local x; the 2-bit field per cell along local y via the mask/shift tables), that layer's
+        // MCLY ground effect (+0x0C), GroundEffectTexture +0x28 = TerrainType. The chunk's area ID is
+        // at +0xB0 (copied from the MCNK header by the chunk build 0x7C64B0).
+        constexpr size_t    kChunkLowRes = 0x114, kChunkLayers = 0x12C, kChunkArea = 0xB0;
+        constexpr size_t    kHeaderLayerCount = 0x0C, kLayerStride = 0x10, kLayerEffect = 0x0C;
+        constexpr uintptr_t kLowResMasks = 0x00A3FB88, kLowResShifts = 0x00A3FB98;
+        constexpr uintptr_t kEffectMaxId = 0x00AD3AF4, kEffectMinId = 0x00AD3AF8, kEffectTable = 0x00AD3B08;
+        constexpr size_t    kEffectTerrainType = 0x28;
+
+        float pos[3] = { x, y, 0.0f };
+        const auto* chunk = static_cast<const uint8_t*>(wxl::game::adt::GetChunk(pos));
+        if (!chunk) return false;
+        const auto* header = *reinterpret_cast<const uint8_t* const*>(chunk + kChunkHeader);
+        const auto* lowRes = *reinterpret_cast<const uint16_t* const*>(chunk + kChunkLowRes);
+        const auto* layers = *reinterpret_cast<const uint8_t* const*>(chunk + kChunkLayers);
+        if (!header || !lowRes) return false;
+        const float* corner = reinterpret_cast<const float*>(chunk + kChunkCorner);
+
+        const float r = (corner[0] - x) / kCellSize, c = (corner[1] - y) / kCellSize;
+        const int row = r < 0.0f ? 0 : (r >= 8.0f ? 7 : static_cast<int>(r));
+        const int col = c < 0.0f ? 0 : (c >= 8.0f ? 7 : static_cast<int>(c));
+        const uint16_t holes = *reinterpret_cast<const uint16_t*>(header + kHeaderHoles);
+        if (holes & reinterpret_cast<const uint32_t*>(kHoleMaskTable)[(row >> 1) * 4 + (col >> 1)]) return false;
+
+        out = Surface{};
+        out.area = *reinterpret_cast<const uint32_t*>(chunk + kChunkArea);
+        const uint16_t mask = reinterpret_cast<const uint16_t*>(kLowResMasks)[col];
+        const uint8_t shift = static_cast<uint8_t>(reinterpret_cast<const uint32_t*>(kLowResShifts)[col]);
+        const unsigned layer = static_cast<unsigned>((lowRes[row] & mask) >> shift);
+        const unsigned count = *reinterpret_cast<const uint32_t*>(header + kHeaderLayerCount);
+        if (!layers || layer >= count) return true; // no layer: bare ground with no ground effect
+
+        out.groundEffect = *reinterpret_cast<const uint32_t*>(layers + layer * kLayerStride + kLayerEffect);
+        const int32_t minId = *reinterpret_cast<const int32_t*>(kEffectMinId);
+        const int32_t maxId = *reinterpret_cast<const int32_t*>(kEffectMaxId);
+        const auto* table = *reinterpret_cast<const uint8_t* const* const*>(kEffectTable);
+        const int32_t id = static_cast<int32_t>(out.groundEffect);
+        if (table && id >= minId && id <= maxId)
+            if (const uint8_t* rec = table[id - minId])
+                out.terrainType = *reinterpret_cast<const int32_t*>(rec + kEffectTerrainType);
+        return true;
+    }
+
     bool TerrainTypeAt(float x, float y, int& outType)
     {
         const float pos[3] = { x, y, 0.0f };

@@ -60,6 +60,7 @@ namespace
         wxl_livingazeroth::wind::LoadProfiles(cdbc);
         wxl_livingazeroth::grassdoodads::LoadOverrides(cdbc);
         wxl_livingazeroth::grassdensity::Load(cdbc);
+        wxl_livingazeroth::cover::LoadTable(cdbc);
 
         wxl_livingazeroth::config::Apply(g_api);
         wxl_livingazeroth::grassdistance::OnFirstFrame();

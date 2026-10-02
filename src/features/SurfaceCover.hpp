@@ -17,6 +17,9 @@ namespace wxl_livingazeroth::cover
 {
     void Install(const WXL_Api* api);
 
+    /// Loads SurfaceCover.cdbc (which ground gets cover, how deep) through the cdbc reader.
+    void LoadTable(const void* cdbcApi);
+
     /// Once per frame on the main thread, after the world snapshot and the actors are refreshed.
     void Update(float dt, const world::Snapshot& snap);
 }

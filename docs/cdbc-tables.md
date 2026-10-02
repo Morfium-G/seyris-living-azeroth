@@ -67,3 +67,38 @@ Area and ground effect come from the chunk each grass layer belongs to, not from
 player stands, so a forest can be thinner even while you're outside it.
 
 Generator: `tools/gen_default_density.py` (shipped baseline; `--examples` adds example rows).
+
+## SurfaceCover.cdbc — `SurfaceCover.xml`
+
+Which ground gets a cover (snow, sand, ...) and how deep. The cover is a real layer on top of the
+terrain: units sink in and carve trenches with a rim, which relax over time. Looked up per terrain
+cell (about 4 yd) from what the cell is painted with: its dominant texture layer's ground effect and
+that effect's TerrainType. Edges between cells blend, and the slope and drift-noise settings shape
+the rest.
+
+| Field | Meaning |
+|---|---|
+| ID | row id |
+| ScopeType | 0 = Global, 1 = Map, 2 = Area |
+| ScopeID | Map.dbc ID or AreaTable ID (ignored for Global) |
+| GroundEffectID | GroundEffectTexture.dbc ID (what the map designer painted); 0 = any |
+| TerrainType | TerrainType.dbc ID; **-1 = any** (0 is Dirt). Stock: 0 Dirt, 1 Metallic, 2 Stone, 3 Snow, 4 Wood, 5 Grass, 6 Leaves, 7 Sand, 8 Soggy, 9 Dusty Grass, 10 None, 11 Water |
+| Depth | yards of cover; **0 = no cover** (switches a material off) |
+| Rim | height of the rim pushed up beside a trench, as a share of the depth |
+| RelaxSeconds | how long a trench takes to fill back in |
+| Flags | reserved, 0 |
+
+A float of **-1 takes that field from the next, less specific row**. No row at all = no cover.
+
+**The most specific row wins** (workspace rule for scoped tables): place first, then what.
+Places: the terrain cell's own area (sub-zone), its parent zones, the map, global. Within each
+place: GroundEffectID → TerrainType → everything (GroundEffectID 0 and TerrainType -1). Values are
+never added or multiplied across rows.
+
+Rim and RelaxSeconds are taken from the row where the player stands (trenches are made around the
+player); -1 all the way down falls back to the panel's defaults. The panel's "Depth scale" multiplies
+every depth.
+
+Shipped baseline: snow 0.35 yd everywhere, sand off (Depth 0). Generator:
+`tools/gen_default_surface_cover.py` (`--examples` adds a deeper Icecrown and a thin Kalimdor sand
+row). After editing, press "Reload table" in the surface cover panel.

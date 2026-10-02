@@ -41,6 +41,21 @@ only add what stock data can't express, and every feature can be switched off.
   options slider still stops at its old maximum; to go further, set the distance with the console,
   e.g. `/console groundEffectDist 1024`. The client saves it like any other setting.
 
+**Snow cover** (test feature, off by default: switch it on in the F9 "surface cover" panel)
+- A real layer of snow on top of the terrain, not just a texture: characters sink in, and they
+  and nearby creatures carve trenches with a raised rim that slowly fill back in. Grass and small
+  doodads are buried under it.
+- Content decides where (`SurfaceCover.cdbc`, per area, map or globally, per ground effect or
+  terrain material) and how deep. The shipped sample covers snowy ground and leaves sand off.
+- Soft, ragged edges where snowy ground meets bare ground, bare steep slopes, gentle drifts.
+- Lit and fogged like the terrain, so it follows the time of day and zone fog. Reaches 640 yards
+  in rings that get coarser with distance; only the nearest 40 yards deform.
+
+**Anti-aliasing**
+- Our own FXAA pass on the world, drawn before the interface (on by default, `AntiAliasing` in the
+  ini). It runs while the client's multisampling is off, which the readable scene depth needs
+  anyway.
+
 **Readable scene depth**
 - The world's depth buffer made readable for later effects (fog, footprints, water edges). It's
   off while the client's multisampling is on.
@@ -62,10 +77,13 @@ only add what stock data can't express, and every feature can be switched off.
      in-game panel).
    - `GroundEffectDoodadDensity.cdbc`: grass density near the player. Without it there are no
      extra plants.
+   - `SurfaceCover.cdbc`: where snow (or sand) cover goes and how deep. Without it there is no
+     cover.
 
-   **These are sample data**, so that wind and grass show up and work in some stock 3.3.5 zones.
-   They are in no way fine-tuned yet. The scripts in `tools/` regenerate a minimal baseline
-   (`gen_default_density.py`) or a small wind example (`gen_test_wind.py`).
+   **These are sample data**, so that wind, grass and snow show up and work in some stock 3.3.5
+   zones. They are in no way fine-tuned yet. The scripts in `tools/` regenerate a minimal baseline
+   (`gen_default_density.py`, `gen_default_surface_cover.py`) or a small wind example
+   (`gen_test_wind.py`).
 3. Start the client. `Logs\wxl-core.log` lists what loaded.
 
 ## Configuration
@@ -73,8 +91,9 @@ only add what stock data can't express, and every feature can be switched off.
 Settings live in `WTF\WXL\WarcraftXL.ini`, section `[LivingAzeroth]`. Missing keys are written with
 their defaults and a comment on first launch. All keys are listed in [docs/config.md](docs/config.md).
 
-The in-game overlay (**F9**) has panels for wind, grass and grass performance. Everything can be
-tuned live there; the ini sets what each launch starts with.
+The in-game overlay (**F9**) has panels for wind, grass, grass performance, anti-aliasing and the
+snow cover. Everything can be tuned live there; the ini sets what each launch starts with (the
+snow cover has no ini keys yet: it starts off every launch).
 
 ## Custom tables
 
@@ -106,8 +125,8 @@ The extension builds inside the WarcraftXL core tree. Core picks up every folder
 
 ## Planned
 
-Weather and wetness, snow/sand/mud with footprints, puddles, better water and fog, wind on trees
-and bushes, a data-driven sky, foot placement on slopes.
+Weather and wetness, footprints and lasting trails in the snow, sand and mud, puddles, better
+water and fog, wind on trees and bushes, a data-driven sky, foot placement on slopes.
 
 ## License and credits
 
