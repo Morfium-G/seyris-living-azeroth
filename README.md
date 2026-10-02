@@ -41,7 +41,7 @@ only add what stock data can't express, and every feature can be switched off.
   options slider still stops at its old maximum; to go further, set the distance with the console,
   e.g. `/console groundEffectDist 1024`. The client saves it like any other setting.
 
-**Snow cover** (test feature, off by default: switch it on in the F9 "surface cover" panel)
+**Snow cover** (test feature; `SurfaceCover` in the ini, tunable in the F9 "surface cover" panel)
 - A real layer of snow on top of the terrain, not just a texture: characters sink in, and they
   and nearby creatures carve trenches with a raised rim that slowly fill back in. Grass and small
   doodads are buried under it.
@@ -94,8 +94,7 @@ Settings live in `WTF\WXL\WarcraftXL.ini`, section `[LivingAzeroth]`. Missing ke
 their defaults and a comment on first launch. All keys are listed in [docs/config.md](docs/config.md).
 
 The in-game overlay (**F9**) has panels for wind, grass, grass performance, anti-aliasing and the
-snow cover. Everything can be tuned live there; the ini sets what each launch starts with (the
-snow cover has no ini keys yet: it starts off every launch).
+snow cover. Everything can be tuned live there; the ini sets what each launch starts with.
 
 ## Custom tables
 

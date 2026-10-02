@@ -17,6 +17,14 @@ namespace wxl_livingazeroth::cover
 {
     void Install(const WXL_Api* api);
 
+    /// Start-up settings (WarcraftXL.ini); the panel can change them at runtime.
+    void Configure(bool enabled, int levels, bool trenches, float depthMultiplier, float fillBudgetMs);
+    bool  Enabled();
+    int   Levels();
+    bool  Trenches();
+    float DepthMultiplier();
+    float FillBudgetMs();
+
     /// Loads SurfaceCover.cdbc (which ground gets cover, how deep) through the cdbc reader.
     void LoadTable(const void* cdbcApi);
 

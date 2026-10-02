@@ -4,6 +4,7 @@
 #include "env/Shelter.hpp"
 #include "features/GrassInstanced.hpp"
 #include "features/GrassMotion.hpp"
+#include "features/SurfaceCover.hpp"
 #include "render/PostAA.hpp"
 #include "wxl_seyris/SettingsApi.hpp"
 
@@ -87,6 +88,13 @@ namespace wxl_livingazeroth::config
             aa.mode != postaa::Mode::Off);
         aa.mode = fxaa ? postaa::Mode::Fxaa : postaa::Mode::Off;
         aa.subpixel = Float(s, "AntiAliasingSubpixel", "FXAA subpixel smoothing, 0 (sharpest) .. 1 (softest).", aa.subpixel);
+
+        cover::Configure(
+            Bool(s, "SurfaceCover", "Snow (and other) cover on the ground that characters sink into and carve trenches in. Where and how comes from SurfaceCover.cdbc.", cover::Enabled()),
+            static_cast<int>(Float(s, "SurfaceCoverLevels", "How far the cover reaches: 1..5 rings of 40, 80, 160, 320, 640 yards.", static_cast<float>(cover::Levels())) + 0.5f),
+            Bool(s, "SurfaceCoverTrenches", "Characters and creatures carve trenches in the cover.", cover::Trenches()),
+            Float(s, "SurfaceCoverDepth", "Your multiplier on the cover depth from SurfaceCover.cdbc (1 = as the table says).", cover::DepthMultiplier()),
+            Float(s, "SurfaceCoverFillBudgetMs", "Milliseconds per frame spent filling the cover around you (on login, teleports, moving). Lower = smoother, slower to appear.", cover::FillBudgetMs()));
 
         shelter::SetEnabled(Bool(s, "WindShelter", "Roofs and overhangs shelter the ground below from wind.", shelter::Enabled()));
         shelter::SetLeeEnabled(Bool(s, "WindLee", "Walls and cliffs cast a wind shadow on their downwind side.", shelter::LeeEnabled()));

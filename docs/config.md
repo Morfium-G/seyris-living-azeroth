@@ -28,6 +28,11 @@ says why.
 | GrassPushRadiusScale | 2 | Push radius as a multiple of a character's bounding radius. |
 | GrassMinPushRadius | 0.5 | Smallest push radius in yards. |
 | GrassMountedRadiusScale | 2 | Extra push radius factor while mounted. |
+| SurfaceCover | 1 | Snow (and other) cover on the ground that characters sink into and carve trenches in. Where and how comes from `SurfaceCover.cdbc`. |
+| SurfaceCoverLevels | 5 | How far the cover reaches: 1..5 rings of 40, 80, 160, 320, 640 yards. |
+| SurfaceCoverTrenches | 1 | Characters and creatures carve trenches in the cover. |
+| SurfaceCoverDepth | 1 | Your multiplier on the cover depth from `SurfaceCover.cdbc` (1 = as the table says). |
+| SurfaceCoverFillBudgetMs | 2 | Milliseconds per frame spent filling the cover around you (on login, teleports, moving). Lower = smoother, slower to appear. |
 | WindShelter | 1 | Roofs and overhangs shelter the ground below from wind. |
 | WindLee | 1 | Walls and cliffs cast a wind shadow on their downwind side. |
 | DebugWindArrows | 0 | Debug: draw the wind as arrows around the player. |

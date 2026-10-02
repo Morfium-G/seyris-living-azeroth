@@ -16,9 +16,9 @@
 
 #include <cmath>
 #include <cstdio>
+#include <climits>
 #include <cstring>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace wxl_livingazeroth::cover
@@ -63,7 +63,7 @@ namespace wxl_livingazeroth::cover
 
         struct Settings
         {
-            int   enabled = 0;
+            int   enabled = 1;
             int   coverage = static_cast<int>(Coverage::Table);
             int   levels = 5;               // 1..5: 40, 80, 160, 320, 640 yd
             // Player/testing multipliers on what SurfaceCover.cdbc says; 1 = exactly the table.
@@ -73,6 +73,7 @@ namespace wxl_livingazeroth::cover
             float farLift = 0.75f;          // yd added far away, against terrain drawn simpler than its heights
             int   sceneLight = 1;           // light and fog the cover like the terrain just drawn (in-pass only)
             float brightness = 0.93f;       // cover albedo
+            float fillBudgetMs = 2.0f;      // sampling work per frame for fills and recentres
             int   wireframe = 0;
             int   drawPoint = 0;            // 0 right after the terrain (inside the world pass), 1 end of the scene
         };
@@ -100,7 +101,17 @@ namespace wxl_livingazeroth::cover
             std::vector<uint32_t> tint = std::vector<uint32_t>(kTex * kTex, 0);
             bool lookDirty = true;
             int boostRows = 0;              // rows left to re-sample at full speed after a setting change
-            bool  haveGrid = false;
+            bool  haveGrid = false;         // drawn: its grid at gridI/gridJ is filled
+            // A fill in progress, worked through within the per-frame budget. The level keeps drawing
+            // its current grid meanwhile (unless `hidden`: a new place, nothing valid to show), and
+            // switches to the job's origin when it's done. The texture has 59 spare rows/columns, so
+            // the strips being filled never overwrite cells still on screen.
+            struct Segment { int i0, i1, j; };
+            std::vector<Segment> job;
+            size_t jobPos = 0;
+            int    jobI = 0, jobJ = 0;
+            bool   jobActive = false, jobHidden = false, jobFull = false;
+            double jobMs = 0;
             int   gridI = 0, gridJ = 0;     // world cell index (of this level) of the grid's first vertex
             int   refreshRow = 0;
             bool  baseDirty = true, coverDirty = true;
@@ -156,7 +167,14 @@ namespace wxl_livingazeroth::cover
         // The table's values per terrain cell (what the cell is made of is constant over one: it's
         // the cell's dominant layer). Unloaded cells aren't cached, so they're asked again.
         constexpr float kTerrainCell = 33.3333333f / 8.0f;
-        std::unordered_map<int64_t, covertable::Values> g_cellValues;
+        // A fixed window of terrain cells around the player (384 cells = +-800 yd, beyond the
+        // outermost level), indexed by cell mod the window: one array access per lookup.
+        constexpr int kCellWindow = 384;
+        struct CellEntry { int cx = INT_MIN, cy = INT_MIN; covertable::Values v; };
+        std::vector<CellEntry> g_cellCache(kCellWindow * kCellWindow);
+        unsigned g_cellMisses = 0;
+
+        void ClearCellCache() { for (CellEntry& e : g_cellCache) e.cx = INT_MIN; }
         int g_mapNow = -1;
 
         // The terrain's lighting and fog as last read (for the panel): VS c12 fog, c24 sun direction
@@ -327,15 +345,15 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         // The table's values at the centre of terrain cell (cx, cy); false while its chunk isn't loaded.
         bool CellValues(int cx, int cy, covertable::Values& out)
         {
-            const int64_t key = (static_cast<int64_t>(cx) << 32) ^ static_cast<uint32_t>(cy);
-            const auto it = g_cellValues.find(key);
-            if (it != g_cellValues.end()) { out = it->second; return true; }
+            const int wx = ((cx % kCellWindow) + kCellWindow) % kCellWindow, wy = ((cy % kCellWindow) + kCellWindow) % kCellWindow;
+            CellEntry& e = g_cellCache[wy * kCellWindow + wx];
+            if (e.cx == cx && e.cy == cy) { out = e.v; return true; }
             terrain::Surface surface;
             if (!terrain::SurfaceAt((cx + 0.5f) * kTerrainCell, (cy + 0.5f) * kTerrainCell, surface))
                 return false; // not loaded (or a hole): ask again later
             out = covertable::Resolve(surface.area, g_mapNow, surface.texture, surface.groundEffect, surface.terrainType);
-            if (g_cellValues.size() > 400000) g_cellValues.clear(); // far beyond any grid's reach
-            g_cellValues.emplace(key, out);
+            e.cx = cx; e.cy = cy; e.v = out;
+            ++g_cellMisses;
             return true;
         }
 
@@ -473,40 +491,86 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 for (int i = i0; i <= i1; ++i) Sample(L, isLevel0, i, j, fresh);
         }
 
-        // Moves a level's grid so the player is near its middle (origin on an even cell); fills only
-        // the cells that came into it. The filled area is the grid plus an apron of kApron cells: the
-        // normals of the border vertices read up to 2 cells beyond the grid (morph band normals at the
-        // coarser spacing), and without the apron those slots hold stale heights or holes -- a bright
-        // or dark line along every level border.
-        void Recentre(Level& L, bool isLevel0, const float pos[3], bool refill)
+        // Plans a level's next grid around the player (origin on an even cell). The filled area is
+        // the grid plus an apron of kApron cells: the normals of the border vertices read up to 2
+        // cells beyond the grid (morph band normals at the coarser spacing), and without the apron
+        // those slots hold stale heights or holes -- a bright or dark line along every level border.
+        // Modes: a new place (nothing valid on screen: filled while hidden), a refill in place (the
+        // table or the "where" changed: refilled while the old cover stays visible), or a recentre
+        // (only the strips that came into the grid).
+        enum class Plan { Recentre, RefillInPlace, NewPlace };
+
+        void PlanFill(Level& L, const float pos[3], Plan plan)
         {
             const int pi = static_cast<int>(std::floor(pos[0] / L.cell)), pj = static_cast<int>(std::floor(pos[1] / L.cell));
-            const int ni = FloorDiv2(pi - kHalfCells) * 2, nj = FloorDiv2(pj - kHalfCells) * 2;
-            if (L.haveGrid && !refill && std::abs(ni - L.gridI) < kRecentreCells && std::abs(nj - L.gridJ) < kRecentreCells) return;
-
-            const double t0 = grassperf::Now();
+            int ni = FloorDiv2(pi - kHalfCells) * 2, nj = FloorDiv2(pj - kHalfCells) * 2;
             const int span = kFilled - 1;
-            const int fi = ni - kApron, fj = nj - kApron;  // new filled area, first cell
-            if (!L.haveGrid || refill || std::abs(ni - L.gridI) > span || std::abs(nj - L.gridJ) > span)
+            if (plan == Plan::Recentre)
             {
-                SampleRect(L, isLevel0, fi, fi + span, fj, fj + span, true);
-                L.firstFillMs = grassperf::Now() - t0;
-                L.boostRows = kFilled; // chunks still streaming in get picked up quickly
+                if (!L.haveGrid) plan = Plan::NewPlace;
+                else if (std::abs(ni - L.gridI) < kRecentreCells && std::abs(nj - L.gridJ) < kRecentreCells) return;
+                // The player left this level's grid entirely (a teleport): nothing on screen is worth
+                // keeping, start over at the new place.
+                else if (std::abs(ni - L.gridI) > kGridCells || std::abs(nj - L.gridJ) > kGridCells) plan = Plan::NewPlace;
+                else
+                {
+                    // Lagging behind (fast travel): follow in steps that fit the spare rows, so the
+                    // strips being filled never overwrite cells still on screen, and stay visible.
+                    constexpr int kMaxStep = ((kTex - kFilled) / 2) * 2;
+                    const int di = ni - L.gridI, dj = nj - L.gridJ;
+                    ni = L.gridI + (di > kMaxStep ? kMaxStep : (di < -kMaxStep ? -kMaxStep : di));
+                    nj = L.gridJ + (dj > kMaxStep ? kMaxStep : (dj < -kMaxStep ? -kMaxStep : dj));
+                }
+            }
+
+            L.job.clear();
+            L.jobPos = 0;
+            L.jobI = ni; L.jobJ = nj;
+            L.jobMs = 0;
+            const int fi = ni - kApron, fj = nj - kApron;  // new filled area, first cell
+            if (plan != Plan::Recentre)
+            {
+                for (int j = fj; j <= fj + span; ++j) L.job.push_back({ fi, fi + span, j });
             }
             else
             {
                 const int oi0 = L.gridI - kApron, oi1 = oi0 + span, oj0 = L.gridJ - kApron, oj1 = oj0 + span;
                 for (int j = fj; j <= fj + span; ++j)
                 {
-                    if (j < oj0 || j > oj1) { SampleRect(L, isLevel0, fi, fi + span, j, j, true); continue; }
-                    if (fi < oi0) SampleRect(L, isLevel0, fi, oi0 - 1, j, j, true);
-                    if (fi + span > oi1) SampleRect(L, isLevel0, oi1 + 1, fi + span, j, j, true);
+                    if (j < oj0 || j > oj1) { L.job.push_back({ fi, fi + span, j }); continue; }
+                    if (fi < oi0) L.job.push_back({ fi, oi0 - 1, j });
+                    if (fi + span > oi1) L.job.push_back({ oi1 + 1, fi + span, j });
                 }
             }
-            L.gridI = ni; L.gridJ = nj;
+            L.jobActive = true;
+            L.jobFull = plan != Plan::Recentre;
+            L.jobHidden = plan == Plan::NewPlace;
+            if (L.jobHidden) L.haveGrid = false;
+        }
+
+        // Works one level's job until the deadline; true when the job is done.
+        bool WorkFill(Level& L, bool isLevel0, double deadline)
+        {
+            const double t0 = grassperf::Now();
+            while (L.jobPos < L.job.size())
+            {
+                const Level::Segment& seg = L.job[L.jobPos++];
+                SampleRect(L, isLevel0, seg.i0, seg.i1, seg.j, seg.j, true);
+                if (grassperf::Now() >= deadline) break;
+            }
+            L.jobMs += grassperf::Now() - t0;
+            if (L.jobPos < L.job.size()) return false;
+
+            L.gridI = L.jobI; L.gridJ = L.jobJ;
             L.haveGrid = true;
             L.coverDirty = true;
-            L.fillMs = grassperf::Now() - t0;
+            L.baseDirty = true;
+            L.lookDirty = true;
+            if (L.jobFull) { L.firstFillMs = L.jobMs; L.boostRows = kFilled; } // chunks still streaming in get picked up quickly
+            L.fillMs = L.jobMs;
+            L.jobActive = false;
+            L.job.clear();
+            return true;
         }
 
         // A trench under one grounded unit: pressed flat inside r, a rim between r and 1.6 r.
@@ -770,7 +834,10 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         {
             if (!dev || !EnsureGpu(dev)) return;
             const int levels = ActiveLevels();
-            for (int k = 0; k < levels; ++k) if (!g_levels[k].haveGrid) return;
+            // Levels still filling a new place aren't drawn yet; the others are (near ones first).
+            int drawn = 0, lastDrawn = -1;
+            for (int k = 0; k < levels; ++k) if (g_levels[k].haveGrid) { ++drawn; lastDrawn = k; }
+            if (!drawn) { g_inactive = "filling"; return; }
 
             // The world's view (no translation: the scene is drawn about the camera, so positions go
             // in camera-relative, c6) and its rendered projection.
@@ -781,7 +848,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
 
             double t0 = grassperf::Now();
             for (int k = 0; k < levels; ++k)
-                if (!UploadLevel(g_levels[k], k == 0)) { g_inactive = "texture upload failed"; return; }
+                if (g_levels[k].haveGrid && !UploadLevel(g_levels[k], k == 0)) { g_inactive = "texture upload failed"; return; }
             g_uploadMs = grassperf::Now() - t0;
             t0 = grassperf::Now();
 
@@ -897,7 +964,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             for (int k = 0; k < levels; ++k)
             {
                 const Level& L = g_levels[k];
-                const bool outermost = k == levels - 1;
+                if (!L.haveGrid) continue;
+                const bool outermost = k == lastDrawn;
                 dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, L.baseTex);
                 dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, L.coverTex);
                 dev->SetTexture(D3DVERTEXTEXTURESAMPLER2, g_tintSupported ? L.lookTex : nullptr);
@@ -912,9 +980,11 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 // The box is a hair smaller than that grid, so the two levels overlap slightly where
                 // they meet (same heights there) instead of both skipping a pixel exactly on the edge.
                 float inner[4] = { 1.0e9f, 1.0e9f, -1.0e9f, -1.0e9f };
-                if (k > 0)
+                int finer = k - 1;
+                while (finer >= 0 && !g_levels[finer].haveGrid) --finer;
+                if (finer >= 0)
                 {
-                    const Level& F = g_levels[k - 1];
+                    const Level& F = g_levels[finer];
                     const double e = F.cell * 0.25;
                     inner[0] = static_cast<float>(static_cast<double>(F.gridI) * F.cell + e - eye[0]);
                     inner[1] = static_cast<float>(static_cast<double>(F.gridJ) * F.cell + e - eye[1]);
@@ -997,6 +1067,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             g_api->UiSliderFloat("Far lift (yd, 80 -> 400 yd away)", &g_settings.farLift, 0.0f, 3.0f);
             g_api->UiCheckbox("Light and fog like the terrain", &g_settings.sceneLight);
             g_api->UiSliderFloat("Snow brightness", &g_settings.brightness, 0.3f, 1.5f);
+            g_api->UiSliderFloat("Fill budget (ms per frame)", &g_settings.fillBudgetMs, 0.5f, 10.0f);
             g_api->UiCheckbox("Wireframe", &g_settings.wireframe);
             static const char* const drawPoints[] = { "Right after the terrain (inside the world pass)", "End of the scene (old)" };
             g_api->UiCombo("Draw point", &g_settings.drawPoint, drawPoints, 2);
@@ -1013,11 +1084,15 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             for (int k = 0; k < levels; ++k)
             {
                 const Level& L = g_levels[k];
-                std::snprintf(line, sizeof(line), "level %d: %.2f yd cells, %.0f yd out, first cell (%d, %d), holes/unloaded %u, full fill %.2f ms, last recentre %.2f ms",
-                              k, L.cell, kHalfCells * L.cell, L.gridI, L.gridJ, L.holes, L.firstFillMs, L.fillMs); add();
+                char state[48] = "";
+                if (L.jobActive)
+                    std::snprintf(state, sizeof(state), ", %s %u%%", L.jobHidden ? "filling" : (L.jobFull ? "refilling" : "recentring"),
+                                  static_cast<unsigned>(L.job.empty() ? 100 : 100 * L.jobPos / L.job.size()));
+                std::snprintf(line, sizeof(line), "level %d: %.2f yd cells, %.0f yd out, first cell (%d, %d), holes/unloaded %u, full fill %.2f ms, last recentre %.2f ms%s",
+                              k, L.cell, kHalfCells * L.cell, L.gridI, L.gridJ, L.holes, L.firstFillMs, L.fillMs, state); add();
             }
-            std::snprintf(line, sizeof(line), "%d x %d vertices; units stamping %u; terrain cells cached %zu; tint %s",
-                          levels * kPatches * kPatches, kPatchVerts * kPatchVerts, g_stamps, g_cellValues.size(),
+            std::snprintf(line, sizeof(line), "%d x %d vertices; units stamping %u; terrain cells looked up %zu; tint %s",
+                          levels * kPatches * kPatches, kPatchVerts * kPatchVerts, g_stamps, static_cast<size_t>(g_cellMisses),
                           g_tintSupported ? "on" : "not supported by this GPU"); add();
             if (g_hereValid)
             {
@@ -1050,6 +1125,21 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         }
     }
 
+    void Configure(bool enabled, int levels, bool trenches, float depthMultiplier, float fillBudgetMs)
+    {
+        g_settings.enabled = enabled ? 1 : 0;
+        g_settings.levels = levels < 1 ? 1 : (levels > kMaxLevels ? kMaxLevels : levels);
+        g_settings.stamp = trenches ? 1 : 0;
+        g_settings.depthMul = depthMultiplier < 0.0f ? 0.0f : depthMultiplier;
+        g_settings.fillBudgetMs = fillBudgetMs < 0.1f ? 0.1f : fillBudgetMs;
+    }
+
+    bool Enabled() { return g_settings.enabled != 0; }
+    int  Levels() { return g_settings.levels; }
+    bool Trenches() { return g_settings.stamp != 0; }
+    float DepthMultiplier() { return g_settings.depthMul; }
+    float FillBudgetMs() { return g_settings.fillBudgetMs; }
+
     void LoadTable(const void* cdbcApi)
     {
         g_cdbcApi = cdbcApi;
@@ -1077,9 +1167,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         const double t0 = grassperf::Now();
 
         g_mapNow = snap.mapId;
-        const bool refill = g_lastCoverage != g_settings.coverage || g_lastMap != snap.mapId ||
-                            g_tableGeneration != covertable::Generation();
-        if (refill) g_cellValues.clear();
+        const bool newMap = g_lastMap != snap.mapId;
+        const bool refill = newMap || g_lastCoverage != g_settings.coverage || g_tableGeneration != covertable::Generation();
+        if (refill) ClearCellCache();
         g_lastCoverage = g_settings.coverage;
         g_lastMap = snap.mapId;
         g_tableGeneration = covertable::Generation();
@@ -1099,7 +1189,10 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         for (int k = 0; k < levels; ++k)
         {
             Level& L = g_levels[k];
-            Recentre(L, k == 0, snap.playerPos, refill);
+            // A refill or a new map replaces whatever job was running; a recentre waits for it.
+            if (refill) PlanFill(L, snap.playerPos, newMap || !L.haveGrid ? Plan::NewPlace : Plan::RefillInPlace);
+            else if (!L.jobActive) PlanFill(L, snap.playerPos, Plan::Recentre);
+            if (L.jobActive) continue; // re-sampling and hole counting wait for the fill
             // Chunks stream in after the grid saw them: re-sample a few rows per frame, keeping trenches.
             // Once nothing is missing one row is enough, except for a pass at full speed after a
             // setting that's applied while sampling changed.
@@ -1122,7 +1215,25 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             }
         }
         // A level switched off is refilled from scratch when it comes back.
-        for (int k = levels; k < kMaxLevels; ++k) g_levels[k].haveGrid = false;
+        for (int k = levels; k < kMaxLevels; ++k) { g_levels[k].haveGrid = false; g_levels[k].jobActive = false; }
+
+        // Fills within the budget. Levels with nothing on screen go first, coarsest first (a coarse
+        // level covers the most ground for the same work, so there's always cover under the player);
+        // the rest of the budget is shared evenly by the visible levels' jobs, so fast travel can't
+        // starve any of them.
+        const double end = grassperf::Now() + (g_settings.fillBudgetMs > 0.1f ? g_settings.fillBudgetMs : 0.1f);
+        int order[kMaxLevels], jobs = 0;
+        for (int k = levels - 1; k >= 0; --k) if (g_levels[k].jobActive && g_levels[k].jobHidden) order[jobs++] = k;
+        for (int k = 0; k < levels; ++k)      if (g_levels[k].jobActive && !g_levels[k].jobHidden) order[jobs++] = k;
+        for (int n = 0; n < jobs; ++n)
+        {
+            const double now = grassperf::Now();
+            if (now >= end) break;
+            const int k = order[n];
+            const bool hidden = g_levels[k].jobHidden;
+            const double deadline = hidden ? end : now + (end - now) / (jobs - n);
+            WorkFill(g_levels[k], k == 0, deadline);
+        }
 
         // Rim and relax time come from the table's row where the player is (trenches are made around
         // the player), times the panel's multipliers. The same lookup feeds the panel's "here" lines.
