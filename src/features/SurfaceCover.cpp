@@ -30,16 +30,31 @@ namespace wxl_livingazeroth::cover
         constexpr const char* kPanelTitle = "wxl-seyris-living-azeroth: surface cover (spike)";
 
         // --- grid ------------------------------------------------------------------------------
-        // 0.25 yd cells; the mesh is 4 patches of 160x160 cells (161x161 vertices, 16-bit indices)
-        // = 320 cells = 80 yd. The textures are toroidal, one texel per world cell; 384 > 321 so a
-        // slot is never shared by two vertices of the grid at once.
-        constexpr float kCell = 0.25f;
+        // A clipmap: every level is the same 320x320-cell grid (4 patches of 160x160 cells, 161x161
+        // vertices, 16-bit indices), level k with cells of 0.25 * 2^k yd, so the levels reach 40, 80,
+        // 160, 320 and 640 yd from the player. Only level 0 deforms (trenches); the coarser ones carry the
+        // static cover. Each level has its own toroidal textures, one texel per world cell of that
+        // level; 384 > 321 so a slot is never shared by two vertices of the grid at once.
+        //
+        // Seams: every level's origin snaps to an even cell, so its border lies on the next coarser
+        // level's vertex lines. In a band along the border the odd vertices morph onto their even
+        // neighbours, which turns the edge into exactly the coarser level's triangles; the coarser
+        // level discards its pixels inside the finer level's box. In the band the normals switch to the
+        // coarser level's spacing too, or the two levels shade the same surface differently.
+        constexpr float kCell0 = 0.25f;
+        constexpr int   kMaxLevels = 5;
         constexpr int   kPatchCells = 160, kPatchVerts = kPatchCells + 1, kPatches = 2;
-        constexpr int   kGridCells = kPatchCells * kPatches, kGridVerts = kGridCells + 1;
+        constexpr int   kGridCells = kPatchCells * kPatches, kGridVerts = kGridCells + 1, kHalfCells = kGridCells / 2;
         constexpr int   kTex = 384;
-        constexpr int   kRecentreCells = 16;      // recentre after the player moved 4 yd
-        constexpr int   kRefreshRowsPerFrame = 8; // re-sample rows round-robin (late-streamed chunks)
-        constexpr float kHole = -100000.0f;       // base height of a hole / unloaded spot
+        constexpr int   kApron = 2;                // cells filled beyond the grid on every side (border normals)
+        constexpr int   kFilled = kGridVerts + 2 * kApron;
+        static_assert(kFilled <= kTex, "the filled area must fit the toroidal texture");
+        constexpr int   kRecentreCells = 16;       // recentre after the player moved 16 cells of the level
+        constexpr int   kMorphCells = 16;          // morph band along a level's border
+        constexpr int   kDeformFullCells = 120;    // level 0: trenches at full strength inside this (Chebyshev, cells)...
+        constexpr int   kDeformZeroCells = 140;    // ...gone by this, before the morph band starts
+        constexpr float kOuterFadeStart = 0.80f, kOuterFadeEnd = 0.97f; // outermost level: cover fades out (share of its half)
+        constexpr float kHole = -100000.0f;        // base height of a hole / unloaded spot
 
         // TerrainType storage (WowClientDB 0xAD4C34): a row's Flags at +0x14, 0x1 = footprints.
         constexpr uintptr_t kTerrainMinId = 0x00AD4C44, kTerrainMaxId = 0x00AD4C40, kTerrainIndex = 0x00AD4C54;
@@ -51,37 +66,50 @@ namespace wxl_livingazeroth::cover
         {
             int   enabled = 0;
             int   coverage = static_cast<int>(Coverage::FootprintTypes);
-            float depth = 0.35f;        // yd of cover at full strength
-            float rim = 0.3f;           // rim height as a share of the depth
-            float relaxSeconds = 30.0f; // trench back to flat
+            int   levels = 5;               // 1..5: 40, 80, 160, 320, 640 yd
+            float depth = 0.35f;            // yd of cover at full strength
+            float rim = 0.3f;               // rim height as a share of the depth
+            float relaxSeconds = 30.0f;     // trench back to flat
             int   stamp = 1;
-            float stampScale = 1.0f;    // trench radius x the unit's size
-            float fadeStart = 32.0f, fadeEnd = 39.5f; // radius from the grid centre, yd
+            float stampScale = 1.0f;        // trench radius x the unit's size
+            float farLift = 0.75f;          // yd added far away, against terrain drawn simpler than its heights
             int   wireframe = 0;
-            int   drawPoint = 0;          // 0 right after the terrain (inside the world pass), 1 end of the scene
+            int   drawPoint = 0;            // 0 right after the terrain (inside the world pass), 1 end of the scene
         };
 
         const WXL_Api* g_api = nullptr;
         Settings       g_settings;
 
-        // CPU state, slot = (world cell mod kTex).
-        std::vector<float>   g_base(kTex * kTex, kHole);
-        std::vector<uint8_t> g_mask(kTex * kTex, 0);
-        std::vector<float>   g_press(kTex * kTex, 0.0f);
-        std::vector<float>   g_rimH(kTex * kTex, 0.0f);
-        bool g_haveGrid = false;
-        int  g_gridI = 0, g_gridJ = 0; // world cell index of the grid's first vertex (x, y)
-        int  g_refreshRow = 0;
-        bool g_baseDirty = true;
-        int  g_lastCoverage = -1;
+        struct Level
+        {
+            float cell = kCell0;
+            std::vector<float>   base = std::vector<float>(kTex * kTex, kHole);
+            std::vector<uint8_t> mask = std::vector<uint8_t>(kTex * kTex, 0);
+            bool  haveGrid = false;
+            int   gridI = 0, gridJ = 0;     // world cell index (of this level) of the grid's first vertex
+            int   refreshRow = 0;
+            bool  baseDirty = true, coverDirty = true;
+            unsigned holes = 0;
+            double   fillMs = 0, firstFillMs = 0;
+            IDirect3DTexture9* baseTex = nullptr;
+            IDirect3DTexture9* coverTex = nullptr;
+        };
+        Level g_levels[kMaxLevels];
+
+        // Level 0's trench state, slot = (world cell mod kTex).
+        std::vector<float> g_press(kTex * kTex, 0.0f);
+        std::vector<float> g_rimH(kTex * kTex, 0.0f);
+
+        int   g_lastCoverage = -1;
+        float g_lastDepth = -1.0f;
 
         // stats
-        double   g_fillMs = 0, g_firstFillMs = 0, g_simMs = 0, g_uploadMs = 0, g_drawMs = 0;
-        unsigned g_holes = 0, g_stamps = 0;
+        double   g_simMs = 0, g_uploadMs = 0, g_drawMs = 0;
+        unsigned g_stamps = 0;
         const char* g_inactive = "not started";
 
         // --- drawing in step with the world (verified in-client 2026-10-02) ----------------------
-        // The cover draws at OnWorldSceneEnd, after the world pass restored its own state, so it has to
+        // At the end of the scene the world pass has restored its own state, so a draw there has to
         // put back what the world was drawn with or its depth won't match the terrain's:
         //  - Projection: the graphics device keeps the matrix it was GIVEN at +0xF88 (what
         //    gfx::SceneMatrices returns) and the one it RENDERS with at +0xFC8 (its set-projection
@@ -111,63 +139,93 @@ namespace wxl_livingazeroth::cover
         IDirect3DVertexDeclaration9* g_decl = nullptr;
         IDirect3DVertexShader9*      g_vs = nullptr;
         IDirect3DPixelShader9*       g_ps = nullptr;
-        IDirect3DTexture9*           g_baseTex = nullptr;
-        IDirect3DTexture9*           g_coverTex = nullptr;
         bool                         g_gpuFailed = false;
 
-        // VS: c0..c3 view-projection columns; c4 = (patch first cell i, j, cell size, 1 / texture size);
-        // c5 = (grid centre x, y, fade start, fade end); c6 = the camera position (the scene is drawn
-        // about the camera, see OnWorldSceneEnd).
+        // VS: c0..c3 view-projection columns; c4 = (patch first cell i, j, cell size, 1 / texture
+                // size); c5 = (level centre cell i, j, half extent, morph band) in cells; c6 = the camera
+        // position (the scene is drawn about the camera); c7 = (fade start, fade end, fade on) in cells;
+        // c8 = (far lift start, end, height) in yd from the camera.
         const char* kVsHlsl = R"(
 float4 vp0 : register(c0); float4 vp1 : register(c1); float4 vp2 : register(c2); float4 vp3 : register(c3);
 float4 grid : register(c4);
-float4 centre : register(c5);
+float4 lod : register(c5);
 float4 eye : register(c6);
+float4 fade : register(c7);
+float4 lift : register(c8);
 sampler2D baseTex : register(s0);
 sampler2D coverTex : register(s1);
 
-struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1; };
+struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1; float2 rel : TEXCOORD2; };
 
-float Fade(float2 xy) { return saturate((centre.w - length(xy - centre.xy)) / (centre.w - centre.z)); }
+float Cheb(float2 idx) { float2 a = abs(idx - lod.xy); return max(a.x, a.y); }
+float Fade(float2 idx) { return fade.z > 0.5 ? saturate((fade.y - Cheb(idx)) / (fade.y - fade.x)) : 1; }
 
-float Height(float2 idx)
+// x = base height, y = cover depth
+float2 Sample(float2 idx)
 {
     float2 uv = (idx + 0.5) * grid.w;
-    float b = tex2Dlod(baseTex, float4(uv, 0, 0)).r;
-    float c = tex2Dlod(coverTex, float4(uv, 0, 0)).r;
-    return b + c * Fade(idx * grid.z);
+    return float2(tex2Dlod(baseTex, float4(uv, 0, 0)).r, tex2Dlod(coverTex, float4(uv, 0, 0)).r * Fade(idx));
+}
+
+float H(float2 idx) { float2 s = Sample(idx); return s.x + s.y; }
+
+// step = neighbour distance for the normal in cells (2 = the coarser level's spacing)
+void Vertex(float2 idx, float step, out float3 p, out float3 n, out float2 s)
+{
+    s = Sample(idx);
+    p = float3(idx * grid.z, s.x + s.y);
+    n = float3(H(idx - float2(step, 0)) - H(idx + float2(step, 0)), H(idx - float2(0, step)) - H(idx + float2(0, step)), 2 * step * grid.z);
 }
 
 VOut main(float2 ij : POSITION)
 {
     VOut o;
     float2 idx = grid.xy + ij;
-    float2 uv = (idx + 0.5) * grid.w;
-    float b = tex2Dlod(baseTex, float4(uv, 0, 0)).r;
-    float2 xy = idx * grid.z;
-    float c = tex2Dlod(coverTex, float4(uv, 0, 0)).r * Fade(xy);
+    float3 p, n; float2 s;
+    Vertex(idx, 1, p, n, s);
 
-    float hL = Height(idx + float2(-1, 0)), hR = Height(idx + float2(1, 0));
-    float hD = Height(idx + float2(0, -1)), hU = Height(idx + float2(0, 1));
-    o.n = normalize(float3(hL - hR, hD - hU, 2 * grid.z));
+    // Border band: odd vertices slide onto their even neighbours, so the edge becomes the coarser
+    // level's triangles.
+    float m = lod.w > 1 ? saturate((Cheb(idx) - (lod.z - lod.w)) / (lod.w - 1)) : 0;
+    [branch] if (m > 0)
+    {
+        float2 odd = frac(idx * 0.5) * 2;
+        float3 p1, n1; float2 s1;
+        Vertex(idx - odd, 2, p1, n1, s1);
+        // Fully morphed takes the coarser vertex exactly: lerp(p, p1, 1) = p + (p1 - p) rounds off p1
+        // at world-sized coordinates, and the two levels' edges no longer meet (hairline cracks).
+        if (m >= 1) { p = p1; n = n1; s = s1; }
+        else        { p = lerp(p, p1, m); n = lerp(normalize(n), normalize(n1), m); s = lerp(s, s1, m); }
+    }
 
-    float4 p = float4(xy - eye.xy, b + c - eye.z, 1);
-    o.pos = float4(dot(p, vp0), dot(p, vp1), dot(p, vp2), dot(p, vp3));
-    o.d = float2(c, b < -10000 ? 1 : 0);
+    // Far away the client draws simpler terrain than its heights, which pokes through a thin
+    // cover; a lift that only depends on the distance stays seamless across the levels.
+    float dist = length(float3(p.xy - eye.xy, p.z - eye.z));
+    if (s.y > 0) p.z += lift.z * saturate((dist - lift.x) / (lift.y - lift.x));
+
+    o.n = normalize(n);
+    o.rel = p.xy - eye.xy;
+    float4 q = float4(o.rel, p.z - eye.z, 1);
+    o.pos = float4(dot(q, vp0), dot(q, vp1), dot(q, vp2), dot(q, vp3));
+    o.d = float2(s.y, s.x < -10000 ? 1 : 0);
     return o;
 }
 )";
 
-        // PS: c0 = (light direction, ambient), c1 = colour, c2.x = smallest drawn depth.
+        // PS: c0 = (light direction, ambient), c1 = colour, c2.x = smallest drawn depth, c3 = the next
+        // finer level's box (camera-relative min x, min y, max x, max y): this level isn't drawn there.
         const char* kPsHlsl = R"(
 float4 light : register(c0);
 float4 albedo : register(c1);
 float4 opts : register(c2);
+float4 inner : register(c3);
 
-float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
+float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2) : COLOR
 {
     clip(d.x - opts.x);
     clip(0.5 - d.y);
+    float2 a = step(inner.xy, rel) * step(rel, inner.zw);
+    clip(0.5 - a.x * a.y);
     float lit = light.w + (1 - light.w) * saturate(dot(normalize(n), light.xyz));
     return float4(albedo.rgb * lit, 1);
 }
@@ -175,6 +233,13 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
 
         int Slot(int i) { const int m = i % kTex; return m < 0 ? m + kTex : m; }
         int SlotOf(int i, int j) { return Slot(j) * kTex + Slot(i); } // row = y (j), column = x (i)
+        int FloorDiv2(int v) { return v >= 0 ? v / 2 : -((-v + 1) / 2); }
+
+        int ActiveLevels()
+        {
+            const int n = g_settings.levels;
+            return n < 1 ? 1 : (n > kMaxLevels ? kMaxLevels : n);
+        }
 
         bool FootprintType(int id)
         {
@@ -186,15 +251,16 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
             return row && (*reinterpret_cast<const uint32_t*>(row + kTerrainFlags) & 1);
         }
 
-        // Base height and material mask of one world cell (resets its trench state when `fresh`).
-        void Sample(int i, int j, bool fresh)
+        // Base height and material mask of one world cell of a level (level 0 also resets its trench
+        // state when `fresh`).
+        void Sample(Level& L, bool isLevel0, int i, int j, bool fresh)
         {
             const int s = SlotOf(i, j);
-            const float x = i * kCell, y = j * kCell;
+            const float x = i * L.cell, y = j * L.cell;
             float z;
             const bool ok = terrain::HeightAt(x, y, z);
             const float base = ok ? z : kHole;
-            if (base != g_base[s]) { g_base[s] = base; g_baseDirty = true; }
+            if (base != L.base[s]) { L.base[s] = base; L.baseDirty = true; }
 
             uint8_t mask = 0;
             if (ok)
@@ -202,62 +268,67 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
                 if (static_cast<Coverage>(g_settings.coverage) == Coverage::Everywhere) mask = 1;
                 else { int type; mask = terrain::TerrainTypeAt(x, y, type) && FootprintType(type) ? 1 : 0; }
             }
-            g_mask[s] = mask;
-            if (fresh) { g_press[s] = 0.0f; g_rimH[s] = 0.0f; }
+            if (mask != L.mask[s]) { L.mask[s] = mask; L.coverDirty = true; }
+            if (isLevel0 && fresh) { g_press[s] = 0.0f; g_rimH[s] = 0.0f; }
         }
 
-        void SampleRect(int i0, int i1, int j0, int j1, bool fresh) // inclusive
+        void SampleRect(Level& L, bool isLevel0, int i0, int i1, int j0, int j1, bool fresh) // inclusive
         {
             for (int j = j0; j <= j1; ++j)
-                for (int i = i0; i <= i1; ++i) Sample(i, j, fresh);
+                for (int i = i0; i <= i1; ++i) Sample(L, isLevel0, i, j, fresh);
         }
 
-        // Moves the grid so the player is near its middle; fills only the cells that came into it.
-        void Recentre(const float pos[3])
+        // Moves a level's grid so the player is near its middle (origin on an even cell); fills only
+        // the cells that came into it. The filled area is the grid plus an apron of kApron cells: the
+        // normals of the border vertices read up to 2 cells beyond the grid (morph band normals at the
+        // coarser spacing), and without the apron those slots hold stale heights or holes -- a bright
+        // or dark line along every level border.
+        void Recentre(Level& L, bool isLevel0, const float pos[3], bool refill)
         {
-            const int pi = static_cast<int>(std::floor(pos[0] / kCell)), pj = static_cast<int>(std::floor(pos[1] / kCell));
-            const int ni = pi - kGridCells / 2, nj = pj - kGridCells / 2;
-            const bool coverageChanged = g_lastCoverage != g_settings.coverage;
-            if (g_haveGrid && !coverageChanged && std::abs(ni - g_gridI) < kRecentreCells && std::abs(nj - g_gridJ) < kRecentreCells) return;
+            const int pi = static_cast<int>(std::floor(pos[0] / L.cell)), pj = static_cast<int>(std::floor(pos[1] / L.cell));
+            const int ni = FloorDiv2(pi - kHalfCells) * 2, nj = FloorDiv2(pj - kHalfCells) * 2;
+            if (L.haveGrid && !refill && std::abs(ni - L.gridI) < kRecentreCells && std::abs(nj - L.gridJ) < kRecentreCells) return;
 
             const double t0 = grassperf::Now();
-            const int last = kGridVerts - 1;
-            if (!g_haveGrid || coverageChanged || std::abs(ni - g_gridI) > last || std::abs(nj - g_gridJ) > last)
+            const int span = kFilled - 1;
+            const int fi = ni - kApron, fj = nj - kApron;  // new filled area, first cell
+            if (!L.haveGrid || refill || std::abs(ni - L.gridI) > span || std::abs(nj - L.gridJ) > span)
             {
-                SampleRect(ni, ni + last, nj, nj + last, true);
-                g_firstFillMs = grassperf::Now() - t0;
+                SampleRect(L, isLevel0, fi, fi + span, fj, fj + span, true);
+                L.firstFillMs = grassperf::Now() - t0;
             }
             else
             {
-                const int oi0 = g_gridI, oi1 = g_gridI + last, oj0 = g_gridJ, oj1 = g_gridJ + last;
-                for (int j = nj; j <= nj + last; ++j)
+                const int oi0 = L.gridI - kApron, oi1 = oi0 + span, oj0 = L.gridJ - kApron, oj1 = oj0 + span;
+                for (int j = fj; j <= fj + span; ++j)
                 {
-                    if (j < oj0 || j > oj1) { SampleRect(ni, ni + last, j, j, true); continue; }
-                    if (ni < oi0) SampleRect(ni, oi0 - 1, j, j, true);
-                    if (ni + last > oi1) SampleRect(oi1 + 1, ni + last, j, j, true);
+                    if (j < oj0 || j > oj1) { SampleRect(L, isLevel0, fi, fi + span, j, j, true); continue; }
+                    if (fi < oi0) SampleRect(L, isLevel0, fi, oi0 - 1, j, j, true);
+                    if (fi + span > oi1) SampleRect(L, isLevel0, oi1 + 1, fi + span, j, j, true);
                 }
             }
-            g_gridI = ni; g_gridJ = nj;
-            g_haveGrid = true;
-            g_lastCoverage = g_settings.coverage;
-            g_fillMs = grassperf::Now() - t0;
+            L.gridI = ni; L.gridJ = nj;
+            L.haveGrid = true;
+            L.coverDirty = true;
+            L.fillMs = grassperf::Now() - t0;
         }
 
         // A trench under one grounded unit: pressed flat inside r, a rim between r and 1.6 r.
         void Stamp(const float pos[3], float radius)
         {
+            const Level& L = g_levels[0];
             float ground;
             if (!terrain::HeightAt(pos[0], pos[1], ground) || std::fabs(pos[2] - ground) > 0.35f) return; // airborne, swimming, on a WMO
             ++g_stamps;
             const float outer = radius * 1.6f, rimPeak = radius * 1.25f, rimHalf = radius * 0.35f;
             const float rimH = g_settings.depth * g_settings.rim;
-            const int i0 = static_cast<int>(std::floor((pos[0] - outer) / kCell)), i1 = static_cast<int>(std::ceil((pos[0] + outer) / kCell));
-            const int j0 = static_cast<int>(std::floor((pos[1] - outer) / kCell)), j1 = static_cast<int>(std::ceil((pos[1] + outer) / kCell));
+            const int i0 = static_cast<int>(std::floor((pos[0] - outer) / L.cell)), i1 = static_cast<int>(std::ceil((pos[0] + outer) / L.cell));
+            const int j0 = static_cast<int>(std::floor((pos[1] - outer) / L.cell)), j1 = static_cast<int>(std::ceil((pos[1] + outer) / L.cell));
             for (int j = j0; j <= j1; ++j)
                 for (int i = i0; i <= i1; ++i)
                 {
-                    if (i < g_gridI || i >= g_gridI + kGridVerts || j < g_gridJ || j >= g_gridJ + kGridVerts) continue;
-                    const float dx = i * kCell - pos[0], dy = j * kCell - pos[1];
+                    if (i < L.gridI || i >= L.gridI + kGridVerts || j < L.gridJ || j >= L.gridJ + kGridVerts) continue;
+                    const float dx = i * L.cell - pos[0], dy = j * L.cell - pos[1];
                     const float d = std::sqrt(dx * dx + dy * dy);
                     if (d >= outer) continue;
                     const int s = SlotOf(i, j);
@@ -296,8 +367,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
         void ReleaseGpu()
         {
             auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
-            rel(g_vb); rel(g_ib); rel(g_decl); rel(g_vs); rel(g_ps); rel(g_baseTex); rel(g_coverTex);
-            g_baseDirty = true;
+            rel(g_vb); rel(g_ib); rel(g_decl); rel(g_vs); rel(g_ps);
+            for (Level& L : g_levels) { rel(L.baseTex); rel(L.coverTex); L.baseDirty = L.coverDirty = true; }
         }
 
         void* Compile(IDirect3DDevice9* dev, const char* hlsl, const char* target, bool pixel)
@@ -340,7 +411,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
         {
             if (dev != g_device) { ReleaseGpu(); g_gpuFailed = false; g_device = dev; }
             if (g_gpuFailed) return false;
-            if (g_vb && g_ib && g_decl && g_vs && g_ps && g_baseTex && g_coverTex) return true;
+            bool texturesReady = true;
+            for (const Level& L : g_levels) texturesReady &= L.baseTex && L.coverTex;
+            if (g_vb && g_ib && g_decl && g_vs && g_ps && texturesReady) return true;
             ReleaseGpu();
 
             auto fail = [](const char* why) { g_inactive = why; g_gpuFailed = true; g_api->Log(WXL_LOG_WARN, kTag, "surface cover: %s", why); return false; };
@@ -375,40 +448,57 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
                 }
             g_ib->Unlock();
 
-            if (FAILED(dev->CreateTexture(kTex, kTex, 1, 0, D3DFMT_R32F, D3DPOOL_MANAGED, &g_baseTex, nullptr)) ||
-                FAILED(dev->CreateTexture(kTex, kTex, 1, 0, D3DFMT_R32F, D3DPOOL_MANAGED, &g_coverTex, nullptr)))
-                return fail("R32F textures failed");
+            for (Level& L : g_levels)
+                if (FAILED(dev->CreateTexture(kTex, kTex, 1, 0, D3DFMT_R32F, D3DPOOL_MANAGED, &L.baseTex, nullptr)) ||
+                    FAILED(dev->CreateTexture(kTex, kTex, 1, 0, D3DFMT_R32F, D3DPOOL_MANAGED, &L.coverTex, nullptr)))
+                    return fail("R32F textures failed");
 
             g_vs = static_cast<IDirect3DVertexShader9*>(Compile(dev, kVsHlsl, "vs_3_0", false));
             g_ps = static_cast<IDirect3DPixelShader9*>(Compile(dev, kPsHlsl, "ps_3_0", true));
             if (!g_vs || !g_ps) return fail("shader compile failed (see the log)");
-            g_baseDirty = true;
             return true;
         }
 
-        bool Upload()
+        bool UploadLevel(Level& L, bool isLevel0)
         {
             D3DLOCKED_RECT lr{};
-            if (g_baseDirty)
+            if (L.baseDirty)
             {
-                if (FAILED(g_baseTex->LockRect(0, &lr, nullptr, 0))) return false;
+                if (FAILED(L.baseTex->LockRect(0, &lr, nullptr, 0))) return false;
                 for (int row = 0; row < kTex; ++row)
-                    std::memcpy(static_cast<uint8_t*>(lr.pBits) + row * lr.Pitch, &g_base[row * kTex], kTex * 4);
-                g_baseTex->UnlockRect(0);
-                g_baseDirty = false;
+                    std::memcpy(static_cast<uint8_t*>(lr.pBits) + row * lr.Pitch, &L.base[row * kTex], kTex * 4);
+                L.baseTex->UnlockRect(0);
+                L.baseDirty = false;
             }
-            if (FAILED(g_coverTex->LockRect(0, &lr, nullptr, 0))) return false;
+            // Level 0 changes every frame (trenches); the others only when their mask or the depth does.
+            if (!isLevel0 && !L.coverDirty) return true;
+            if (FAILED(L.coverTex->LockRect(0, &lr, nullptr, 0))) return false;
             const float depth = g_settings.depth;
+            const int slotI0 = Slot(L.gridI), slotJ0 = Slot(L.gridJ);
             for (int row = 0; row < kTex; ++row)
             {
                 float* out = reinterpret_cast<float*>(static_cast<uint8_t*>(lr.pBits) + row * lr.Pitch);
+                // Where this row sits in the grid (Chebyshev distance from the centre feeds the trench fade).
+                const int dj = (row - slotJ0 + kTex) % kTex;
+                const int cj = std::abs(dj - kHalfCells);
                 for (int col = 0; col < kTex; ++col)
                 {
                     const int s = row * kTex + col;
-                    out[col] = g_mask[s] ? (depth + g_rimH[s]) * (1.0f - g_press[s]) : 0.0f;
+                    if (!L.mask[s]) { out[col] = 0.0f; continue; }
+                    if (!isLevel0) { out[col] = depth; continue; }
+                    const int di = (col - slotI0 + kTex) % kTex;
+                    const int ci = std::abs(di - kHalfCells);
+                    const int cheb = ci > cj ? ci : cj;
+                    // Trenches fade out before the morph band, so the border matches the static coarser level.
+                    float k = cheb <= kDeformFullCells ? 1.0f
+                            : (cheb >= kDeformZeroCells ? 0.0f : float(kDeformZeroCells - cheb) / float(kDeformZeroCells - kDeformFullCells));
+                    if (dj >= kGridVerts || di >= kGridVerts) k = 0.0f;
+                    const float deformed = (depth + g_rimH[s]) * (1.0f - g_press[s]);
+                    out[col] = depth + (deformed - depth) * k;
                 }
             }
-            g_coverTex->UnlockRect(0);
+            L.coverTex->UnlockRect(0);
+            L.coverDirty = false;
             return true;
         }
 
@@ -417,6 +507,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
         void Draw(IDirect3DDevice9* dev, IDirect3DSurface9* sceneDepth, bool inPass)
         {
             if (!dev || !EnsureGpu(dev)) return;
+            const int levels = ActiveLevels();
+            for (int k = 0; k < levels; ++k) if (!g_levels[k].haveGrid) return;
 
             // The world's view (no translation: the scene is drawn about the camera, so positions go
             // in camera-relative, c6) and its rendered projection.
@@ -426,7 +518,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
             std::memcpy(P, static_cast<const uint8_t*>(graphics) + kDeviceRenderProjection, sizeof(P));
 
             double t0 = grassperf::Now();
-            if (!Upload()) { g_inactive = "texture upload failed"; return; }
+            for (int k = 0; k < levels; ++k)
+                if (!UploadLevel(g_levels[k], k == 0)) { g_inactive = "texture upload failed"; return; }
             g_uploadMs = grassperf::Now() - t0;
             t0 = grassperf::Now();
 
@@ -454,7 +547,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
                 for (int c = 0; c < 4; ++c)
                 {
                     float sum = 0.0f;
-                    for (int k = 0; k < 4; ++k) sum += V[r * 4 + k] * P[k * 4 + c];
+                    for (int j = 0; j < 4; ++j) sum += V[r * 4 + j] * P[j * 4 + c];
                     vpm[r * 4 + c] = sum;
                 }
             float cols[16];
@@ -462,12 +555,11 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
                 for (int c = 0; c < 4; ++c) cols[c * 4 + r] = vpm[r * 4 + c];
             dev->SetVertexShaderConstantF(0, cols, 4);
 
-            const float centreX = (g_gridI + kGridCells * 0.5f) * kCell, centreY = (g_gridJ + kGridCells * 0.5f) * kCell;
-            const float c5[4] = { centreX, centreY, g_settings.fadeStart, g_settings.fadeEnd > g_settings.fadeStart + 0.1f ? g_settings.fadeEnd : g_settings.fadeStart + 0.1f };
-            dev->SetVertexShaderConstantF(5, c5, 1);
             float eye[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
             wxl::game::camera::GetPosition(eye);
             dev->SetVertexShaderConstantF(6, eye, 1);
+            const float c8[4] = { 80.0f, 400.0f, g_settings.farLift, 0.0f };
+            dev->SetVertexShaderConstantF(8, c8, 1);
 
             const float lx = 0.35f, ly = 0.45f, lz = 0.82f, inv = 1.0f / std::sqrt(lx * lx + ly * ly + lz * lz);
             const float ps[12] = {
@@ -485,7 +577,6 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
             for (int s = 0; s < 2; ++s)
             {
                 const DWORD sampler = D3DVERTEXTEXTURESAMPLER0 + s;
-                dev->SetTexture(sampler, s == 0 ? g_baseTex : g_coverTex);
                 dev->SetSamplerState(sampler, D3DSAMP_MINFILTER, D3DTEXF_POINT);
                 dev->SetSamplerState(sampler, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
                 dev->SetSamplerState(sampler, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
@@ -509,14 +600,43 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
             dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x07);
             dev->SetRenderState(D3DRS_FILLMODE, g_settings.wireframe ? D3DFILL_WIREFRAME : D3DFILL_SOLID);
 
-            for (int pj = 0; pj < kPatches; ++pj)
-                for (int pi = 0; pi < kPatches; ++pi)
+            for (int k = 0; k < levels; ++k)
+            {
+                const Level& L = g_levels[k];
+                const bool outermost = k == levels - 1;
+                dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, L.baseTex);
+                dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, L.coverTex);
+
+                const float c5[4] = { static_cast<float>(L.gridI + kHalfCells), static_cast<float>(L.gridJ + kHalfCells),
+                                      static_cast<float>(kHalfCells), outermost ? 0.0f : static_cast<float>(kMorphCells) };
+                dev->SetVertexShaderConstantF(5, c5, 1);
+                const float c7[4] = { kHalfCells * kOuterFadeStart, kHalfCells * kOuterFadeEnd, outermost ? 1.0f : 0.0f, 0.0f };
+                dev->SetVertexShaderConstantF(7, c7, 1);
+
+                // Not drawn inside the next finer level's grid (camera-relative box); level 0 has none.
+                // The box is a hair smaller than that grid, so the two levels overlap slightly where
+                // they meet (same heights there) instead of both skipping a pixel exactly on the edge.
+                float inner[4] = { 1.0e9f, 1.0e9f, -1.0e9f, -1.0e9f };
+                if (k > 0)
                 {
-                    const float c4[4] = { static_cast<float>(g_gridI + pi * kPatchCells), static_cast<float>(g_gridJ + pj * kPatchCells),
-                                          kCell, 1.0f / kTex };
-                    dev->SetVertexShaderConstantF(4, c4, 1);
-                    dev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, kPatchVerts * kPatchVerts, 0, kPatchCells * kPatchCells * 2);
+                    const Level& F = g_levels[k - 1];
+                    const double e = F.cell * 0.25;
+                    inner[0] = static_cast<float>(static_cast<double>(F.gridI) * F.cell + e - eye[0]);
+                    inner[1] = static_cast<float>(static_cast<double>(F.gridJ) * F.cell + e - eye[1]);
+                    inner[2] = static_cast<float>(static_cast<double>(F.gridI + kGridCells) * F.cell - e - eye[0]);
+                    inner[3] = static_cast<float>(static_cast<double>(F.gridJ + kGridCells) * F.cell - e - eye[1]);
                 }
+                dev->SetPixelShaderConstantF(3, inner, 1);
+
+                for (int pj = 0; pj < kPatches; ++pj)
+                    for (int pi = 0; pi < kPatches; ++pi)
+                    {
+                        const float c4[4] = { static_cast<float>(L.gridI + pi * kPatchCells), static_cast<float>(L.gridJ + pj * kPatchCells),
+                                              L.cell, 1.0f / kTex };
+                        dev->SetVertexShaderConstantF(4, c4, 1);
+                        dev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, kPatchVerts * kPatchVerts, 0, kPatchCells * kPatchCells * 2);
+                    }
+            }
 
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, nullptr);
@@ -531,13 +651,13 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
         void __cdecl hkTerrainStage()
         {
             g_origTerrainStage();
-            if (g_settings.enabled && g_haveGrid && g_settings.drawPoint == 0)
+            if (g_settings.enabled && g_settings.drawPoint == 0)
                 Draw(static_cast<IDirect3DDevice9*>(gx::RawDevice()), nullptr, true);
         }
 
         void __cdecl OnWorldSceneEnd(void* /*user*/, const void* args)
         {
-            if (!g_settings.enabled || !g_haveGrid || g_settings.drawPoint != 1) return;
+            if (!g_settings.enabled || g_settings.drawPoint != 1) return;
             const auto* a = static_cast<const ev::WorldSceneEndArgs*>(args);
             auto* dev = static_cast<IDirect3DDevice9*>(a && a->device ? a->device : gx::RawDevice());
             Draw(dev, a ? static_cast<IDirect3DSurface9*>(a->sceneDepth) : nullptr, false);
@@ -569,13 +689,13 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
             g_api->UiCheckbox("Draw the cover", &g_settings.enabled);
             static const char* const coverage[] = { "Everywhere (test)", "Only TerrainTypes with footprints (Snow, Sand)" };
             g_api->UiCombo("Where", &g_settings.coverage, coverage, 2);
+            g_api->UiSliderInt("Levels (40 / 80 / 160 / 320 / 640 yd)", &g_settings.levels, 1, kMaxLevels);
             g_api->UiSliderFloat("Depth (yd)", &g_settings.depth, 0.0f, 1.5f);
             g_api->UiSliderFloat("Rim (x depth)", &g_settings.rim, 0.0f, 1.0f);
             g_api->UiCheckbox("Units carve trenches", &g_settings.stamp);
             g_api->UiSliderFloat("Trench width (x unit size)", &g_settings.stampScale, 0.3f, 3.0f);
             g_api->UiSliderFloat("Relax time (s)", &g_settings.relaxSeconds, 1.0f, 300.0f);
-            g_api->UiSliderFloat("Fade start (yd)", &g_settings.fadeStart, 5.0f, 40.0f);
-            g_api->UiSliderFloat("Fade end (yd)", &g_settings.fadeEnd, 5.0f, 40.0f);
+            g_api->UiSliderFloat("Far lift (yd, 80 -> 400 yd away)", &g_settings.farLift, 0.0f, 3.0f);
             g_api->UiCheckbox("Wireframe", &g_settings.wireframe);
             static const char* const drawPoints[] = { "Right after the terrain (inside the world pass)", "End of the scene (old)" };
             g_api->UiCombo("Draw point", &g_settings.drawPoint, drawPoints, 2);
@@ -584,11 +704,15 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
             std::vector<std::string> lines;
             auto add = [&lines, &line]() { lines.emplace_back(line); };
             if (const char* why = g_settings.enabled ? g_inactive : "switched off") { std::snprintf(line, sizeof(line), "not drawing: %s", why); add(); }
-            std::snprintf(line, sizeof(line), "grid %dx%d vertices (%.0f yd, %.2f yd cells), first cell (%d, %d)",
-                          kGridVerts, kGridVerts, kGridCells * kCell, kCell, g_gridI, g_gridJ); add();
-            std::snprintf(line, sizeof(line), "holes/unloaded cells %u, units stamping %u", g_holes, g_stamps); add();
-            std::snprintf(line, sizeof(line), "CPU: full fill %.2f ms, last recentre %.2f ms, sim %.2f ms, upload %.2f ms, draw submit %.2f ms",
-                          g_firstFillMs, g_fillMs, g_simMs, g_uploadMs, g_drawMs); add();
+            const int levels = ActiveLevels();
+            for (int k = 0; k < levels; ++k)
+            {
+                const Level& L = g_levels[k];
+                std::snprintf(line, sizeof(line), "level %d: %.2f yd cells, %.0f yd out, first cell (%d, %d), holes/unloaded %u, full fill %.2f ms, last recentre %.2f ms",
+                              k, L.cell, kHalfCells * L.cell, L.gridI, L.gridJ, L.holes, L.firstFillMs, L.fillMs); add();
+            }
+            std::snprintf(line, sizeof(line), "%d x %d vertices; units stamping %u", levels * kPatches * kPatches, kPatchVerts * kPatchVerts, g_stamps); add();
+            std::snprintf(line, sizeof(line), "CPU: sim %.2f ms, upload %.2f ms, draw submit %.2f ms", g_simMs, g_uploadMs, g_drawMs); add();
 
             static char status[64] = "";
             if (g_api->UiButton("Copy status to clipboard"))
@@ -605,6 +729,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
     void Install(const WXL_Api* api)
     {
         g_api = api;
+        for (int k = 0; k < kMaxLevels; ++k) g_levels[k].cell = kCell0 * static_cast<float>(1 << k);
         api->Subscribe(static_cast<uint32_t>(ev::Event::OnWorldSceneEnd), &OnWorldSceneEnd, nullptr);
         if (!api->HookAttach("LivingAzeroth.TerrainStage", kTerrainStage, reinterpret_cast<void*>(&hkTerrainStage),
                              reinterpret_cast<void**>(&g_origTerrainStage), WXL_HOOK_DEFAULT_PRIORITY))
@@ -621,20 +746,37 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1) : COLOR
         if (dt < 0.0f || dt > 0.5f) dt = 0.0f;
         const double t0 = grassperf::Now();
 
-        Recentre(snap.playerPos);
-        // Chunks stream in after the grid saw them: re-sample a few rows per frame, keeping trenches.
-        for (int k = 0; k < kRefreshRowsPerFrame; ++k)
+        const bool refill = g_lastCoverage != g_settings.coverage;
+        g_lastCoverage = g_settings.coverage;
+        if (g_lastDepth != g_settings.depth)
         {
-            SampleRect(g_gridI, g_gridI + kGridVerts - 1, g_gridJ + g_refreshRow, g_gridJ + g_refreshRow, false);
-            g_refreshRow = (g_refreshRow + 1) % kGridVerts;
+            g_lastDepth = g_settings.depth;
+            for (Level& L : g_levels) L.coverDirty = true;
         }
-        if (g_refreshRow < kRefreshRowsPerFrame) // once per round: count what's still missing
+
+        const int levels = ActiveLevels();
+        for (int k = 0; k < levels; ++k)
         {
-            unsigned holes = 0;
-            for (int j = 0; j < kGridVerts; ++j)
-                for (int i = 0; i < kGridVerts; ++i) holes += g_base[SlotOf(g_gridI + i, g_gridJ + j)] == kHole;
-            g_holes = holes;
+            Level& L = g_levels[k];
+            Recentre(L, k == 0, snap.playerPos, refill);
+            // Chunks stream in after the grid saw them: re-sample a few rows per frame, keeping trenches.
+            const int rows = k == 0 ? 8 : 4;
+            for (int r = 0; r < rows; ++r)
+            {
+                const int row = L.gridJ - kApron + L.refreshRow;
+                SampleRect(L, k == 0, L.gridI - kApron, L.gridI - kApron + kFilled - 1, row, row, false);
+                L.refreshRow = (L.refreshRow + 1) % kFilled;
+            }
+            if (L.refreshRow < rows) // once per round: count what's still missing
+            {
+                unsigned holes = 0;
+                for (int j = 0; j < kGridVerts; ++j)
+                    for (int i = 0; i < kGridVerts; ++i) holes += L.base[SlotOf(L.gridI + i, L.gridJ + j)] == kHole;
+                L.holes = holes;
+            }
         }
+        // A level switched off is refilled from scratch when it comes back.
+        for (int k = levels; k < kMaxLevels; ++k) g_levels[k].haveGrid = false;
 
         Simulate(dt);
         g_simMs = grassperf::Now() - t0;
