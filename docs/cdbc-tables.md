@@ -97,7 +97,7 @@ values the table gives there, so rows can be written on the spot.
 | RelaxSeconds | how long a trench takes to fill back in |
 | TintColor | colour as 0xRRGGBB, used with TintStrength |
 | TintStrength | 0 = the plain cover colour .. 1 = TintColor. TintColor comes from the same row |
-| CoverTexture | a BLP drawn on the cover, tiled like the terrain's layers (one repeat per terrain cell), e.g. the same texture as the ground it covers. **Empty = from the next row, `-` = none.** Up to 8 different paths per table (the panel says if there are more; extra ones get no texture). TintColor/TintStrength still apply on top |
+| CoverTexture | a BLP drawn on the cover, tiled like the terrain's layers (one repeat per terrain cell), e.g. the same texture as the ground it covers. **Empty = from the next row, `-` = none.** Any number of paths per table; up to 8 different ones are drawn at once in view (the ones most present around you; the panel lists them and says when more are around). TintColor/TintStrength still apply on top |
 | Opacity | **reserved, not used yet** (see-through covers: slush, goo) |
 | Flatten | **reserved, not used yet** (liquid-like covers that fill hollows) |
 | Flags | reserved, 0 |

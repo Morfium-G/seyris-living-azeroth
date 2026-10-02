@@ -9,7 +9,7 @@ Columns (see docs/cdbc-tables.md for the full meaning):
   TexturePath (string, empty = any), GroundEffectID (0 = any), TerrainType (-1 = any; 0 is Dirt),
   Depth (yd, 0 = no cover), MaxSlope, SlopeFade (degrees), DriftNoise, EdgeBreakup (0..1),
   Rim (x depth), RelaxSeconds, TintColor (0xRRGGBB), TintStrength (0..1),
-  CoverTexture (string: a BLP on the cover, empty = from the next row, "-" = none; up to 8
+  CoverTexture (string: a BLP on the cover, empty = from the next row, "-" = none; any number,
   distinct paths per table), Opacity, Flatten -- reserved, not used yet --, Flags (0).
 Floats; -1 = take this field from the next, less specific row (TintColor goes with
 TintStrength). No row at all = no cover.

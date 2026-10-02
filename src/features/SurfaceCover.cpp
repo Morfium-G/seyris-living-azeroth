@@ -17,6 +17,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
 #include <array>
 #include <climits>
 #include <cstring>
@@ -104,9 +105,12 @@ namespace wxl_livingazeroth::cover
             std::vector<uint8_t>  drift = std::vector<uint8_t>(kTex * kTex, 128);
             std::vector<uint8_t>  edgeNoise = std::vector<uint8_t>(kTex * kTex, 128);
             std::vector<uint32_t> tint = std::vector<uint32_t>(kTex * kTex, 0);
-            // How much of each cover texture slot, blended like the rest: texWeights[0] r..a = slots
-            // 1..4, texWeights[1] r..a = slots 5..8. Read (filtered) in the pixel shader.
+            // The cell's two strongest cover textures, by table ID (lo/hi 16 bits) and share (lo/hi
+            // byte). Turned into per-slot weights at upload, with whatever IDs hold the slots then.
+            std::vector<uint32_t> texIds = std::vector<uint32_t>(kTex * kTex, 0);
+            std::vector<uint16_t> texShares = std::vector<uint16_t>(kTex * kTex, 0);
             std::vector<uint32_t> texWeights[2] = { std::vector<uint32_t>(kTex * kTex, 0), std::vector<uint32_t>(kTex * kTex, 0) };
+            uint32_t slotsUploaded = 0;     // the slot generation the weight textures were built with
             bool lookDirty = true;
             int boostRows = 0;              // rows left to re-sample at full speed after a setting change
             bool  haveGrid = false;         // drawn: its grid at gridI/gridJ is filled
@@ -168,8 +172,14 @@ namespace wxl_livingazeroth::cover
 
         // CoverTexture slots from the table, loaded from the client's archives into textures of
         // our own; reloaded when the table is.
-        IDirect3DTexture9* g_coverTextures[covertable::kMaxCoverTextures] = {};
-        std::string        g_coverTextureStatus[covertable::kMaxCoverTextures];
+        IDirect3DTexture9* g_coverTextures[covertable::kMaxCoverTextures] = {}; // per slot (owned by the cache)
+        int                g_slotId[covertable::kMaxCoverTextures] = {};          // the ID each slot holds (0 = free)
+        std::vector<int>   g_slotOfId;                                            // ID -> slot, -1 = none
+        uint32_t           g_slotGeneration = 1;
+        int                g_slotFrame = 0;
+        unsigned           g_texturesInView = 0;
+        std::unordered_map<int, IDirect3DTexture9*> g_textureCache;
+        std::unordered_map<int, std::string>       g_textureStatus;
         uint32_t           g_coverTexturesGeneration = 0;
         constexpr float    kCoverTextureTile = 33.3333333f / 8.0f; // one repeat per terrain cell, like the terrain's layers
         const void* g_cdbcApi = nullptr;
@@ -413,7 +423,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         {
             float covered = 0.0f, depth = 0.0f, maxSlope = 45.0f, slopeFade = 15.0f, drift = 0.0f, breakup = 0.5f;
             float tint[3] = {}, tintStrength = 0.0f;
-            float tex[covertable::kMaxCoverTextures] = {}; // share of each cover texture slot
+            int   texId[8] = {}; float texShare[8] = {}; int texCount = 0; // cover textures present, by ID
         };
 
         const std::array<covertable::Values, 4>& LayerValues(const terrain::LayerWeights& lw)
@@ -433,6 +443,14 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         // From the painted strength of every texture layer: each layer's row values, weighted by
         // how strongly it's painted here (alpha maps, ~0.5 yd). Edges follow what was painted, and
         // two materials painted over each other mix.
+        Blend* g_blendTarget = nullptr; // where AddTexture collects (the Blend being built)
+        void AddTexture(int id, float w)
+        {
+            Blend& b = *g_blendTarget;
+            for (int i = 0; i < b.texCount; ++i) if (b.texId[i] == id) { b.texShare[i] += w; return; }
+            if (b.texCount < 8) { b.texId[b.texCount] = id; b.texShare[b.texCount++] = w; }
+        }
+
         void AccumulateLayers(float x, float y, float& covered, float sum[9 + covertable::kMaxCoverTextures])
         {
             terrain::LayerWeights lw;
@@ -450,7 +468,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 sum[6] += wk * ((cv.tintColor >> 8) & 0xFF) / 255.0f;
                 sum[7] += wk * (cv.tintColor & 0xFF) / 255.0f;
                 sum[8] += wk * cv.tintStrength;
-                if (cv.coverTexture > 0 && cv.coverTexture <= covertable::kMaxCoverTextures) sum[8 + cv.coverTexture] += wk;
+                if (cv.coverTexture > 0) AddTexture(cv.coverTexture, wk);
             }
         }
 
@@ -467,13 +485,14 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             if (g_settings.materialSource == 0)
             {
                 float sum[9 + covertable::kMaxCoverTextures] = {};
+                g_blendTarget = &b;
                 AccumulateLayers(x, y, b.covered, sum);
                 if (b.covered <= 0.0f) return b;
                 const float inv = 1.0f / b.covered;
                 b.depth = sum[0] * inv; b.maxSlope = sum[1] * inv; b.slopeFade = sum[2] * inv;
                 b.drift = sum[3] * inv; b.breakup = sum[4] * inv;
                 b.tint[0] = sum[5] * inv; b.tint[1] = sum[6] * inv; b.tint[2] = sum[7] * inv; b.tintStrength = sum[8] * inv;
-                for (int t = 0; t < covertable::kMaxCoverTextures; ++t) b.tex[t] = sum[9 + t] * inv;
+                for (int t = 0; t < b.texCount; ++t) b.texShare[t] *= inv;
                 if (b.covered > 1.0f) b.covered = 1.0f;
                 return b;
             }
@@ -483,6 +502,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             const int c[4][2] = { { cx, cy }, { cx + 1, cy }, { cx, cy + 1 }, { cx + 1, cy + 1 } };
             const float w[4] = { (1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy };
             float sum[9 + covertable::kMaxCoverTextures] = {};
+            g_blendTarget = &b;
             for (int k = 0; k < 4; ++k)
             {
                 covertable::Values cv;
@@ -495,14 +515,14 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 sum[6] += wk * ((cv.tintColor >> 8) & 0xFF) / 255.0f;
                 sum[7] += wk * (cv.tintColor & 0xFF) / 255.0f;
                 sum[8] += wk * cv.tintStrength;
-                if (cv.coverTexture > 0 && cv.coverTexture <= covertable::kMaxCoverTextures) sum[8 + cv.coverTexture] += wk;
+                if (cv.coverTexture > 0) AddTexture(cv.coverTexture, wk);
             }
             if (b.covered <= 0.0f) return b;
             const float inv = 1.0f / b.covered;
             b.depth = sum[0] * inv; b.maxSlope = sum[1] * inv; b.slopeFade = sum[2] * inv;
             b.drift = sum[3] * inv; b.breakup = sum[4] * inv;
             b.tint[0] = sum[5] * inv; b.tint[1] = sum[6] * inv; b.tint[2] = sum[7] * inv; b.tintStrength = sum[8] * inv;
-            for (int t = 0; t < covertable::kMaxCoverTextures; ++t) b.tex[t] = sum[9 + t] * inv;
+            for (int t = 0; t < b.texCount; ++t) b.texShare[t] *= inv;
             return b;
         }
 
@@ -583,13 +603,17 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 L.breakup[s] = breakup; L.drift[s] = drift; L.edgeNoise[s] = edge;
                 L.coverDirty = true;
             }
-            uint32_t texW[2];
-            for (int q = 0; q < 2; ++q)
-                texW[q] = (static_cast<uint32_t>(ToByte(b.tex[q * 4 + 3])) << 24) | (static_cast<uint32_t>(ToByte(b.tex[q * 4 + 0])) << 16) |
-                          (static_cast<uint32_t>(ToByte(b.tex[q * 4 + 1])) << 8) | ToByte(b.tex[q * 4 + 2]);
-            if (tint != L.tint[s] || texW[0] != L.texWeights[0][s] || texW[1] != L.texWeights[1][s])
+            int a = -1, c = -1; // the two strongest
+            for (int i = 0; i < b.texCount; ++i)
             {
-                L.tint[s] = tint; L.texWeights[0][s] = texW[0]; L.texWeights[1][s] = texW[1];
+                if (a < 0 || b.texShare[i] > b.texShare[a]) { c = a; a = i; }
+                else if (c < 0 || b.texShare[i] > b.texShare[c]) c = i;
+            }
+            const uint32_t ids = (a >= 0 ? static_cast<uint32_t>(b.texId[a]) & 0xFFFF : 0) | (c >= 0 ? (static_cast<uint32_t>(b.texId[c]) & 0xFFFF) << 16 : 0);
+            const uint16_t shares = static_cast<uint16_t>((a >= 0 ? ToByte(b.texShare[a]) : 0) | (c >= 0 ? ToByte(b.texShare[c]) << 8 : 0));
+            if (tint != L.tint[s] || ids != L.texIds[s] || shares != L.texShares[s])
+            {
+                L.tint[s] = tint; L.texIds[s] = ids; L.texShares[s] = shares;
                 L.lookDirty = true;
             }
             if (isLevel0 && fresh) { g_press[s] = 0.0f; g_rim[s] = 0.0f; }
@@ -749,7 +773,11 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
             rel(g_vb); rel(g_ib); rel(g_decl); rel(g_vs); rel(g_ps);
             for (Level& L : g_levels) { rel(L.baseTex); rel(L.coverTex); rel(L.lookTex); rel(L.texWTex[0]); rel(L.texWTex[1]); L.baseDirty = L.coverDirty = L.lookDirty = true; }
-            for (IDirect3DTexture9*& t : g_coverTextures) rel(t);
+            for (auto& e : g_textureCache) if (e.second) e.second->Release();
+            g_textureCache.clear();
+            for (IDirect3DTexture9*& t : g_coverTextures) t = nullptr;
+            for (int& t : g_slotId) t = 0;
+            g_slotOfId.clear();
             g_coverTexturesGeneration = 0;
         }
 
@@ -851,27 +879,102 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             return true;
         }
 
-        // (Re)loads the table's cover textures when the table changed.
+        // The slots follow what's in view: about once a second the loaded rings are counted
+        // (sparsely) by cover texture ID, and the 8 most present IDs hold the slots. An ID keeps
+        // its slot while it stays among them, so nothing jumps. Textures load on demand and stay in
+        // a small cache, so walking back and forth doesn't reload them.
+        IDirect3DTexture9* CachedTexture(IDirect3DDevice9* dev, int id)
+        {
+            auto found = g_textureCache.find(id);
+            if (found != g_textureCache.end()) return found->second;
+            if (g_textureCache.size() >= 16)
+                for (auto it = g_textureCache.begin(); it != g_textureCache.end(); ++it)
+                {
+                    bool resident = false;
+                    for (int t : g_slotId) resident |= t == it->first;
+                    if (resident) continue;
+                    if (it->second) it->second->Release();
+                    g_textureCache.erase(it);
+                    break;
+                }
+            std::string error;
+            IDirect3DTexture9* tex = blp::Load(dev, covertable::CoverTexturePath(id), error);
+            g_textureStatus[id] = tex ? "loaded" : error;
+            if (!tex) g_api->Log(WXL_LOG_WARN, kTag, "surface cover: CoverTexture \"%s\": %s", covertable::CoverTexturePath(id), error.c_str());
+            g_textureCache[id] = tex;
+            return tex;
+        }
+
         void EnsureCoverTextures(IDirect3DDevice9* dev)
         {
-            if (g_coverTexturesGeneration == covertable::Generation()) return;
-            g_coverTexturesGeneration = covertable::Generation();
-            for (int t = 0; t < covertable::kMaxCoverTextures; ++t)
+            if (g_coverTexturesGeneration != covertable::Generation())
             {
-                if (g_coverTextures[t]) { g_coverTextures[t]->Release(); g_coverTextures[t] = nullptr; }
-                g_coverTextureStatus[t].clear();
-                if (t >= covertable::CoverTextureCount()) continue;
-                std::string error;
-                g_coverTextures[t] = blp::Load(dev, covertable::CoverTexturePath(t + 1), error);
-                g_coverTextureStatus[t] = g_coverTextures[t] ? "loaded" : error;
-                if (!g_coverTextures[t])
-                    g_api->Log(WXL_LOG_WARN, kTag, "surface cover: CoverTexture \"%s\": %s", covertable::CoverTexturePath(t + 1), error.c_str());
+                g_coverTexturesGeneration = covertable::Generation();
+                for (auto& e : g_textureCache) if (e.second) e.second->Release();
+                g_textureCache.clear();
+                g_textureStatus.clear();
+                for (int& t : g_slotId) t = 0;
+                g_slotFrame = 0; // recount now
             }
+            if (g_slotFrame > 0 && --g_slotFrame > 0) return;
+            g_slotFrame = 60;
+
+            const int ids = covertable::CoverTextureCount();
+            std::vector<unsigned> count(static_cast<size_t>(ids) + 1, 0);
+            for (const Level& L : g_levels)
+            {
+                if (!L.haveGrid) continue;
+                for (int sl = 0; sl < kTex * kTex; sl += 7) // sparse is plenty for "which are around"
+                    for (int k = 0; k < 2; ++k)
+                    {
+                        const int id = static_cast<int>((L.texIds[sl] >> (16 * k)) & 0xFFFF);
+                        if (id > 0 && id <= ids && ((L.texShares[sl] >> (8 * k)) & 0xFF)) ++count[id];
+                    }
+            }
+            std::vector<int> wanted;
+            for (int id = 1; id <= ids; ++id) if (count[id]) wanted.push_back(id);
+            std::sort(wanted.begin(), wanted.end(), [&](int x, int y) { return count[x] > count[y]; });
+            g_texturesInView = static_cast<unsigned>(wanted.size());
+            if (wanted.size() > static_cast<size_t>(covertable::kMaxCoverTextures)) wanted.resize(covertable::kMaxCoverTextures);
+
+            bool changed = false;
+            for (int& t : g_slotId) // residents not wanted any more free their slot
+                if (t && std::find(wanted.begin(), wanted.end(), t) == wanted.end()) { t = 0; changed = true; }
+            for (int id : wanted)
+            {
+                if (std::find(std::begin(g_slotId), std::end(g_slotId), id) != std::end(g_slotId)) continue;
+                for (int& t : g_slotId) if (!t) { t = id; changed = true; break; }
+            }
+            if (!changed && g_slotOfId.size() == static_cast<size_t>(ids) + 1) return;
+
+            g_slotOfId.assign(static_cast<size_t>(ids) + 1, -1);
+            for (int sl = 0; sl < covertable::kMaxCoverTextures; ++sl)
+            {
+                g_coverTextures[sl] = g_slotId[sl] ? CachedTexture(dev, g_slotId[sl]) : nullptr;
+                if (g_slotId[sl] && g_slotId[sl] <= ids) g_slotOfId[g_slotId[sl]] = sl;
+            }
+            ++g_slotGeneration;
         }
 
         bool UploadLook(Level& L)
         {
+            if (L.slotsUploaded != g_slotGeneration) L.lookDirty = true;
             if (!L.lookDirty) return true;
+            // The cells' cover texture IDs -> weights of whichever slots hold those IDs now.
+            for (int sl = 0; sl < kTex * kTex; ++sl)
+            {
+                uint8_t w[8] = {};
+                for (int k = 0; k < 2; ++k)
+                {
+                    const int id = static_cast<int>((L.texIds[sl] >> (16 * k)) & 0xFFFF);
+                    const int slot = id > 0 && id < static_cast<int>(g_slotOfId.size()) ? g_slotOfId[id] : -1;
+                    if (slot >= 0) w[slot] = static_cast<uint8_t>((L.texShares[sl] >> (8 * k)) & 0xFF);
+                }
+                for (int q = 0; q < 2; ++q)
+                    L.texWeights[q][sl] = (static_cast<uint32_t>(w[q * 4 + 3]) << 24) | (static_cast<uint32_t>(w[q * 4]) << 16) |
+                                          (static_cast<uint32_t>(w[q * 4 + 1]) << 8) | w[q * 4 + 2];
+            }
+            L.slotsUploaded = g_slotGeneration;
             IDirect3DTexture9* const textures[3] = { L.lookTex, L.texWTex[0], L.texWTex[1] };
             const std::vector<uint32_t>* const data[3] = { &L.tint, &L.texWeights[0], &L.texWeights[1] };
             for (int t = 0; t < 3; ++t)
@@ -986,6 +1089,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             if (!graphics || !wxl::game::gfx::SceneMatrices(V, P)) { g_inactive = "no scene matrices"; return; }
             std::memcpy(P, static_cast<const uint8_t*>(graphics) + kDeviceRenderProjection, sizeof(P));
 
+            EnsureCoverTextures(dev);
             double t0 = grassperf::Now();
             for (int k = 0; k < levels; ++k)
                 if (g_levels[k].haveGrid && !UploadLevel(g_levels[k], k == 0)) { g_inactive = "texture upload failed"; return; }
@@ -1072,7 +1176,6 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
 
             // Cover textures: tiled in world space; the offset keeps the uv small (the scene is drawn
             // about the camera, so positions arrive camera-relative).
-            EnsureCoverTextures(dev);
             const float inv = 1.0f / kCoverTextureTile;
             const float c7[4] = { inv, eye[0] * inv - std::floor(eye[0] * inv), eye[1] * inv - std::floor(eye[1] * inv), 0.0f };
             dev->SetPixelShaderConstantF(7, c7, 1);
@@ -1248,10 +1351,15 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             g_api->UiText(line);
             g_api->UiSameLine();
             if (g_api->UiButton("Reload table")) covertable::Load(g_cdbcApi);
-            for (int t = 0; t < covertable::CoverTextureCount(); ++t)
+            std::snprintf(line, sizeof(line), "  cover textures in view: %u (slots: %d)%s", g_texturesInView, covertable::kMaxCoverTextures,
+                          g_texturesInView > static_cast<unsigned>(covertable::kMaxCoverTextures) ? " -- the least present ones draw without their texture" : "");
+            g_api->UiText(line);
+            for (int sl = 0; sl < covertable::kMaxCoverTextures; ++sl)
             {
-                std::snprintf(line, sizeof(line), "  cover texture %d: \"%s\" -- %s", t + 1, covertable::CoverTexturePath(t + 1),
-                              g_coverTextureStatus[t].empty() ? "not loaded yet" : g_coverTextureStatus[t].c_str());
+                if (!g_slotId[sl]) continue;
+                auto st = g_textureStatus.find(g_slotId[sl]);
+                std::snprintf(line, sizeof(line), "  slot %d: \"%s\" -- %s", sl + 1, covertable::CoverTexturePath(g_slotId[sl]),
+                              st == g_textureStatus.end() ? "?" : st->second.c_str());
                 g_api->UiText(line);
             }
             std::vector<std::string> lines;

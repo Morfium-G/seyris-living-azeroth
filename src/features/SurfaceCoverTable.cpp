@@ -156,8 +156,7 @@ namespace wxl_livingazeroth::covertable
                 const std::string key = Normalize(cover.c_str());
                 int slot = 0;
                 for (size_t k = 0; k < g_coverPaths.size(); ++k) if (Normalize(g_coverPaths[k].c_str()) == key) slot = static_cast<int>(k) + 1;
-                if (!slot && g_coverPaths.size() < static_cast<size_t>(kMaxCoverTextures)) { g_coverPaths.push_back(cover); slot = static_cast<int>(g_coverPaths.size()); }
-                if (!slot) ++g_coverOverflow;
+                if (!slot) { g_coverPaths.push_back(cover); slot = static_cast<int>(g_coverPaths.size()); }
                 r.coverTexture = slot;
             }
             g_rows[{ scope, id }].push_back(r);
@@ -166,8 +165,7 @@ namespace wxl_livingazeroth::covertable
         cdbc->Release(table);
 
         char line[160];
-        std::snprintf(line, sizeof(line), "%u row(s) loaded, %u cover texture(s)%s", g_rowCount, static_cast<unsigned>(g_coverPaths.size()),
-                      g_coverOverflow ? "; MORE distinct CoverTexture paths than slots: the extra ones get no texture" : "");
+        std::snprintf(line, sizeof(line), "%u row(s) loaded, %u cover texture(s)", g_rowCount, static_cast<unsigned>(g_coverPaths.size()));
         g_status = line;
     }
 
