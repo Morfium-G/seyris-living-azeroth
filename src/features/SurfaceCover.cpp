@@ -2,6 +2,7 @@
 
 #include "../env/Actors.hpp"
 #include "../env/TerrainHeight.hpp"
+#include "../render/BlpTexture.hpp"
 #include "GrassPerf.hpp"
 #include "SurfaceCoverTable.hpp"
 
@@ -103,6 +104,9 @@ namespace wxl_livingazeroth::cover
             std::vector<uint8_t>  drift = std::vector<uint8_t>(kTex * kTex, 128);
             std::vector<uint8_t>  edgeNoise = std::vector<uint8_t>(kTex * kTex, 128);
             std::vector<uint32_t> tint = std::vector<uint32_t>(kTex * kTex, 0);
+            // How much of each cover texture slot, blended like the rest: texWeights[0] r..a = slots
+            // 1..4, texWeights[1] r..a = slots 5..8. Read (filtered) in the pixel shader.
+            std::vector<uint32_t> texWeights[2] = { std::vector<uint32_t>(kTex * kTex, 0), std::vector<uint32_t>(kTex * kTex, 0) };
             bool lookDirty = true;
             int boostRows = 0;              // rows left to re-sample at full speed after a setting change
             bool  haveGrid = false;         // drawn: its grid at gridI/gridJ is filled
@@ -124,6 +128,7 @@ namespace wxl_livingazeroth::cover
             IDirect3DTexture9* baseTex = nullptr;
             IDirect3DTexture9* coverTex = nullptr;
             IDirect3DTexture9* lookTex = nullptr;  // A8R8G8B8 tint per slot (when the GPU can fetch it in the VS)
+            IDirect3DTexture9* texWTex[2] = {};    // A8R8G8B8 cover texture weights (pixel shader, always available)
         };
         Level g_levels[kMaxLevels];
 
@@ -160,6 +165,13 @@ namespace wxl_livingazeroth::cover
         std::string        g_hereTexture;
         bool               g_hereValid = false;
         bool               g_tintSupported = false;
+
+        // CoverTexture slots from the table, loaded from the client's archives into textures of
+        // our own; reloaded when the table is.
+        IDirect3DTexture9* g_coverTextures[covertable::kMaxCoverTextures] = {};
+        std::string        g_coverTextureStatus[covertable::kMaxCoverTextures];
+        uint32_t           g_coverTexturesGeneration = 0;
+        constexpr float    kCoverTextureTile = 33.3333333f / 8.0f; // one repeat per terrain cell, like the terrain's layers
         const void* g_cdbcApi = nullptr;
         uint32_t    g_tableGeneration = 0;
 
@@ -186,7 +198,9 @@ namespace wxl_livingazeroth::cover
         // Under the player, for the panel: the layer weights both ways round and the client's own
         // dominant layer (the check that the alpha maps are read the right way round).
         terrain::LayerWeights g_hereLayers, g_hereLayersSwapped;
+        std::string g_hereLayerTexture[4]; // own copies for the panel (the cache can drop the originals)
         bool g_hereLayersValid = false;
+        bool g_wasInWorld = false;
         int g_mapNow = -1;
 
         // The terrain's lighting and fog as last read (for the panel): VS c12 fog, c24 sun direction
@@ -251,9 +265,10 @@ sampler2D baseTex : register(s0);
 sampler2D coverTex : register(s1);
 sampler2D lookTex : register(s2);
 
-struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1; float2 rel : TEXCOORD2; float fog : TEXCOORD3; float4 tint : TEXCOORD4; };
+struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1; float2 rel : TEXCOORD2; float fog : TEXCOORD3; float4 tint : TEXCOORD4; float2 wuv : TEXCOORD5; };
 
 float4 Tint(float2 idx) { return look.x > 0.5 ? tex2Dlod(lookTex, float4((idx + 0.5) * grid.w, 0, 0)) : 0; }
+
 
 float Cheb(float2 idx) { float2 a = abs(idx - lod.xy); return max(a.x, a.y); }
 float Fade(float2 idx) { return fade.z > 0.5 ? saturate((fade.y - Cheb(idx)) / (fade.y - fade.x)) : 1; }
@@ -282,6 +297,7 @@ VOut main(float2 ij : POSITION)
     float3 p, n; float2 s;
     Vertex(idx, 1, p, n, s);
     o.tint = Tint(idx);
+    o.wuv = (idx + 0.5) * grid.w;
 
     // Border band: odd vertices slide onto their even neighbours, so the edge becomes the coarser
     // level's triangles.
@@ -294,8 +310,9 @@ VOut main(float2 ij : POSITION)
         // Fully morphed takes the coarser vertex exactly: lerp(p, p1, 1) = p + (p1 - p) rounds off p1
         // at world-sized coordinates, and the two levels' edges no longer meet (hairline cracks).
         float4 t1 = Tint(idx - odd);
-        if (m >= 1) { p = p1; n = n1; s = s1; o.tint = t1; }
-        else        { p = lerp(p, p1, m); n = lerp(normalize(n), normalize(n1), m); s = lerp(s, s1, m); o.tint = lerp(o.tint, t1, m); }
+        float2 w1 = (idx - odd + 0.5) * grid.w;
+        if (m >= 1) { p = p1; n = n1; s = s1; o.tint = t1; o.wuv = w1; }
+        else        { p = lerp(p, p1, m); n = lerp(normalize(n), normalize(n1), m); s = lerp(s, s1, m); o.tint = lerp(o.tint, t1, m); o.wuv = lerp(o.wuv, w1, m); }
     }
 
     // Far away the client draws simpler terrain than its heights, which pokes through a thin
@@ -330,8 +347,19 @@ float4 inner : register(c3);
 float4 ambient : register(c4);
 float4 diffuse : register(c5);
 float4 fogColor : register(c6);
+float4 texMap : register(c7);   // 1 / tile size (yd), uv offset (x, y): uv = rel * x + yz
+sampler2D cover0 : register(s0);
+sampler2D cover1 : register(s1);
+sampler2D cover2 : register(s2);
+sampler2D cover3 : register(s3);
+sampler2D cover4 : register(s4);
+sampler2D cover5 : register(s5);
+sampler2D cover6 : register(s6);
+sampler2D cover7 : register(s7);
+sampler2D weights0 : register(s8); // slots 1..4 (r..a)
+sampler2D weights1 : register(s9); // slots 5..8
 
-float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float fog : TEXCOORD3, float4 tint : TEXCOORD4) : COLOR
+float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float fog : TEXCOORD3, float4 tint : TEXCOORD4, float2 wuv : TEXCOORD5) : COLOR
 {
     clip(d.x - opts.x);
     clip(0.5 - d.y);
@@ -339,7 +367,15 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
     clip(0.5 - a.x * a.y);
     float ndl = saturate(dot(normalize(n), normalize(light.xyz)));
     float3 lit = min(ambient.rgb + diffuse.rgb * ndl, 1);
-    float3 colour = lerp(albedo.rgb, tint.rgb, saturate(tint.a));
+    // Cover textures, tiled in world space like the terrain's layers, mixed by their share here
+    // (two filtered weight textures, slots 1..8); the plain cover colour fills the rest.
+    float2 uv = rel * texMap.x + texMap.yz;
+    float4 w = tex2D(weights0, wuv), v = tex2D(weights1, wuv);
+    float3 textured = tex2D(cover0, uv).rgb * w.r + tex2D(cover1, uv).rgb * w.g + tex2D(cover2, uv).rgb * w.b + tex2D(cover3, uv).rgb * w.a
+                    + tex2D(cover4, uv).rgb * v.r + tex2D(cover5, uv).rgb * v.g + tex2D(cover6, uv).rgb * v.b + tex2D(cover7, uv).rgb * v.a;
+    float share = saturate(dot(w, 1) + dot(v, 1));
+    float3 base = albedo.rgb * (1 - share) + textured * albedo.w;
+    float3 colour = lerp(base, tint.rgb, saturate(tint.a));
     return float4(lerp(fogColor.rgb, colour * lit, fog), 1);
 }
 )";
@@ -377,6 +413,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         {
             float covered = 0.0f, depth = 0.0f, maxSlope = 45.0f, slopeFade = 15.0f, drift = 0.0f, breakup = 0.5f;
             float tint[3] = {}, tintStrength = 0.0f;
+            float tex[covertable::kMaxCoverTextures] = {}; // share of each cover texture slot
         };
 
         const std::array<covertable::Values, 4>& LayerValues(const terrain::LayerWeights& lw)
@@ -396,7 +433,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         // From the painted strength of every texture layer: each layer's row values, weighted by
         // how strongly it's painted here (alpha maps, ~0.5 yd). Edges follow what was painted, and
         // two materials painted over each other mix.
-        void AccumulateLayers(float x, float y, float& covered, float sum[9])
+        void AccumulateLayers(float x, float y, float& covered, float sum[9 + covertable::kMaxCoverTextures])
         {
             terrain::LayerWeights lw;
             if (!terrain::LayerWeightsAt(x, y, lw, g_settings.alphaSwap != 0)) return;
@@ -413,6 +450,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 sum[6] += wk * ((cv.tintColor >> 8) & 0xFF) / 255.0f;
                 sum[7] += wk * (cv.tintColor & 0xFF) / 255.0f;
                 sum[8] += wk * cv.tintStrength;
+                if (cv.coverTexture > 0 && cv.coverTexture <= covertable::kMaxCoverTextures) sum[8 + cv.coverTexture] += wk;
             }
         }
 
@@ -428,13 +466,14 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             }
             if (g_settings.materialSource == 0)
             {
-                float sum[9] = {};
+                float sum[9 + covertable::kMaxCoverTextures] = {};
                 AccumulateLayers(x, y, b.covered, sum);
                 if (b.covered <= 0.0f) return b;
                 const float inv = 1.0f / b.covered;
                 b.depth = sum[0] * inv; b.maxSlope = sum[1] * inv; b.slopeFade = sum[2] * inv;
                 b.drift = sum[3] * inv; b.breakup = sum[4] * inv;
                 b.tint[0] = sum[5] * inv; b.tint[1] = sum[6] * inv; b.tint[2] = sum[7] * inv; b.tintStrength = sum[8] * inv;
+                for (int t = 0; t < covertable::kMaxCoverTextures; ++t) b.tex[t] = sum[9 + t] * inv;
                 if (b.covered > 1.0f) b.covered = 1.0f;
                 return b;
             }
@@ -443,7 +482,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             const float fx = u - cx, fy = v - cy;
             const int c[4][2] = { { cx, cy }, { cx + 1, cy }, { cx, cy + 1 }, { cx + 1, cy + 1 } };
             const float w[4] = { (1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy };
-            float sum[9] = {};
+            float sum[9 + covertable::kMaxCoverTextures] = {};
             for (int k = 0; k < 4; ++k)
             {
                 covertable::Values cv;
@@ -456,12 +495,14 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 sum[6] += wk * ((cv.tintColor >> 8) & 0xFF) / 255.0f;
                 sum[7] += wk * (cv.tintColor & 0xFF) / 255.0f;
                 sum[8] += wk * cv.tintStrength;
+                if (cv.coverTexture > 0 && cv.coverTexture <= covertable::kMaxCoverTextures) sum[8 + cv.coverTexture] += wk;
             }
             if (b.covered <= 0.0f) return b;
             const float inv = 1.0f / b.covered;
             b.depth = sum[0] * inv; b.maxSlope = sum[1] * inv; b.slopeFade = sum[2] * inv;
             b.drift = sum[3] * inv; b.breakup = sum[4] * inv;
             b.tint[0] = sum[5] * inv; b.tint[1] = sum[6] * inv; b.tint[2] = sum[7] * inv; b.tintStrength = sum[8] * inv;
+            for (int t = 0; t < covertable::kMaxCoverTextures; ++t) b.tex[t] = sum[9 + t] * inv;
             return b;
         }
 
@@ -542,7 +583,15 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 L.breakup[s] = breakup; L.drift[s] = drift; L.edgeNoise[s] = edge;
                 L.coverDirty = true;
             }
-            if (tint != L.tint[s]) { L.tint[s] = tint; L.lookDirty = true; }
+            uint32_t texW[2];
+            for (int q = 0; q < 2; ++q)
+                texW[q] = (static_cast<uint32_t>(ToByte(b.tex[q * 4 + 3])) << 24) | (static_cast<uint32_t>(ToByte(b.tex[q * 4 + 0])) << 16) |
+                          (static_cast<uint32_t>(ToByte(b.tex[q * 4 + 1])) << 8) | ToByte(b.tex[q * 4 + 2]);
+            if (tint != L.tint[s] || texW[0] != L.texWeights[0][s] || texW[1] != L.texWeights[1][s])
+            {
+                L.tint[s] = tint; L.texWeights[0][s] = texW[0]; L.texWeights[1][s] = texW[1];
+                L.lookDirty = true;
+            }
             if (isLevel0 && fresh) { g_press[s] = 0.0f; g_rim[s] = 0.0f; }
         }
 
@@ -699,7 +748,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         {
             auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
             rel(g_vb); rel(g_ib); rel(g_decl); rel(g_vs); rel(g_ps);
-            for (Level& L : g_levels) { rel(L.baseTex); rel(L.coverTex); rel(L.lookTex); L.baseDirty = L.coverDirty = L.lookDirty = true; }
+            for (Level& L : g_levels) { rel(L.baseTex); rel(L.coverTex); rel(L.lookTex); rel(L.texWTex[0]); rel(L.texWTex[1]); L.baseDirty = L.coverDirty = L.lookDirty = true; }
+            for (IDirect3DTexture9*& t : g_coverTextures) rel(t);
+            g_coverTexturesGeneration = 0;
         }
 
         void* Compile(IDirect3DDevice9* dev, const char* hlsl, const char* target, bool pixel)
@@ -743,7 +794,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             if (dev != g_device) { ReleaseGpu(); g_gpuFailed = false; g_device = dev; }
             if (g_gpuFailed) return false;
             bool texturesReady = true;
-            for (const Level& L : g_levels) texturesReady &= L.baseTex && L.coverTex && (!g_tintSupported || L.lookTex);
+            for (const Level& L : g_levels) texturesReady &= L.baseTex && L.coverTex && L.texWTex[0] && L.texWTex[1] && (!g_tintSupported || L.lookTex);
             if (g_vb && g_ib && g_decl && g_vs && g_ps && texturesReady) return true;
             ReleaseGpu();
 
@@ -789,6 +840,10 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 for (Level& L : g_levels)
                     if (FAILED(dev->CreateTexture(kTex, kTex, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &L.lookTex, nullptr)))
                     { L.lookTex = nullptr; g_tintSupported = false; }
+            for (Level& L : g_levels)
+                for (IDirect3DTexture9*& t : L.texWTex)
+                    if (FAILED(dev->CreateTexture(kTex, kTex, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &t, nullptr)))
+                        return fail("cover texture weight textures failed");
 
             g_vs = static_cast<IDirect3DVertexShader9*>(Compile(dev, kVsHlsl, "vs_3_0", false));
             g_ps = static_cast<IDirect3DPixelShader9*>(Compile(dev, kPsHlsl, "ps_3_0", true));
@@ -796,14 +851,38 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             return true;
         }
 
+        // (Re)loads the table's cover textures when the table changed.
+        void EnsureCoverTextures(IDirect3DDevice9* dev)
+        {
+            if (g_coverTexturesGeneration == covertable::Generation()) return;
+            g_coverTexturesGeneration = covertable::Generation();
+            for (int t = 0; t < covertable::kMaxCoverTextures; ++t)
+            {
+                if (g_coverTextures[t]) { g_coverTextures[t]->Release(); g_coverTextures[t] = nullptr; }
+                g_coverTextureStatus[t].clear();
+                if (t >= covertable::CoverTextureCount()) continue;
+                std::string error;
+                g_coverTextures[t] = blp::Load(dev, covertable::CoverTexturePath(t + 1), error);
+                g_coverTextureStatus[t] = g_coverTextures[t] ? "loaded" : error;
+                if (!g_coverTextures[t])
+                    g_api->Log(WXL_LOG_WARN, kTag, "surface cover: CoverTexture \"%s\": %s", covertable::CoverTexturePath(t + 1), error.c_str());
+            }
+        }
+
         bool UploadLook(Level& L)
         {
-            if (!L.lookTex || !L.lookDirty) return true;
-            D3DLOCKED_RECT lr{};
-            if (FAILED(L.lookTex->LockRect(0, &lr, nullptr, 0))) return false;
-            for (int row = 0; row < kTex; ++row)
-                std::memcpy(static_cast<uint8_t*>(lr.pBits) + row * lr.Pitch, &L.tint[row * kTex], kTex * 4);
-            L.lookTex->UnlockRect(0);
+            if (!L.lookDirty) return true;
+            IDirect3DTexture9* const textures[3] = { L.lookTex, L.texWTex[0], L.texWTex[1] };
+            const std::vector<uint32_t>* const data[3] = { &L.tint, &L.texWeights[0], &L.texWeights[1] };
+            for (int t = 0; t < 3; ++t)
+            {
+                if (!textures[t]) continue;
+                D3DLOCKED_RECT lr{};
+                if (FAILED(textures[t]->LockRect(0, &lr, nullptr, 0))) return false;
+                for (int row = 0; row < kTex; ++row)
+                    std::memcpy(static_cast<uint8_t*>(lr.pBits) + row * lr.Pitch, &(*data[t])[row * kTex], kTex * 4);
+                textures[t]->UnlockRect(0);
+            }
             L.lookDirty = false;
             return true;
         }
@@ -969,7 +1048,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             float vs9[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 1, 1, 0 }; // c9..c11 rows, c12 fog (none)
             float ps0[28] = {
                 0.35f, 0.45f, 0.82f, 0.0f,       // c0 light direction
-                a, a * 1.02f, a * 1.07f, 1.0f,   // c1 snow colour (a touch blue)
+                a, a * 1.02f, a * 1.07f, a,      // c1 snow colour (a touch blue); w = brightness on cover textures
                 0.004f, 0.0f, 0.0f, 0.0f,        // c2 smallest depth drawn (no z-fighting with the terrain)
                 0.0f, 0.0f, 0.0f, 0.0f,          // c3 inner box (set per level)
                 0.45f, 0.45f, 0.45f, 0.0f,       // c4 ambient
@@ -990,6 +1069,23 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             const float c13[4] = { g_tintSupported ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
             dev->SetVertexShaderConstantF(13, c13, 1);
             dev->SetPixelShaderConstantF(0, ps0, 7);
+
+            // Cover textures: tiled in world space; the offset keeps the uv small (the scene is drawn
+            // about the camera, so positions arrive camera-relative).
+            EnsureCoverTextures(dev);
+            const float inv = 1.0f / kCoverTextureTile;
+            const float c7[4] = { inv, eye[0] * inv - std::floor(eye[0] * inv), eye[1] * inv - std::floor(eye[1] * inv), 0.0f };
+            dev->SetPixelShaderConstantF(7, c7, 1);
+            for (int t = 0; t < covertable::kMaxCoverTextures; ++t)
+            {
+                dev->SetTexture(t, g_coverTextures[t]);
+                dev->SetSamplerState(t, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+                dev->SetSamplerState(t, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+                dev->SetSamplerState(t, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+                dev->SetSamplerState(t, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+                dev->SetSamplerState(t, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+                dev->SetSamplerState(t, D3DSAMP_SRGBTEXTURE, FALSE);
+            }
 
             dev->SetVertexDeclaration(g_decl);
             dev->SetStreamSource(0, g_vb, 0, 8);
@@ -1030,6 +1126,16 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, L.baseTex);
                 dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, L.coverTex);
                 dev->SetTexture(D3DVERTEXTEXTURESAMPLER2, g_tintSupported ? L.lookTex : nullptr);
+                for (int q = 0; q < 2; ++q)
+                {
+                    dev->SetTexture(8 + q, L.texWTex[q]);
+                    dev->SetSamplerState(8 + q, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+                    dev->SetSamplerState(8 + q, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+                    dev->SetSamplerState(8 + q, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+                    dev->SetSamplerState(8 + q, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+                    dev->SetSamplerState(8 + q, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+                    dev->SetSamplerState(8 + q, D3DSAMP_SRGBTEXTURE, FALSE);
+                }
 
                 const float c5[4] = { static_cast<float>(L.gridI + kHalfCells), static_cast<float>(L.gridJ + kHalfCells),
                                       static_cast<float>(kHalfCells), outermost ? 0.0f : static_cast<float>(kMorphCells) };
@@ -1067,6 +1173,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, nullptr);
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER2, nullptr);
+            for (int t = 0; t < covertable::kMaxCoverTextures + 2; ++t) dev->SetTexture(t, nullptr);
             if (swapDepth) dev->SetDepthStencilSurface(oldDepth);
             if (oldDepth) oldDepth->Release();
             saved->Apply(); // includes the viewport
@@ -1141,6 +1248,12 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             g_api->UiText(line);
             g_api->UiSameLine();
             if (g_api->UiButton("Reload table")) covertable::Load(g_cdbcApi);
+            for (int t = 0; t < covertable::CoverTextureCount(); ++t)
+            {
+                std::snprintf(line, sizeof(line), "  cover texture %d: \"%s\" -- %s", t + 1, covertable::CoverTexturePath(t + 1),
+                              g_coverTextureStatus[t].empty() ? "not loaded yet" : g_coverTextureStatus[t].c_str());
+                g_api->UiText(line);
+            }
             std::vector<std::string> lines;
             auto add = [&lines, &line]() { lines.emplace_back(line); };
             if (const char* why = g_settings.enabled ? g_inactive : "switched off") { std::snprintf(line, sizeof(line), "not drawing: %s", why); add(); }
@@ -1163,8 +1276,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 std::snprintf(line, sizeof(line), "here: texture \"%s\", ground effect %u, TerrainType %d, area %u",
                               g_hereTexture.c_str(), g_hereSurface.groundEffect, g_hereSurface.terrainType, g_hereSurface.area); add();
                 const covertable::Values& v = g_hereValues;
-                std::snprintf(line, sizeof(line), "here (table): depth %.2f, max slope %.0f, fade %.0f, drift %.2f, breakup %.2f, rim %.2f, relax %.0f s, tint %08X x %.2f",
-                              v.depth, v.maxSlope, v.slopeFade, v.driftNoise, v.edgeBreakup, v.rim, v.relaxSeconds, v.tintColor, v.tintStrength); add();
+                std::snprintf(line, sizeof(line), "here (table): depth %.2f, max slope %.0f, fade %.0f, drift %.2f, breakup %.2f, rim %.2f, relax %.0f s, tint %08X x %.2f, cover texture %d",
+                              v.depth, v.maxSlope, v.slopeFade, v.driftNoise, v.edgeBreakup, v.rim, v.relaxSeconds, v.tintColor, v.tintStrength, v.coverTexture); add();
             }
             else { std::snprintf(line, sizeof(line), "here: no terrain under the player"); add(); }
             if (g_hereLayersValid)
@@ -1185,7 +1298,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 {
                     const terrain::Surface& sf = g_hereLayers.surface[l];
                     std::snprintf(line, sizeof(line), "  layer %d: %.2f  \"%s\", effect %u, TerrainType %d", l, g_hereLayers.weight[l],
-                                  sf.texture ? sf.texture : "", sf.groundEffect, sf.terrainType); add();
+                                  g_hereLayerTexture[l].c_str(), sf.groundEffect, sf.terrainType); add();
                 }
             }
             std::snprintf(line, sizeof(line), "CPU: sim %.2f ms, upload %.2f ms, draw submit %.2f ms", g_simMs, g_uploadMs, g_drawMs); add();
@@ -1247,7 +1360,24 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
 
     void Update(float dt, const world::Snapshot& snap)
     {
-        if (!g_settings.enabled || !snap.inWorld) return;
+        // Leaving the world (logout, loading screens without a player) unloads every tile: drop
+        // everything that refers to them, and start over on the way back.
+        if (!snap.inWorld)
+        {
+            if (g_wasInWorld)
+            {
+                terrain::ClearLayerCache();
+                g_layerValues.clear();
+                ClearCellCache();
+                g_hereLayersValid = g_hereValid = false;
+                for (Level& L : g_levels) { L.haveGrid = false; L.jobActive = false; }
+                g_lastMap = -1;
+            }
+            g_wasInWorld = false;
+            return;
+        }
+        g_wasInWorld = true;
+        if (!g_settings.enabled) return;
         if (dt < 0.0f || dt > 0.5f) dt = 0.0f;
         const double t0 = grassperf::Now();
 
@@ -1338,6 +1468,11 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         g_hereValues = here;
         g_hereLayersValid = terrain::LayerWeightsAt(snap.playerPos[0], snap.playerPos[1], g_hereLayers, false) &&
                             terrain::LayerWeightsAt(snap.playerPos[0], snap.playerPos[1], g_hereLayersSwapped, true);
+        for (int l = 0; l < 4; ++l)
+        {
+            g_hereLayerTexture[l] = g_hereLayersValid && l < g_hereLayers.layers && g_hereLayers.surface[l].texture ? g_hereLayers.surface[l].texture : "";
+            g_hereLayers.surface[l].texture = g_hereLayersSwapped.surface[l].texture = nullptr;
+        }
         g_rimShareNow = here.rim * g_settings.rimMul;
         g_relaxNow = here.relaxSeconds * g_settings.relaxMul;
 

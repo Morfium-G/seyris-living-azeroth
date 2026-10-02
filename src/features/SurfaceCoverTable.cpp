@@ -32,7 +32,7 @@ namespace wxl_livingazeroth::covertable
             {"RelaxSeconds",   12, WXL_CDBC_FIELD_VALUE},
             {"TintColor",      13, WXL_CDBC_FIELD_VALUE},
             {"TintStrength",   14, WXL_CDBC_FIELD_VALUE},
-            {"CoverTexture",   15, WXL_CDBC_FIELD_STRING}, // reserved: not used yet
+            {"CoverTexture",   15, WXL_CDBC_FIELD_STRING},
             {"Opacity",        16, WXL_CDBC_FIELD_VALUE},  // reserved: not used yet
             {"Flatten",        17, WXL_CDBC_FIELD_VALUE},  // reserved: not used yet
             {"Flags",          18, WXL_CDBC_FIELD_VALUE},
@@ -55,7 +55,12 @@ namespace wxl_livingazeroth::covertable
             int32_t     terrain = -1; // -1 = any TerrainType (TerrainType 0 is Dirt, so 0 can't mean "any")
             float       value[kFieldCount];
             uint32_t    tintColor = 0;
+            int         coverTexture = -1; // -1 = take it from the next row, 0 = none, 1.. = slot
         };
+
+        // CoverTexture paths in the order the table first names them; slot = index + 1.
+        std::vector<std::string> g_coverPaths;
+        unsigned g_coverOverflow = 0; // rows naming a texture beyond the slots (drawn without one)
 
         // Rows by place: (scope type, scope id) -> rows there.
         std::map<std::pair<uint32_t, uint32_t>, std::vector<Row>> g_rows;
@@ -118,6 +123,8 @@ namespace wxl_livingazeroth::covertable
         g_rows.clear();
         g_cache.clear();
         g_rowCount = 0;
+        g_coverPaths.clear();
+        g_coverOverflow = 0;
         ++g_generation;
 
         const auto* cdbc = static_cast<const WXL_SeyrisCdbcApi*>(cdbcApi);
@@ -140,17 +147,36 @@ namespace wxl_livingazeroth::covertable
             r.terrain = static_cast<int32_t>(cdbc->Value(table, rec, "TerrainType", 0));
             for (int f = 0; f < kFieldCount; ++f) r.value[f] = BitsToFloat(cdbc->Value(table, rec, kFloatColumns[f], 0));
             r.tintColor = cdbc->Value(table, rec, "TintColor", 0);
+            // CoverTexture: empty = from the next row, "-" = none, else a path sharing a slot with
+            // every row that names the same file.
+            const std::string cover = cdbc->GetString(table, rec, "CoverTexture");
+            if (cover == "-") r.coverTexture = 0;
+            else if (!cover.empty())
+            {
+                const std::string key = Normalize(cover.c_str());
+                int slot = 0;
+                for (size_t k = 0; k < g_coverPaths.size(); ++k) if (Normalize(g_coverPaths[k].c_str()) == key) slot = static_cast<int>(k) + 1;
+                if (!slot && g_coverPaths.size() < static_cast<size_t>(kMaxCoverTextures)) { g_coverPaths.push_back(cover); slot = static_cast<int>(g_coverPaths.size()); }
+                if (!slot) ++g_coverOverflow;
+                r.coverTexture = slot;
+            }
             g_rows[{ scope, id }].push_back(r);
             ++g_rowCount;
         }
         cdbc->Release(table);
 
-        char line[96];
-        std::snprintf(line, sizeof(line), "%u row(s) loaded", g_rowCount);
+        char line[160];
+        std::snprintf(line, sizeof(line), "%u row(s) loaded, %u cover texture(s)%s", g_rowCount, static_cast<unsigned>(g_coverPaths.size()),
+                      g_coverOverflow ? "; MORE distinct CoverTexture paths than slots: the extra ones get no texture" : "");
         g_status = line;
     }
 
     unsigned    RowCount()   { return g_rowCount; }
+    int         CoverTextureCount() { return static_cast<int>(g_coverPaths.size()); }
+    const char* CoverTexturePath(int index)
+    {
+        return index >= 1 && index <= static_cast<int>(g_coverPaths.size()) ? g_coverPaths[index - 1].c_str() : "";
+    }
     const char* Status()     { return g_status.c_str(); }
     uint32_t    Generation() { return g_generation; }
 
@@ -170,18 +196,22 @@ namespace wxl_livingazeroth::covertable
         float value[kFieldCount];
         for (float& v : value) v = -1.0f;
         uint32_t tint = 0;
+        int cover = -1;
         for (const auto& place : places)
         {
             auto rows = g_rows.find(place);
             if (rows == g_rows.end()) continue;
             for (int level = 0; level < 4; ++level)
                 if (const Row* r = AtLevel(rows->second, level, key.texture, groundEffectId, terrainType))
+                {
+                    if (cover < 0 && r->coverTexture >= 0) cover = r->coverTexture;
                     for (int f = 0; f < kFieldCount; ++f)
                         if (value[f] < 0.0f && r->value[f] >= 0.0f)
                         {
                             value[f] = r->value[f];
                             if (f == kTint) tint = r->tintColor;
                         }
+                }
         }
 
         Values v; // fields no row sets keep the defaults
@@ -193,6 +223,7 @@ namespace wxl_livingazeroth::covertable
         if (value[kRim] >= 0.0f)      v.rim = value[kRim];
         if (value[kRelax] >= 0.0f)    v.relaxSeconds = value[kRelax];
         if (value[kTint] >= 0.0f)     { v.tintStrength = value[kTint]; v.tintColor = tint; }
+        if (cover > 0)                v.coverTexture = cover;
         if (g_cache.size() > 20000) g_cache.clear();
         g_cache.emplace(std::move(key), v);
         return v;

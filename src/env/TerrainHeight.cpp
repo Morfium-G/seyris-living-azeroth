@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -173,14 +174,20 @@ namespace wxl_livingazeroth::terrain
         }
 
         // --- decoded alpha per chunk -------------------------------------------------------------
+        // A chunk object is reused for another place after a teleport or a tile reload, and the new
+        // tile's buffers can land at the same addresses, so the cached decode is checked against the
+        // chunk's place (its world corner), layer count and data pointers together. The texture names
+        // are copied: the tile's MTEX block they point into is freed with the tile.
         struct DecodedChunk
         {
-            const uint8_t* layers = nullptr; // the MCLY / MCAL the decode came from (a chunk object
-            const uint8_t* alpha = nullptr;  // reused for another place has other ones)
+            const uint8_t* layers = nullptr;
+            const uint8_t* alpha = nullptr;
+            float    cornerX = 0.0f, cornerY = 0.0f;
             unsigned serial = 0;
             int      count = 0;
             std::vector<uint8_t> map;        // layers 1..count-1, 64x64 each (sized to what the chunk has)
             Surface  surface[4];
+            std::string texture[4];          // own copies; surface[l].texture points here
         };
         std::unordered_map<const uint8_t*, DecodedChunk> g_decoded;
         unsigned g_serial = 0;
@@ -224,21 +231,28 @@ namespace wxl_livingazeroth::terrain
             const auto* layers = *reinterpret_cast<const uint8_t* const*>(at.chunk + kChunkLayers);
             const auto* alpha = *reinterpret_cast<const uint8_t* const*>(at.chunk + kChunkAlpha);
             auto found = g_decoded.find(at.chunk);
-            if (found != g_decoded.end() && found->second.layers == layers && found->second.alpha == alpha) return &found->second;
+            const float* corner = reinterpret_cast<const float*>(at.chunk + kChunkCorner);
+            const unsigned count = *reinterpret_cast<const uint32_t*>(at.header + kHeaderLayerCount);
+            const int layerCount = layers ? static_cast<int>(count > 4 ? 4 : count) : 0;
+            if (found != g_decoded.end() && found->second.layers == layers && found->second.alpha == alpha &&
+                found->second.cornerX == corner[0] && found->second.cornerY == corner[1] && found->second.count == layerCount)
+                return &found->second;
 
             // ~1500 chunks lie within the outermost level's reach; a few KB each.
             if (g_decoded.size() > 2500) g_decoded.clear();
             DecodedChunk& d = g_decoded[at.chunk];
             d = DecodedChunk{};
             d.layers = layers; d.alpha = alpha;
+            d.cornerX = corner[0]; d.cornerY = corner[1];
             d.serial = ++g_serial;
-            const unsigned count = *reinterpret_cast<const uint32_t*>(at.header + kHeaderLayerCount);
-            d.count = layers ? static_cast<int>(count > 4 ? 4 : count) : 0;
+            d.count = layerCount;
             const bool fix = !(*reinterpret_cast<const uint32_t*>(at.header + kHeaderFlags) & kMcnkDoNotFixAlpha);
             if (d.count > 1) d.map.assign(static_cast<size_t>(d.count - 1) * 64 * 64, 0);
             for (int l = 0; l < d.count; ++l)
             {
                 LayerSurface(at.chunk, layers, static_cast<unsigned>(l), d.surface[l]);
+                d.texture[l] = d.surface[l].texture ? d.surface[l].texture : "";
+                d.surface[l].texture = d.texture[l].c_str();
                 d.surface[l].area = *reinterpret_cast<const uint32_t*>(at.chunk + kChunkArea);
                 if (l == 0) continue;
                 const uint32_t flags = *reinterpret_cast<const uint32_t*>(layers + l * kLayerStride + kLayerFlags);

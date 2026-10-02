@@ -22,7 +22,15 @@ namespace wxl_livingazeroth::covertable
         float    relaxSeconds = 30.0f; // trench back to flat
         uint32_t tintColor = 0;        // ARGB (alpha unused)
         float    tintStrength = 0.0f;  // 0 = the plain cover colour .. 1 = the tint colour
+        int      coverTexture = 0;     // 0 = none, 1..kMaxCoverTextures = CoverTexturePath(index)
     };
+
+    /// Distinct CoverTexture paths a table can use at once (each is a texture slot when drawing).
+    constexpr int kMaxCoverTextures = 8;
+
+    /// How many CoverTexture slots the loaded table uses, and the path of slot 1..that.
+    int         CoverTextureCount();
+    const char* CoverTexturePath(int index);
 
     /// (Re)loads DBFilesClient\SurfaceCover.cdbc through wxl-seyris-tools' cdbc reader.
     void Load(const void* cdbcApi);

@@ -37,6 +37,7 @@ namespace wxl_livingazeroth::terrain
     };
     bool LayerWeightsAt(float x, float y, LayerWeights& out, bool swapAxes = false);
 
-    /// Forgets every decoded chunk (call when the map changes).
+    /// Forgets every decoded chunk (call when the map changes or the world is left). Texture
+    /// names in LayerWeights from before are invalid afterwards.
     void ClearLayerCache();
 }

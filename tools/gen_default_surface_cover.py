@@ -9,7 +9,8 @@ Columns (see docs/cdbc-tables.md for the full meaning):
   TexturePath (string, empty = any), GroundEffectID (0 = any), TerrainType (-1 = any; 0 is Dirt),
   Depth (yd, 0 = no cover), MaxSlope, SlopeFade (degrees), DriftNoise, EdgeBreakup (0..1),
   Rim (x depth), RelaxSeconds, TintColor (0xRRGGBB), TintStrength (0..1),
-  CoverTexture (string), Opacity, Flatten -- reserved, not used yet --, Flags (0).
+  CoverTexture (string: a BLP on the cover, empty = from the next row, "-" = none; up to 8
+  distinct paths per table), Opacity, Flatten -- reserved, not used yet --, Flags (0).
 Floats; -1 = take this field from the next, less specific row (TintColor goes with
 TintStrength). No row at all = no cover.
 
@@ -52,9 +53,10 @@ DEFAULT_ROWS = [
     # Snow everywhere it's painted: 0.35 yd, bare above ~40 degrees, gentle drifts, ragged edges.
     row(1, GLOBAL, terrain=SNOW, depth=0.35, max_slope=40.0, slope_fade=15.0, drift=0.35, breakup=0.5,
         rim=0.3, relax=30.0, tint_strength=0.0),
-    # Sand: off for now (try Depth 0.08). Flatter, quicker to relax, sandy tint.
+    # Sand: off for now (try Depth 0.08). Flatter, quicker to relax, the Tanaris sand texture on it.
     row(2, GLOBAL, terrain=SAND, depth=0.0, max_slope=30.0, slope_fade=10.0, drift=0.25, breakup=0.7,
-        rim=0.2, relax=8.0, tint_color=0xD8C08A, tint_strength=0.6),
+        rim=0.2, relax=8.0, tint_color=0xD8C08A, tint_strength=0.0,
+        cover_texture=r"Tileset\Tanaris\TanarisSandBase01.blp"),
 ]
 
 EXAMPLE_ROWS = [

@@ -97,14 +97,14 @@ values the table gives there, so rows can be written on the spot.
 | RelaxSeconds | how long a trench takes to fill back in |
 | TintColor | colour as 0xRRGGBB, used with TintStrength |
 | TintStrength | 0 = the plain cover colour .. 1 = TintColor. TintColor comes from the same row |
-| CoverTexture | **reserved, not used yet** (a texture on the cover itself) |
+| CoverTexture | a BLP drawn on the cover, tiled like the terrain's layers (one repeat per terrain cell), e.g. the same texture as the ground it covers. **Empty = from the next row, `-` = none.** Up to 8 different paths per table (the panel says if there are more; extra ones get no texture). TintColor/TintStrength still apply on top |
 | Opacity | **reserved, not used yet** (see-through covers: slush, goo) |
 | Flatten | **reserved, not used yet** (liquid-like covers that fill hollows) |
 | Flags | reserved, 0 |
 
 A float of **-1 takes that field from the next, less specific row**. Fields no row sets use the
 defaults: MaxSlope 45, SlopeFade 15, DriftNoise 0.35, EdgeBreakup 0.5, Rim 0.3, RelaxSeconds 30,
-no tint. No row at all (or Depth 0) = no cover.
+no tint, no cover texture. No row at all (or Depth 0) = no cover.
 
 **The most specific row wins** (workspace rule for scoped tables): place first, then what.
 Places: the terrain cell's own area (sub-zone), its parent zones, the map, global. Within each
