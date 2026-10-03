@@ -1,11 +1,8 @@
-// SurfaceCover.cdbc: which ground gets a cover (snow, sand, ...) and how it looks and behaves, per
-// place and per painted texture.
-//
-// Scoped like every override table in this workspace (orchestration docs/principles.md): the most
-// specific row wins, place first -- the terrain cell's area, its parent zones, the map, global --
-// then within each place TexturePath, GroundEffectID, TerrainType, everything. A field of -1 takes
-// that field from the next row in that order (ZOffset: exactly -1, since other negatives are real
-// offsets). No row at all = no cover; Depth 0 switches it off.
+// SurfaceCover.cdbc: which ground materials get a cover (snow, sand, ...) and how it looks and
+// behaves. Keyed by GroundMaterial ID: where a material lies is GroundMaterialSelector.cdbc's job
+// (GroundMaterialTable.hpp). A field of -1 takes that field from the row of the material's Parent,
+// its parent, ... (ZOffset: exactly -1, since other negatives are real offsets). No material, or no
+// row along its chain = no cover; Depth 0 switches it off.
 #pragma once
 
 #include <cstdint>
@@ -37,6 +34,9 @@ namespace wxl_livingazeroth::covertable
         float    zOffset = 0.0f;       // yd the cover's base sits above (+) or below (-) the terrain
         float    wetness = 0.0f;       // 0 dry .. 1 soaked: darker, glossier
         uint32_t flags = 0;            // Flag bits
+        uint32_t material = 0;         // the ground material (0 = none)
+        uint32_t coverMaterial = 0;    // what lies on top: the row's CoverMaterial, else the ground material
+        float    stiffness = 0.0f;     // the cover material's: 0 feet press it to the ground .. 1 rigid
     };
 
     /// Cover textures drawn at once: the slots go to the textures most present in view.
@@ -49,12 +49,13 @@ namespace wxl_livingazeroth::covertable
     /// CoverTexture named in the same row; the other flags come with Depth).
     bool        CoverTextureIgnoresSpecular(int index);
 
-    /// (Re)loads DBFilesClient\SurfaceCover.cdbc through wxl-seyris-tools' cdbc reader.
+    /// (Re)loads GroundMaterial, GroundMaterialSelector and SurfaceCover through wxl-seyris-tools' cdbc reader.
     void Load(const void* cdbcApi);
 
-    /// The row values for a terrain cell: its chunk's area, the map, its dominant layer's texture
-    /// path (may be null), ground effect and that effect's TerrainType (-1 = none). Fields no row
-    /// sets keep the defaults above. Cached; Generation() changes on reload.
+    /// The cover for a terrain cell: its material (from its chunk's area, the map, the layer's texture
+    /// path (may be null), ground effect and that effect's TerrainType, -1 = none), then that
+    /// material's row along its Parent chain. Fields no row sets keep the defaults above. Cached;
+    /// Generation() changes on reload.
     Values Resolve(uint32_t areaId, int mapId, const char* texturePath, uint32_t groundEffectId, int terrainType);
 
     unsigned    RowCount();

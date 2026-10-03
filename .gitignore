@@ -67,3 +67,7 @@ Testing/
 docs/notes/
 
 # data/*.cdbc is shipped sample data (tracked); the tools/gen_*.py scripts can regenerate a baseline
+
+# Python bytecode (tools/)
+__pycache__/
+*.pyc

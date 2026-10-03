@@ -4,6 +4,7 @@
 #include "../env/TerrainHeight.hpp"
 #include "../render/BlpTexture.hpp"
 #include "GrassPerf.hpp"
+#include "GroundMaterialTable.hpp"
 #include "SurfaceCoverTable.hpp"
 
 #include "engine/events/Event.hpp"
@@ -102,6 +103,7 @@ namespace wxl_livingazeroth::cover
             std::vector<uint8_t>  slope = std::vector<uint8_t>(kTex * kTex, 255);
             std::vector<uint8_t>  driftAmp = std::vector<uint8_t>(kTex * kTex, 0);
             std::vector<uint8_t>  breakup = std::vector<uint8_t>(kTex * kTex, 0);
+            std::vector<uint8_t>  stiff = std::vector<uint8_t>(kTex * kTex, 0); // cover material's stiffness (level 0's trenches)
             std::vector<uint8_t>  drift = std::vector<uint8_t>(kTex * kTex, 128);
             std::vector<uint8_t>  edgeNoise = std::vector<uint8_t>(kTex * kTex, 128);
             std::vector<uint32_t> tint = std::vector<uint32_t>(kTex * kTex, 0);
@@ -164,9 +166,14 @@ namespace wxl_livingazeroth::cover
             g_changed.push_back(s);
         }
 
-        // Rim share and relax time where the player is (the table's row there, x the multipliers),
-        // and what the table sees there (for the panel, so rows can be authored on the spot).
-        float g_rimShareNow = 0.3f, g_relaxNow = 30.0f;
+        // Level 0's rim share and relax time per slot, from the rows of the cell's materials (blended
+        // like everything else; the panel's multipliers apply on top). Per cell, not per player: a
+        // cover whose prints only show through their rims (mud below the terrain) must keep its rims
+        // when the player steps onto other ground.
+        std::vector<float> g_rimCell(kTex * kTex, 0.3f);
+        std::vector<float> g_relaxCell(kTex * kTex, 30.0f);
+
+        // What the table sees where the player is (for the panel, so rows can be authored on the spot).
         terrain::Surface   g_hereSurface;
         covertable::Values g_hereValues;
         std::string        g_hereTexture;
@@ -448,14 +455,14 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         {
             float covered = 0.0f, depth = 0.0f, maxSlope = 45.0f, slopeFade = 15.0f, drift = 0.0f, breakup = 0.5f;
             float tint[3] = {}, tintStrength = 0.0f;
-            float zOffset = 0.0f, wetness = 0.0f;
+            float zOffset = 0.0f, wetness = 0.0f, stiffness = 0.0f, rim = 0.3f, relax = 30.0f;
             float vertexColor[3] = { 0.5f, 0.5f, 0.5f }; // MCCV mixed in by the rows' "use MCCV" share; 0.5 = neutral
             int   texId[8] = {}; float texShare[8] = {}; int texCount = 0; // cover textures present, by ID
         };
 
         // Sums per blended property, in this order (cover textures go through AddTexture).
         enum Sum { kSumDepth, kSumMaxSlope, kSumSlopeFade, kSumDrift, kSumBreakup, kSumTintR, kSumTintG, kSumTintB,
-                   kSumTintStrength, kSumZOffset, kSumWetness, kSumMccv, kSumCount };
+                   kSumTintStrength, kSumZOffset, kSumWetness, kSumMccv, kSumStiffness, kSumRim, kSumRelax, kSumCount };
 
         // What the rows' flags need to know about the spot being sampled: how deep it lies under a
         // liquid surface and the terrain's vertex colour there. Both are looked up only when a row
@@ -541,6 +548,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             sum[kSumTintStrength] += wk * cv.tintStrength;
             sum[kSumZOffset] += wk * cv.zOffset;
             sum[kSumWetness] += wk * cv.wetness;
+            sum[kSumStiffness] += wk * cv.stiffness;
+            sum[kSumRim] += wk * cv.rim;
+            sum[kSumRelax] += wk * cv.relaxSeconds;
             if (cv.flags & covertable::kFlagUseVertexColor) sum[kSumMccv] += wk;
             if (cv.coverTexture > 0) AddTexture(cv.coverTexture, wk);
         }
@@ -554,6 +564,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             b.tintStrength = sum[kSumTintStrength] * inv;
             b.zOffset = sum[kSumZOffset] * inv;
             b.wetness = sum[kSumWetness] * inv;
+            b.stiffness = sum[kSumStiffness] * inv;
+            b.rim = sum[kSumRim] * inv;
+            b.relax = sum[kSumRelax] * inv;
             const float mccv = sum[kSumMccv] * inv;
             if (mccv > 0.0f)
             {
@@ -677,16 +690,16 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             // rises above it shows, e.g. trench rims through grass).
             const float base = ok ? z + (b.covered > 0.0f ? b.zOffset : 0.0f) : kHole;
             if (base != L.base[s]) { L.base[s] = base; L.baseDirty = true; }
-            const uint8_t material = ToByte(b.covered), driftAmp = ToByte(b.drift), breakup = ToByte(b.breakup);
+            const uint8_t material = ToByte(b.covered), driftAmp = ToByte(b.drift), breakup = ToByte(b.breakup), stiff = ToByte(b.stiffness);
             const uint8_t drift = static_cast<uint8_t>(Drift(x, y) * 255.0f + 0.5f);
             const uint8_t edge = static_cast<uint8_t>(EdgeNoise(x, y) * 255.0f + 0.5f);
             const uint32_t tint = (static_cast<uint32_t>(ToByte(b.tintStrength)) << 24) | (static_cast<uint32_t>(ToByte(b.tint[0])) << 16) |
                                   (static_cast<uint32_t>(ToByte(b.tint[1])) << 8) | ToByte(b.tint[2]);
             if (material != L.material[s] || b.depth != L.depth[s] || slopeF != L.slope[s] || driftAmp != L.driftAmp[s] ||
-                breakup != L.breakup[s] || drift != L.drift[s] || edge != L.edgeNoise[s])
+                breakup != L.breakup[s] || drift != L.drift[s] || edge != L.edgeNoise[s] || stiff != L.stiff[s])
             {
                 L.material[s] = material; L.depth[s] = b.depth; L.slope[s] = slopeF; L.driftAmp[s] = driftAmp;
-                L.breakup[s] = breakup; L.drift[s] = drift; L.edgeNoise[s] = edge;
+                L.breakup[s] = breakup; L.drift[s] = drift; L.edgeNoise[s] = edge; L.stiff[s] = stiff;
                 L.coverDirty = true;
             }
             int a = -1, c = -1; // the two strongest
@@ -704,7 +717,12 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 L.tint[s] = tint; L.texIds[s] = ids; L.texShares[s] = shares; L.props[s] = props;
                 L.lookDirty = true;
             }
-            if (isLevel0 && fresh) { g_press[s] = 0.0f; g_rim[s] = 0.0f; }
+            if (isLevel0)
+            {
+                if (b.rim != g_rimCell[s]) { g_rimCell[s] = b.rim; L.coverDirty = true; }
+                g_relaxCell[s] = b.relax;
+                if (fresh) { g_press[s] = 0.0f; g_rim[s] = 0.0f; }
+            }
         }
 
         void SampleRect(Level& L, bool isLevel0, int i0, int i1, int j0, int j1, bool fresh) // inclusive
@@ -795,6 +813,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             return true;
         }
 
+        // Trench radius per yard of footprint (its longer side): a human's 0.33 yd print gives 0.4 yd.
+        constexpr float kFootprintToTrench = 1.2f;
+
         // A trench under one grounded unit: pressed flat inside r, a rim between r and 1.6 r.
         void Stamp(const float pos[3], float radius)
         {
@@ -830,10 +851,11 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             if (g_changedPending) g_levels[0].coverDirty = true;
             g_changed.clear();
 
-            const float relax = g_relaxNow > 0.1f ? dt / g_relaxNow : 1.0f;
             for (size_t k = 0; k < g_active.size();)
             {
                 const int s = g_active[k];
+                const float seconds = g_relaxCell[s] * g_settings.relaxMul;
+                const float relax = seconds > 0.1f ? dt / seconds : 1.0f;
                 g_press[s] = g_press[s] > relax ? g_press[s] - relax : 0.0f;
                 g_rim[s]   = g_rim[s] > relax ? g_rim[s] - relax : 0.0f;
                 g_changed.push_back(s);
@@ -845,10 +867,15 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
 
             g_stamps = 0;
             if (!g_settings.stamp) return;
+            // Sized like the client's own footprints (CreatureModelData, x the unit's scale): a frog
+            // leaves a small trench, a tauren a wide one. Models without footprints (bats, birds and
+            // other fliers that "walk" in the air) leave none.
             for (const actors::Actor& a : actors::Nearby())
             {
-                float r = (a.effectiveRadius > 0.0f ? a.effectiveRadius : 0.4f) * g_settings.stampScale;
-                if (r < 0.3f) r = 0.3f;
+                if (!a.hasFootprint) continue;
+                const float foot = a.footprintLength > a.footprintWidth ? a.footprintLength : a.footprintWidth;
+                float r = (foot > 0.0f ? foot * kFootprintToTrench : (a.effectiveRadius > 0.0f ? a.effectiveRadius : 0.4f)) * g_settings.stampScale;
+                if (r < 0.06f) r = 0.06f;
                 if (r > 2.5f) r = 2.5f;
                 Stamp(a.pos, r);
             }
@@ -1126,7 +1153,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                     const int c = sl % kTex, r = sl / kTex;
                     float* out = reinterpret_cast<float*>(static_cast<uint8_t*>(lr.pBits) + (r - r0) * lr.Pitch) + (c - c0);
                     const float cover = g_static0[sl];
-                    const float deformed = cover * (1.0f + g_rimShareNow * g_rim[sl]) * (1.0f - g_press[sl]);
+                    const float deformed = cover * (1.0f + g_rimCell[sl] * g_settings.rimMul * g_rim[sl]) * (1.0f - g_press[sl] * (1.0f - L.stiff[sl] / 255.0f));
                     *out = cover + (deformed - cover) * g_deformK[sl];
                 }
                 L.coverTex->UnlockRect(0);
@@ -1168,7 +1195,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                             : (cheb >= kDeformZeroCells ? 0.0f : float(kDeformZeroCells - cheb) / float(kDeformZeroCells - kDeformFullCells));
                     if (dj >= kGridVerts || di >= kGridVerts) k = 0.0f;
                     g_deformK[s] = k;
-                    const float deformed = cover * (1.0f + g_rimShareNow * g_rim[s]) * (1.0f - g_press[s]);
+                    const float deformed = cover * (1.0f + g_rimCell[s] * g_settings.rimMul * g_rim[s]) * (1.0f - g_press[s] * (1.0f - L.stiff[s] / 255.0f));
                     out[col] = cover + (deformed - cover) * k;
                 }
             }
@@ -1492,11 +1519,29 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             std::snprintf(line, sizeof(line), "%d x %d vertices; units stamping %u; terrain cells looked up %zu; tint %s",
                           levels * kPatches * kPatches, kPatchVerts * kPatchVerts, g_stamps, static_cast<size_t>(g_cellMisses),
                           g_tintSupported ? "on" : "not supported by this GPU"); add();
+            for (const actors::Actor& a : actors::Nearby())
+            {
+                if (!a.isPlayer) continue;
+                const float foot = a.footprintLength > a.footprintWidth ? a.footprintLength : a.footprintWidth;
+                std::snprintf(line, sizeof(line), "player footprint: %s, %.2f x %.2f yd -> trench radius %.2f yd%s",
+                              a.hasFootprint ? "yes" : "none (no stamp)", a.footprintLength, a.footprintWidth,
+                              foot * kFootprintToTrench * g_settings.stampScale, a.mounted ? " (mount's)" : ""); add();
+                break;
+            }
             if (g_hereValid)
             {
                 std::snprintf(line, sizeof(line), "here: texture \"%s\", ground effect %u, TerrainType %d, area %u",
                               g_hereTexture.c_str(), g_hereSurface.groundEffect, g_hereSurface.terrainType, g_hereSurface.area); add();
                 const covertable::Values& v = g_hereValues;
+                if (v.material)
+                {
+                    const materials::Values mv = materials::Get(v.material);
+                    std::snprintf(line, sizeof(line), "here: material %u \"%s\" (parent %u), cover material %u \"%s\", rest moisture %.2f, cover stiffness %.2f",
+                                  v.material, materials::Name(v.material), materials::Parent(v.material),
+                                  v.coverMaterial, materials::Name(v.coverMaterial), mv.restMoisture, v.stiffness);
+                }
+                else std::snprintf(line, sizeof(line), "here: no ground material (no selector matches)");
+                add();
                 std::snprintf(line, sizeof(line), "here (table): depth %.2f, max slope %.0f, fade %.0f, drift %.2f, breakup %.2f, rim %.2f, relax %.0f s, tint %08X x %.2f, cover texture %d, z offset %.3f, wetness %.2f, flags 0x%X",
                               v.depth, v.maxSlope, v.slopeFade, v.driftNoise, v.edgeBreakup, v.rim, v.relaxSeconds, v.tintColor, v.tintStrength, v.coverTexture,
                               v.zOffset, v.wetness, v.flags); add();
@@ -1687,8 +1732,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             WorkFill(g_levels[k], k == 0, deadline);
         }
 
-        // Rim and relax time come from the table's row where the player is (trenches are made around
-        // the player), times the panel's multipliers. The same lookup feeds the panel's "here" lines.
+        // The table's values where the player is, for the panel's "here" lines.
         covertable::Values here;
         if (static_cast<Coverage>(g_settings.coverage) == Coverage::Everywhere) here.depth = kTestDepth;
         g_hereValid = terrain::SurfaceAt(snap.playerPos[0], snap.playerPos[1], g_hereSurface);
@@ -1711,8 +1755,6 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             g_hereLayerTexture[l] = g_hereLayersValid && l < g_hereLayers.layers && g_hereLayers.surface[l].texture ? g_hereLayers.surface[l].texture : "";
             g_hereLayers.surface[l].texture = g_hereLayersSwapped.surface[l].texture = nullptr;
         }
-        g_rimShareNow = here.rim * g_settings.rimMul;
-        g_relaxNow = here.relaxSeconds * g_settings.relaxMul;
 
         Simulate(dt);
         g_simMs = grassperf::Now() - t0;

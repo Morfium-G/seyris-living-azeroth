@@ -79,12 +79,13 @@ only add what stock data can't express, and every feature can be switched off.
      in-game panel).
    - `GroundEffectDoodadDensity.cdbc`: grass density near the player. Without it there are no
      extra plants.
-   - `SurfaceCover.cdbc`: where snow (or sand) cover goes and how deep. Without it there is no
-     cover.
+   - `GroundMaterial.cdbc` + `GroundMaterialSelector.cdbc`: what the ground is made of, and
+     where. `SurfaceCover.cdbc`: which materials get snow (or sand) cover and how deep. Without
+     these three there is no cover.
 
    **These are sample data**, so that wind, grass and snow show up and work in some stock 3.3.5
    zones. They are in no way fine-tuned yet. The scripts in `tools/` regenerate a minimal baseline
-   (`gen_default_density.py`, `gen_default_surface_cover.py`) or a small wind example
+   (`gen_default_density.py`, `gen_default_ground_materials.py`) or a small wind example
    (`gen_test_wind.py`).
 3. Start the client. `Logs\wxl-core.log` lists what loaded.
 

@@ -18,6 +18,9 @@ namespace wxl_livingazeroth::actors
         uint32_t displayId = 0, nativeDisplayId = 0;
         float    widthNow = 0.0f, widthNative = 0.0f; // collision widths, only filled when morphed
         float    effectiveRadius = 0.0f;              // bounding radius, scaled for morphs/shapeshifts
+        bool     hasFootprint = true;            // false: the model makes no footprints (FootprintTextureID -1: bats, birds, ...)
+        float    footprintLength = 0.0f;         // yd, one print, x the unit's scale (the mount's while mounted); 0 = unknown
+        float    footprintWidth = 0.0f;
         bool     isPlayer = false;
         float    distance = 0.0f;       // to the player, yards
     };

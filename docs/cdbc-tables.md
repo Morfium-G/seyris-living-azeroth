@@ -68,17 +68,28 @@ player stands, so a forest can be thinner even while you're outside it.
 
 Generator: `tools/gen_default_density.py` (shipped baseline; `--examples` adds example rows).
 
-## SurfaceCover.cdbc — `SurfaceCover.xml`
+## Ground materials: three tables
 
-Which ground gets a cover (snow, sand, ...), how deep, and how it looks and behaves. The cover is
-a real layer on top of the terrain: units sink in and carve trenches with a rim, which fill back in
-over time. Grass and small doodads are buried under it.
+What the ground is made of is decided once and shared by every feature that cares (the cover
+now; moisture, temperature, footsteps and texture swaps later). Three roles:
 
-Looked up per terrain cell (about 4 yd) from what the cell is painted with: its dominant texture
-layer's **texture**, that layer's **ground effect**, and the ground effect's **TerrainType**. Between
-cells everything blends (depth, slope limits, tint, ...), so two materials meeting mix smoothly.
-**The F9 surface cover panel shows these for the spot you stand on** ("here:" lines), plus the
-values the table gives there, so rows can be written on the spot.
+1. **GroundMaterialSelector.cdbc**: *where* a material lies.
+2. **GroundMaterial.cdbc**: *what* a material is (properties only).
+3. **Feature tables keyed by material**: SurfaceCover.cdbc today. A new feature adds a new table
+   and leaves the others alone.
+
+Looked up per terrain cell from what it's painted with: each texture layer's **texture**, that
+layer's **ground effect**, and the ground effect's **TerrainType**. Layers are weighted by their
+painted strength, so two materials meeting mix smoothly. **The F9 surface cover panel shows all of
+this for the spot you stand on** ("here:" lines: texture, effect, TerrainType, area, material and
+its values), so rows can be written on the spot.
+
+Generator for all three: `tools/gen_default_ground_materials.py` (`--examples` adds an Icecrown
+snow child material, wet Westfall sand, mud with muddy footprint outlines, and a "no snow on
+Kalimdor" selector). After editing, press "Reload table" in the surface cover panel: it reloads
+all three.
+
+### GroundMaterialSelector.cdbc — `GroundMaterialSelector.xml`
 
 | Field | Meaning |
 |---|---|
@@ -88,6 +99,41 @@ values the table gives there, so rows can be written on the spot.
 | TexturePath | the painted texture's path, e.g. as the panel shows it; **empty = any**. Case and `/` vs `\` don't matter |
 | GroundEffectID | GroundEffectTexture.dbc ID (the effect painted with the texture); **0 = any** |
 | TerrainType | TerrainType.dbc ID; **-1 = any** (0 is Dirt). Stock: 0 Dirt, 1 Metallic, 2 Stone, 3 Snow, 4 Wood, 5 Grass, 6 Leaves, 7 Sand, 8 Soggy, 9 Dusty Grass, 10 None, 11 Water |
+| LiquidType | **reserved** for liquid materials (LiquidType.dbc IDs, as baked into ADTs and WMOs); 0 for terrain rows. Rows with a LiquidType are skipped for now |
+| MaterialID | the GroundMaterial; **0 = no material here** (switches a broader row off, e.g. no snow in one zone) |
+| Flags | reserved, 0 |
+
+**The most specific row wins** (workspace rule for scoped tables): place first, then what. Places:
+the terrain cell's own area (sub-zone), its parent zones, the map, global. Within each place:
+TexturePath → GroundEffectID → TerrainType → everything (empty texture, GroundEffectID 0,
+TerrainType -1). So "snow everywhere" is one Global row with TerrainType 3; one texture that
+should be a different material gets a TexturePath row; a zone that's different gets Area rows.
+
+### GroundMaterial.cdbc — `GroundMaterial.xml`
+
+| Field | Meaning |
+|---|---|
+| ID | material id (what selectors and feature tables refer to) |
+| Name | for authoring and the panel |
+| Parent | material whose values a −1 field takes (0 = none). Feature tables follow the same chain |
+| RestMoisture | 0 = bone dry .. 1 = soaked: **what the texture already shows** (wet-painted sand ≈ 0.8). Moisture rests here; later, visuals react to the difference from it. Not used yet |
+| Stiffness | resistance to deformation: **0 = gives way completely .. 1 = rigid** (the same meaning as GroundEffectDoodadWind's Stiffness). For a cover: feet press away (1 − Stiffness) of its depth, so mud at 0.4 keeps a floor in every print |
+| Flags | reserved, 0 |
+
+A float of **−1 takes the value from the Parent** (and so on up). Defaults where no material in the
+chain sets one: RestMoisture 0.3, Stiffness 0.
+
+### SurfaceCover.cdbc — `SurfaceCover.xml`
+
+Which materials carry a cover (snow, sand, ...), how deep, and how it looks and behaves. The cover
+is a real layer on top of the terrain: units sink in and carve trenches with a rim, which fill back
+in over time. Grass and small doodads are buried under it.
+
+| Field | Meaning |
+|---|---|
+| ID | row id |
+| MaterialID | the GroundMaterial that carries this cover (one row per material) |
+| CoverMaterial | the material of what lies on top (snow on grass is still Snow); **0 = the ground material itself**. Its Stiffness decides how far feet press the cover down |
 | Depth | yards of cover; **0 = no cover** (switches a material off) |
 | MaxSlope | degrees: steeper ground holds no cover |
 | SlopeFade | degrees below MaxSlope over which the cover thins out |
@@ -97,38 +143,37 @@ values the table gives there, so rows can be written on the spot.
 | RelaxSeconds | how long a trench takes to fill back in |
 | TintColor | colour as 0xRRGGBB, used with TintStrength |
 | TintStrength | 0 = the plain cover colour .. 1 = TintColor. TintColor comes from the same row |
-| CoverTexture | a BLP drawn on the cover, tiled like the terrain's layers (one repeat per terrain cell), e.g. the same texture as the ground it covers. **Empty = from the next row, `-` = none.** Any number of paths per table; up to 8 different ones are drawn at once in view (the ones most present around you; the panel lists them and says when more are around). TintColor/TintStrength still apply on top |
+| CoverTexture | a BLP drawn on the cover, tiled like the terrain's layers (one repeat per terrain cell), e.g. the same texture as the ground it covers. **Empty = from the parent material's row, `-` = none.** Any number of paths per table; up to 8 different ones are drawn at once in view (the ones most present around you; the panel lists them and says when more are around). TintColor/TintStrength still apply on top |
 | Opacity | **reserved, not used yet** (see-through covers: slush, goo) |
 | Flatten | **reserved, not used yet** (liquid-like covers that fill hollows) |
 | ZOffset | yards the cover's base sits above (+) or **below (−)** the terrain. Below the terrain only what rises above it shows. Muddy footprint outlines: Depth 0.015, ZOffset −0.02 (the top stays 0.005 yd under the grass), Rim 4 (rims rise 0.055 yd above it), DriftNoise 0. **Only exactly −1 inherits**; every other negative is a real offset |
-| Wetness | 0 = dry .. 1 = soaked: darker, and the specular gets stronger (up to ×3) and tighter. The shine comes from the CoverTexture's specular mask, so a cover without a CoverTexture doesn't shine |
+| Wetness | how wet the cover **looks**: 0 = as its texture .. 1 = soaked: darker, and the specular gets stronger (up to ×3) and tighter. The shine comes from the CoverTexture's specular mask, so a cover without a CoverTexture doesn't shine |
 | Flags | 0x1 **prevent underwater**: the cover thins out over 0.3 yd below a terrain liquid's surface (rivers, lakes, sea; not WMO water). 0x2 **prevent on land**: cover only there (river and sea floors). 0x4 **use MCCV**: tinted by the terrain's vertex colours, like the terrain. 0x8 **ignore specular map**: no shine from the CoverTexture. Flags come from the row that decides Depth, except 0x8, which belongs to the CoverTexture named in the same row |
 
 **Specular:** a CoverTexture's alpha is its specular mask, as on the terrain's layers. If a `_s.blp`
 next to it exists (later expansions keep the mask there), that one is used instead. The shine uses the
 terrain's own sun and specular colour, so a custom sky's sun applies too.
 
-A float of **-1 takes that field from the next, less specific row** (ZOffset: exactly −1).
-TintColor comes with TintStrength's row, Flags with Depth's row. Fields no row sets use the
-defaults: MaxSlope 45, SlopeFade 15, DriftNoise 0.35, EdgeBreakup 0.5, Rim 0.3, RelaxSeconds 30,
-no tint, no cover texture, ZOffset 0, Wetness 0, no flags. No row at all (or Depth 0) = no cover.
+A float of **−1 takes that field from the parent material's row** (ZOffset: exactly −1), and so on
+up the chain; a material without a row takes everything from its parents'. TintColor comes with
+TintStrength's row, Flags with Depth's row. Fields no row sets use the defaults: MaxSlope 45,
+SlopeFade 15, DriftNoise 0.35, EdgeBreakup 0.5, Rim 0.3, RelaxSeconds 30, no tint, no cover texture,
+ZOffset 0, Wetness 0, no flags. No material, no row along its chain, or Depth 0 = no cover.
 
-**Older files** (19 columns, before ZOffset/Wetness) don't load; the panel says so. Convert them with
-`python tools/convert_surface_cover_v3.py <file>`: it writes `<file>-v3.cdbc` with both new
-columns at −1, so every row behaves as before.
+**Trench size:** like the client's own footprints. CreatureModelData's FootprintTextureLength/Width
+(in inches) × the unit's scale, the mount's while mounted; the trench radius is 1.2 × the print's
+longer side (a human's 0.33 yd print → 0.4 yd). Models with FootprintTextureID −1 (bats, birds and
+other fliers that "walk" in the air) leave no trench.
 
-**The most specific row wins** (workspace rule for scoped tables): place first, then what.
-Places: the terrain cell's own area (sub-zone), its parent zones, the map, global. Within each
-place: TexturePath → GroundEffectID → TerrainType → everything (empty texture, GroundEffectID 0,
-TerrainType -1). Values are never added or multiplied across rows. So "snow everywhere" is one
-Global row with TerrainType 3; one texture that should look different gets a TexturePath row; a
-zone that's different gets Area rows.
-
-Rim and RelaxSeconds are taken from the row where the player stands (trenches are made around the
-player). The panel's multipliers (Depth, Drift noise, Edge breakup, Rim, Relax time) scale the
+Rim and RelaxSeconds apply per spot, like every other value (blended between materials). The panel's multipliers (Depth, Drift noise, Edge breakup, Rim, Relax time) scale the
 table for testing or taste; at 1 the table applies exactly.
 
 Shipped baseline: snow 0.35 yd everywhere it's painted (bare above ~40°), sand listed but off
-(Depth 0, with a sandy tint ready). Generator: `tools/gen_default_surface_cover.py` (`--examples`
-adds a deeper Icecrown, one example texture row, a thin Kalimdor sand and a muddy-footprint row). After editing, press
-"Reload table" in the surface cover panel.
+(Depth 0, with a sandy tint ready).
+
+**Older files:**
+- 21 columns (place keys inside SurfaceCover itself): the panel says so. Split them with
+  `python tools/convert_surface_cover_v4.py <SurfaceCover.cdbc>`. It writes all three tables into
+  `converted-v4/` next to the input: one material, selector and cover row per old row, same IDs,
+  with Parents set so −1 fields resolve exactly as before.
+- 19 columns (before ZOffset/Wetness): run `convert_surface_cover_v3.py` first.

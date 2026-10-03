@@ -39,6 +39,40 @@ namespace wxl_livingazeroth::actors
         constexpr size_t kModelScale        = 0x10; // CreatureModelData.ModelScale [believed]
         constexpr size_t kModelCollisionW   = 0x38; // CreatureModelData.CollisionWidth [believed]
 
+        // Footprints, as the client's own step code reads them (XWorkbench 2026-10-03). Model setup
+        // (0x73E5C0) copies from the unit's CreatureModelData row (unit +0x970): +0x18
+        // FootprintTextureID -> unit +0xA3C, +0x20 FootprintTextureWidth / 36 -> +0xA44, +0x1C
+        // FootprintTextureLength / 36 -> +0xA48 (the columns are in inches; 1/36 at 0xA3F854). The
+        // step (0x71FB60) multiplies them by the unit's scale (virtual +0x7C); while mounted
+        // (+0x9C0 > 0, +0x98C set, not +0xA30 & 0x10000000) the mount's copies at +0xAD8/+0xADC/+0xAE0
+        // are used instead. A texture ID outside FootprintTextures (-1) makes no print.
+        constexpr size_t   kUnitFootTexture = 0xA3C, kUnitFootWidth = 0xA44, kUnitFootLength = 0xA48;
+        constexpr size_t   kUnitMountFootTexture = 0xAD8, kUnitMountFootWidth = 0xADC, kUnitMountFootLength = 0xAE0;
+        constexpr size_t   kUnitMountState = 0x9C0, kUnitMountModel = 0x98C, kUnitFlags = 0xA30;
+        constexpr uint32_t kUnitFlagNoMountFootprint = 0x10000000;
+        constexpr size_t   kVtScale = 0x7C / 4;
+        using ScaleFn = float(__fastcall*)(void* unit, void* edx);
+
+        bool ReadFootprint(void* obj, int32_t& texture, float& length, float& width)
+        {
+            __try
+            {
+                const auto* u = static_cast<const uint8_t*>(obj);
+                const bool mounted = *reinterpret_cast<const int32_t*>(u + kUnitMountState) > 0 &&
+                                     !(*reinterpret_cast<const uint32_t*>(u + kUnitFlags) & kUnitFlagNoMountFootprint) &&
+                                     *reinterpret_cast<const uint32_t*>(u + kUnitMountModel) != 0;
+                texture = *reinterpret_cast<const int32_t*>(u + (mounted ? kUnitMountFootTexture : kUnitFootTexture));
+                const float w = *reinterpret_cast<const float*>(u + (mounted ? kUnitMountFootWidth : kUnitFootWidth));
+                const float l = *reinterpret_cast<const float*>(u + (mounted ? kUnitMountFootLength : kUnitFootLength));
+                const auto* vtable = *reinterpret_cast<void* const* const*>(u);
+                const float scale = vtable ? reinterpret_cast<ScaleFn>(vtable[kVtScale])(obj, nullptr) : 1.0f;
+                width = w * scale;
+                length = l * scale;
+                return true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+
         std::unordered_map<uint32_t, float> g_widthCache; // display id -> effective collision width
 
         std::vector<Actor> g_actors;
@@ -125,6 +159,15 @@ namespace wxl_livingazeroth::actors
                     ratio = ratio < 0.25f ? 0.25f : (ratio > 6.0f ? 6.0f : ratio);
                     a.effectiveRadius = a.boundingRadius * ratio;
                 }
+            }
+            int32_t footTexture = 0;
+            float footLength = 0.0f, footWidth = 0.0f;
+            if (ReadFootprint(obj, footTexture, footLength, footWidth))
+            {
+                a.hasFootprint = footTexture >= 0;
+                // Guard against garbage (a field layout off, a half-built model).
+                if (std::isfinite(footLength) && std::isfinite(footWidth) && footLength >= 0.0f && footLength < 20.0f && footWidth >= 0.0f && footWidth < 20.0f)
+                { a.footprintLength = footLength; a.footprintWidth = footWidth; }
             }
             g_actors.push_back(a);
             return true;

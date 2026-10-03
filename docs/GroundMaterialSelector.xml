@@ -1,0 +1,11 @@
+  <Table Name="GroundMaterialSelector" Build="12340">
+    <Field Name="ID" Type="int" IsIndex="true" />
+    <Field Name="ScopeType" Type="int" />
+    <Field Name="ScopeID" Type="int" />
+    <Field Name="TexturePath" Type="string" />
+    <Field Name="GroundEffectID" Type="int" />
+    <Field Name="TerrainType" Type="int" />
+    <Field Name="LiquidType" Type="int" />
+    <Field Name="MaterialID" Type="int" />
+    <Field Name="Flags" Type="int" />
+  </Table>
