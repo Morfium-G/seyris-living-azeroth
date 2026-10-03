@@ -10,9 +10,13 @@ Columns (see docs/cdbc-tables.md for the full meaning):
   Depth (yd, 0 = no cover), MaxSlope, SlopeFade (degrees), DriftNoise, EdgeBreakup (0..1),
   Rim (x depth), RelaxSeconds, TintColor (0xRRGGBB), TintStrength (0..1),
   CoverTexture (string: a BLP on the cover, empty = from the next row, "-" = none; any number,
-  distinct paths per table), Opacity, Flatten -- reserved, not used yet --, Flags (0).
+  distinct paths per table), Opacity, Flatten -- reserved, not used yet --,
+  ZOffset (yd the cover's base sits above/below the terrain; negative = below),
+  Wetness (0 dry .. 1 soaked: darker, glossier), Flags (0x1 prevent underwater, 0x2 prevent on
+  land, 0x4 use the terrain's vertex colours (MCCV), 0x8 ignore the CoverTexture's specular map).
 Floats; -1 = take this field from the next, less specific row (TintColor goes with
-TintStrength). No row at all = no cover.
+TintStrength, Flags go with Depth). ZOffset inherits only at exactly -1, other negatives are
+real offsets. No row at all = no cover.
 
 Resolution (orchestration docs/principles.md, "scoped override tables"): the most specific row
 wins. Place first -- the terrain cell's area, its parent zones, the map, global -- then within
@@ -41,12 +45,15 @@ ANY = -1  # any TerrainType
 GLOBAL, MAP, AREA = 0, 1, 2
 SNOW, SAND, SOGGY = 3, 7, 8
 
+# Flags (they come from the row that decides Depth)
+PREVENT_UNDERWATER, PREVENT_ON_LAND, USE_MCCV, IGNORE_SPECULAR = 0x1, 0x2, 0x4, 0x8
+
 # Row helper: everything not given inherits (-1) or is empty.
 def row(id, scope, scope_id=0, texture="", effect=0, terrain=ANY, depth=I, max_slope=I, slope_fade=I,
         drift=I, breakup=I, rim=I, relax=I, tint_color=0, tint_strength=I, cover_texture="",
-        opacity=I, flatten=I, flags=0):
+        opacity=I, flatten=I, z_offset=I, wetness=I, flags=0):
     return (id, scope, scope_id, texture, effect, terrain, depth, max_slope, slope_fade, drift, breakup,
-            rim, relax, tint_color, tint_strength, cover_texture, opacity, flatten, flags)
+            rim, relax, tint_color, tint_strength, cover_texture, opacity, flatten, z_offset, wetness, flags)
 
 
 DEFAULT_ROWS = [
@@ -67,9 +74,14 @@ EXAMPLE_ROWS = [
         tint_color=0xC8DCFF, tint_strength=0.3),
     # Kalimdor (map 1): a thin sand cover, everything else from the global sand row.
     row(102, MAP, 1, terrain=SAND, depth=0.08),
+    # Muddy footprint outlines on grass (owner's design): a thin wet layer whose top stays just below
+    # the terrain (0.015 - 0.02 = -0.005 yd), so only trench rims poke through (0.015 x (1 + 4) - 0.02
+    # = +0.055 yd). No drift noise, or the lumps would poke through too. Depth carries the flags.
+    row(103, GLOBAL, terrain=SOGGY, depth=0.015, z_offset=-0.02, wetness=0.8, drift=0.0, rim=4.0, relax=120.0,
+        tint_color=0x3A2A1A, tint_strength=0.6, flags=PREVENT_UNDERWATER),
 ]
 
-FIELDS = "<IIIIIi5f2fIfIffI"  # see row(): strings are packed as offsets
+FIELDS = "<IIIIIi5f2fIfIffffI"  # see row(): strings are packed as offsets
 
 
 def build(rows) -> bytes:
@@ -85,11 +97,12 @@ def build(rows) -> bytes:
     records = bytearray()
     for r in sorted(rows, key=lambda r: r[0]):
         (rid, scope, scope_id, texture, effect, terrain, depth, max_slope, slope_fade, drift, breakup,
-         rim, relax, tint_color, tint_strength, cover_texture, opacity, flatten, flags) = r
+         rim, relax, tint_color, tint_strength, cover_texture, opacity, flatten, z_offset, wetness, flags) = r
         records += struct.pack(FIELDS, rid, scope, scope_id, string(texture), effect, terrain,
                                depth, max_slope, slope_fade, drift, breakup, rim, relax,
-                               tint_color, tint_strength, string(cover_texture), opacity, flatten, flags)
-    field_count = 19
+                               tint_color, tint_strength, string(cover_texture), opacity, flatten,
+                               z_offset, wetness, flags)
+    field_count = 21
     record_size = field_count * 4
     assert len(records) == record_size * len(rows)
     header = struct.pack("<4sIIII", MAGIC, len(rows), field_count, record_size, len(strings))

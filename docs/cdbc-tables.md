@@ -100,11 +100,22 @@ values the table gives there, so rows can be written on the spot.
 | CoverTexture | a BLP drawn on the cover, tiled like the terrain's layers (one repeat per terrain cell), e.g. the same texture as the ground it covers. **Empty = from the next row, `-` = none.** Any number of paths per table; up to 8 different ones are drawn at once in view (the ones most present around you; the panel lists them and says when more are around). TintColor/TintStrength still apply on top |
 | Opacity | **reserved, not used yet** (see-through covers: slush, goo) |
 | Flatten | **reserved, not used yet** (liquid-like covers that fill hollows) |
-| Flags | reserved, 0 |
+| ZOffset | yards the cover's base sits above (+) or **below (−)** the terrain. Below the terrain only what rises above it shows. Muddy footprint outlines: Depth 0.015, ZOffset −0.02 (the top stays 0.005 yd under the grass), Rim 4 (rims rise 0.055 yd above it), DriftNoise 0. **Only exactly −1 inherits**; every other negative is a real offset |
+| Wetness | 0 = dry .. 1 = soaked: darker, and the specular gets stronger (up to ×3) and tighter. The shine comes from the CoverTexture's specular mask, so a cover without a CoverTexture doesn't shine |
+| Flags | 0x1 **prevent underwater**: the cover thins out over 0.3 yd below a terrain liquid's surface (rivers, lakes, sea; not WMO water). 0x2 **prevent on land**: cover only there (river and sea floors). 0x4 **use MCCV**: tinted by the terrain's vertex colours, like the terrain. 0x8 **ignore specular map**: no shine from the CoverTexture. Flags come from the row that decides Depth, except 0x8, which belongs to the CoverTexture named in the same row |
 
-A float of **-1 takes that field from the next, less specific row**. Fields no row sets use the
+**Specular:** a CoverTexture's alpha is its specular mask, as on the terrain's layers. If a `_s.blp`
+next to it exists (later expansions keep the mask there), that one is used instead. The shine uses the
+terrain's own sun and specular colour, so a custom sky's sun applies too.
+
+A float of **-1 takes that field from the next, less specific row** (ZOffset: exactly −1).
+TintColor comes with TintStrength's row, Flags with Depth's row. Fields no row sets use the
 defaults: MaxSlope 45, SlopeFade 15, DriftNoise 0.35, EdgeBreakup 0.5, Rim 0.3, RelaxSeconds 30,
-no tint, no cover texture. No row at all (or Depth 0) = no cover.
+no tint, no cover texture, ZOffset 0, Wetness 0, no flags. No row at all (or Depth 0) = no cover.
+
+**Older files** (19 columns, before ZOffset/Wetness) don't load; the panel says so. Convert them with
+`python tools/convert_surface_cover_v3.py <file>`: it writes `<file>-v3.cdbc` with both new
+columns at −1, so every row behaves as before.
 
 **The most specific row wins** (workspace rule for scoped tables): place first, then what.
 Places: the terrain cell's own area (sub-zone), its parent zones, the map, global. Within each
@@ -119,5 +130,5 @@ table for testing or taste; at 1 the table applies exactly.
 
 Shipped baseline: snow 0.35 yd everywhere it's painted (bare above ~40°), sand listed but off
 (Depth 0, with a sandy tint ready). Generator: `tools/gen_default_surface_cover.py` (`--examples`
-adds a deeper Icecrown, one example texture row and a thin Kalimdor sand). After editing, press
+adds a deeper Icecrown, one example texture row, a thin Kalimdor sand and a muddy-footprint row). After editing, press
 "Reload table" in the surface cover panel.

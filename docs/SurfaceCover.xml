@@ -17,5 +17,7 @@
     <Field Name="CoverTexture" Type="string" />
     <Field Name="Opacity" Type="float" />
     <Field Name="Flatten" Type="float" />
+    <Field Name="ZOffset" Type="float" />
+    <Field Name="Wetness" Type="float" />
     <Field Name="Flags" Type="int" />
   </Table>

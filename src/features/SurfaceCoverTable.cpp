@@ -35,18 +35,25 @@ namespace wxl_livingazeroth::covertable
             {"CoverTexture",   15, WXL_CDBC_FIELD_STRING},
             {"Opacity",        16, WXL_CDBC_FIELD_VALUE},  // reserved: not used yet
             {"Flatten",        17, WXL_CDBC_FIELD_VALUE},  // reserved: not used yet
-            {"Flags",          18, WXL_CDBC_FIELD_VALUE},
+            {"ZOffset",        18, WXL_CDBC_FIELD_VALUE},
+            {"Wetness",        19, WXL_CDBC_FIELD_VALUE},
+            {"Flags",          20, WXL_CDBC_FIELD_VALUE},
         };
-        constexpr WXL_SeyrisCdbcDefinition kDef = { "SurfaceCover", kFile, kFields, 19 };
+        constexpr WXL_SeyrisCdbcDefinition kDef = { "SurfaceCover", kFile, kFields, 21 };
 
         enum Scope : uint32_t { kGlobal = 0, kMap = 1, kArea = 2 };
 
         // The float fields that inherit with -1, in Values order. TintStrength carries TintColor
-        // with it: the row that decides the strength also decides the colour.
-        enum Field { kDepth, kMaxSlope, kSlopeFade, kDrift, kBreakup, kRim, kRelax, kTint, kFieldCount };
+        // with it: the row that decides the strength also decides the colour. Depth carries Flags
+        // the same way (0 is a valid Flags value, so it can't inherit on its own).
+        enum Field { kDepth, kMaxSlope, kSlopeFade, kDrift, kBreakup, kRim, kRelax, kTint, kZOffset, kWetness, kFieldCount };
         constexpr const char* kFloatColumns[kFieldCount] = {
             "Depth", "MaxSlope", "SlopeFade", "DriftNoise", "EdgeBreakup", "Rim", "RelaxSeconds", "TintStrength",
+            "ZOffset", "Wetness",
         };
+
+        // Whether a row sets field f. ZOffset is a signed offset, so only exactly -1 inherits there.
+        bool IsSet(int f, float v) { return f == kZOffset ? v != -1.0f : v >= 0.0f; }
 
         struct Row
         {
@@ -55,11 +62,13 @@ namespace wxl_livingazeroth::covertable
             int32_t     terrain = -1; // -1 = any TerrainType (TerrainType 0 is Dirt, so 0 can't mean "any")
             float       value[kFieldCount];
             uint32_t    tintColor = 0;
+            uint32_t    flags = 0;
             int         coverTexture = -1; // -1 = take it from the next row, 0 = none, 1.. = slot
         };
 
         // CoverTexture paths in the order the table first names them; slot = index + 1.
         std::vector<std::string> g_coverPaths;
+        std::vector<bool>        g_coverIgnoreSpecular; // per path: a row naming it has kFlagIgnoreSpecular
         unsigned g_coverOverflow = 0; // rows naming a texture beyond the slots (drawn without one)
 
         // Rows by place: (scope type, scope id) -> rows there.
@@ -124,6 +133,7 @@ namespace wxl_livingazeroth::covertable
         g_cache.clear();
         g_rowCount = 0;
         g_coverPaths.clear();
+        g_coverIgnoreSpecular.clear();
         g_coverOverflow = 0;
         ++g_generation;
 
@@ -132,7 +142,12 @@ namespace wxl_livingazeroth::covertable
 
         char err[256] = {};
         void* table = cdbc->Load(&kDef, err, sizeof(err));
-        if (!table) { g_status = std::string("no rows (") + err + ")"; return; }
+        if (!table)
+        {
+            g_status = std::string("no rows (") + err + ")";
+            if (std::strstr(err, "only has 19 columns")) g_status += " -- an older layout: convert it with tools/convert_surface_cover_v3.py";
+            return;
+        }
 
         const uint32_t count = cdbc->RowCount(table);
         for (uint32_t i = 0; i < count; ++i)
@@ -147,6 +162,7 @@ namespace wxl_livingazeroth::covertable
             r.terrain = static_cast<int32_t>(cdbc->Value(table, rec, "TerrainType", 0));
             for (int f = 0; f < kFieldCount; ++f) r.value[f] = BitsToFloat(cdbc->Value(table, rec, kFloatColumns[f], 0));
             r.tintColor = cdbc->Value(table, rec, "TintColor", 0);
+            r.flags = cdbc->Value(table, rec, "Flags", 0);
             // CoverTexture: empty = from the next row, "-" = none, else a path sharing a slot with
             // every row that names the same file.
             const std::string cover = cdbc->GetString(table, rec, "CoverTexture");
@@ -156,8 +172,9 @@ namespace wxl_livingazeroth::covertable
                 const std::string key = Normalize(cover.c_str());
                 int slot = 0;
                 for (size_t k = 0; k < g_coverPaths.size(); ++k) if (Normalize(g_coverPaths[k].c_str()) == key) slot = static_cast<int>(k) + 1;
-                if (!slot) { g_coverPaths.push_back(cover); slot = static_cast<int>(g_coverPaths.size()); }
+                if (!slot) { g_coverPaths.push_back(cover); g_coverIgnoreSpecular.push_back(false); slot = static_cast<int>(g_coverPaths.size()); }
                 r.coverTexture = slot;
+                if (r.flags & kFlagIgnoreSpecular) g_coverIgnoreSpecular[slot - 1] = true;
             }
             g_rows[{ scope, id }].push_back(r);
             ++g_rowCount;
@@ -175,6 +192,10 @@ namespace wxl_livingazeroth::covertable
     {
         return index >= 1 && index <= static_cast<int>(g_coverPaths.size()) ? g_coverPaths[index - 1].c_str() : "";
     }
+    bool CoverTextureIgnoresSpecular(int index)
+    {
+        return index >= 1 && index <= static_cast<int>(g_coverIgnoreSpecular.size()) && g_coverIgnoreSpecular[index - 1];
+    }
     const char* Status()     { return g_status.c_str(); }
     uint32_t    Generation() { return g_generation; }
 
@@ -191,9 +212,9 @@ namespace wxl_livingazeroth::covertable
         if (mapId >= 0) places.push_back({ kMap, static_cast<uint32_t>(mapId) });
         places.push_back({ kGlobal, 0 });
 
-        float value[kFieldCount];
-        for (float& v : value) v = -1.0f;
-        uint32_t tint = 0;
+        float value[kFieldCount] = {};
+        bool set[kFieldCount] = {};
+        uint32_t tint = 0, flags = 0;
         int cover = -1;
         for (const auto& place : places)
         {
@@ -204,24 +225,28 @@ namespace wxl_livingazeroth::covertable
                 {
                     if (cover < 0 && r->coverTexture >= 0) cover = r->coverTexture;
                     for (int f = 0; f < kFieldCount; ++f)
-                        if (value[f] < 0.0f && r->value[f] >= 0.0f)
+                        if (!set[f] && IsSet(f, r->value[f]))
                         {
+                            set[f] = true;
                             value[f] = r->value[f];
                             if (f == kTint) tint = r->tintColor;
+                            if (f == kDepth) flags = r->flags;
                         }
                 }
         }
 
         Values v; // fields no row sets keep the defaults
-        if (value[kDepth] >= 0.0f)    v.depth = value[kDepth];
-        if (value[kMaxSlope] >= 0.0f) v.maxSlope = value[kMaxSlope];
-        if (value[kSlopeFade] >= 0.0f) v.slopeFade = value[kSlopeFade];
-        if (value[kDrift] >= 0.0f)    v.driftNoise = value[kDrift];
-        if (value[kBreakup] >= 0.0f)  v.edgeBreakup = value[kBreakup];
-        if (value[kRim] >= 0.0f)      v.rim = value[kRim];
-        if (value[kRelax] >= 0.0f)    v.relaxSeconds = value[kRelax];
-        if (value[kTint] >= 0.0f)     { v.tintStrength = value[kTint]; v.tintColor = tint; }
-        if (cover > 0)                v.coverTexture = cover;
+        if (set[kDepth])     { v.depth = value[kDepth]; v.flags = flags; }
+        if (set[kMaxSlope])  v.maxSlope = value[kMaxSlope];
+        if (set[kSlopeFade]) v.slopeFade = value[kSlopeFade];
+        if (set[kDrift])     v.driftNoise = value[kDrift];
+        if (set[kBreakup])   v.edgeBreakup = value[kBreakup];
+        if (set[kRim])       v.rim = value[kRim];
+        if (set[kRelax])     v.relaxSeconds = value[kRelax];
+        if (set[kTint])      { v.tintStrength = value[kTint]; v.tintColor = tint; }
+        if (set[kZOffset])   v.zOffset = value[kZOffset];
+        if (set[kWetness])   v.wetness = value[kWetness] > 1.0f ? 1.0f : value[kWetness];
+        if (cover > 0)       v.coverTexture = cover;
         if (g_cache.size() > 20000) g_cache.clear();
         g_cache.emplace(std::move(key), v);
         return v;

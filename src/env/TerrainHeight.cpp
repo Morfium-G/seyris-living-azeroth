@@ -316,6 +316,62 @@ namespace wxl_livingazeroth::terrain
         return true;
     }
 
+    namespace
+    {
+        // MCCV: the sub-chunk walk (0x7C3A10) stores its data pointer at chunk +0x120 when the chunk
+        // has one; MCNK flags 0x40 say it does (a reused chunk object can keep an old pointer, so the
+        // flag is the guard). 145 entries in MCVT order, 4 bytes each, B G R A, 0x7F = neutral
+        // [believed: wowdev's layout, check against the client's own terrain with the panel].
+        constexpr size_t   kChunkVertexColors = 0x120;
+        constexpr uint32_t kMcnkHasMccv = 0x40;
+
+        // The client's terrain liquid probe (0x7A0820, verified in XWorkbench 2026-10-03):
+        // bool __cdecl (const float pos[3], uint32_t* outType, float* outHeight, int checkTerrain).
+        // It walks the chunk's liquid instances (chunk +0x108) whose tile exists at the cell, and takes
+        // the first whose surface (+ a small margin) lies above pos.z; with checkTerrain it also wants
+        // pos.z above the terrain. pos.z far below every surface therefore just asks "the surface here".
+        constexpr uintptr_t kQueryTerrainLiquid = 0x007A0820;
+        using QueryTerrainLiquidFn = bool(__cdecl*)(const float* pos, uint32_t* outType, float* outHeight, int checkTerrain);
+    }
+
+    bool VertexColorAt(float x, float y, float rgb[3])
+    {
+        ChunkSpot at;
+        if (!Spot(x, y, at)) return false;
+        if (!(*reinterpret_cast<const uint32_t*>(at.header + kHeaderFlags) & kMcnkHasMccv)) return false;
+        const auto* colors = *reinterpret_cast<const uint8_t* const*>(at.chunk + kChunkVertexColors);
+        if (!colors) return false;
+
+        const float u = at.r - at.row, v = at.c - at.col;
+        const int base = at.row * kRowStride + at.col;
+        const int i00 = base, i01 = base + 1, i10 = base + kRowStride, i11 = base + kRowStride + 1, im = base + kCentreOffset;
+        const float du0 = u, du1 = 1.0f - u, dv0 = v, dv1 = 1.0f - v;
+        int a, b; float pa[2], pb[2];
+        if (du0 <= du1 && du0 <= dv0 && du0 <= dv1) { a = i00; b = i01; pa[0] = 0; pa[1] = 0; pb[0] = 0; pb[1] = 1; }
+        else if (du1 <= dv0 && du1 <= dv1)          { a = i10; b = i11; pa[0] = 1; pa[1] = 0; pb[0] = 1; pb[1] = 1; }
+        else if (dv0 <= dv1)                        { a = i00; b = i10; pa[0] = 0; pa[1] = 0; pb[0] = 1; pb[1] = 0; }
+        else                                        { a = i01; b = i11; pa[0] = 0; pa[1] = 1; pb[0] = 1; pb[1] = 1; }
+        for (int ch = 0; ch < 3; ++ch)
+        {
+            const int byte = 2 - ch; // B G R A -> r = byte 2
+            const float A[3] = { pa[0], pa[1], colors[a * 4 + byte] / 255.0f };
+            const float B[3] = { pb[0], pb[1], colors[b * 4 + byte] / 255.0f };
+            const float M[3] = { 0.5f, 0.5f, colors[im * 4 + byte] / 255.0f };
+            rgb[ch] = PlaneHeight(A, B, M, u, v);
+        }
+        return true;
+    }
+
+    bool LiquidHeightAt(float x, float y, float& outZ)
+    {
+        const float pos[3] = { x, y, -100000.0f };
+        uint32_t type = 0;
+        float h = 0.0f;
+        if (!reinterpret_cast<QueryTerrainLiquidFn>(kQueryTerrainLiquid)(pos, &type, &h, 0)) return false;
+        outZ = h;
+        return std::isfinite(h);
+    }
+
     void ClearLayerCache() { g_decoded.clear(); }
 
     bool TerrainTypeAt(float x, float y, int& outType)

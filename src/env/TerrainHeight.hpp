@@ -37,6 +37,15 @@ namespace wxl_livingazeroth::terrain
     };
     bool LayerWeightsAt(float x, float y, LayerWeights& out, bool swapAxes = false);
 
+    /// The terrain's MCCV vertex colour at world (x, y), interpolated over the same triangles as
+    /// HeightAt: rgb 0..1, where 0.5 is neutral (the terrain multiplies by 2 x the colour). False
+    /// (and no change to `rgb`) when the chunk has no MCCV, isn't loaded, or the spot is a hole.
+    bool VertexColorAt(float x, float y, float rgb[3]);
+
+    /// The surface height of terrain liquid (rivers, lakes, sea; not WMO liquid) at world (x, y),
+    /// from the client's own liquid probe. False where the terrain cell has no liquid.
+    bool LiquidHeightAt(float x, float y, float& outZ);
+
     /// Forgets every decoded chunk (call when the map changes or the world is left). Texture
     /// names in LayerWeights from before are invalid afterwards.
     void ClearLayerCache();

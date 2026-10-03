@@ -110,6 +110,8 @@ namespace wxl_livingazeroth::cover
             std::vector<uint32_t> texIds = std::vector<uint32_t>(kTex * kTex, 0);
             std::vector<uint16_t> texShares = std::vector<uint16_t>(kTex * kTex, 0);
             std::vector<uint32_t> texWeights[2] = { std::vector<uint32_t>(kTex * kTex, 0), std::vector<uint32_t>(kTex * kTex, 0) };
+            // A = wetness, RGB = the terrain's vertex colour where rows use it (0x80 = neutral).
+            std::vector<uint32_t> props = std::vector<uint32_t>(kTex * kTex, 0x00808080u);
             uint32_t slotsUploaded = 0;     // the slot generation the weight textures were built with
             bool lookDirty = true;
             int boostRows = 0;              // rows left to re-sample at full speed after a setting change
@@ -133,6 +135,7 @@ namespace wxl_livingazeroth::cover
             IDirect3DTexture9* coverTex = nullptr;
             IDirect3DTexture9* lookTex = nullptr;  // A8R8G8B8 tint per slot (when the GPU can fetch it in the VS)
             IDirect3DTexture9* texWTex[2] = {};    // A8R8G8B8 cover texture weights (pixel shader, always available)
+            IDirect3DTexture9* propsTex = nullptr; // A8R8G8B8 props (pixel shader)
         };
         Level g_levels[kMaxLevels];
 
@@ -168,11 +171,14 @@ namespace wxl_livingazeroth::cover
         covertable::Values g_hereValues;
         std::string        g_hereTexture;
         bool               g_hereValid = false;
+        float              g_hereMccv[3] = {}, g_hereLiquid = 0.0f, g_hereLiquidDepth = 0.0f;
+        bool               g_hereMccvValid = false, g_hereLiquidValid = false;
         bool               g_tintSupported = false;
 
         // CoverTexture slots from the table, loaded from the client's archives into textures of
         // our own; reloaded when the table is.
         IDirect3DTexture9* g_coverTextures[covertable::kMaxCoverTextures] = {}; // per slot (owned by the cache)
+        bool               g_slotSpecular[covertable::kMaxCoverTextures] = {};    // per slot: its alpha is a specular mask
         int                g_slotId[covertable::kMaxCoverTextures] = {};          // the ID each slot holds (0 = free)
         std::vector<int>   g_slotOfId;                                            // ID -> slot, -1 = none
         uint32_t           g_slotGeneration = 1;
@@ -215,7 +221,7 @@ namespace wxl_livingazeroth::cover
 
         // The terrain's lighting and fog as last read (for the panel): VS c12 fog, c24 sun direction
         // (view space), c25 ambient, c26 diffuse, PS c2 fog colour.
-        float g_seenFog[4] = {}, g_seenLight[12] = {}, g_seenFogColor[4] = {};
+        float g_seenFog[4] = {}, g_seenLight[16] = {}, g_seenFogColor[4] = {}; // light: c24..c27 (c27 = specular colour, exponent)
         bool  g_seenScene = false;
 
         // stats
@@ -275,7 +281,7 @@ sampler2D baseTex : register(s0);
 sampler2D coverTex : register(s1);
 sampler2D lookTex : register(s2);
 
-struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1; float2 rel : TEXCOORD2; float fog : TEXCOORD3; float4 tint : TEXCOORD4; float2 wuv : TEXCOORD5; };
+struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1; float2 rel : TEXCOORD2; float fog : TEXCOORD3; float4 tint : TEXCOORD4; float2 wuv : TEXCOORD5; float3 vpos : TEXCOORD6; };
 
 float4 Tint(float2 idx) { return look.x > 0.5 ? tex2Dlod(lookTex, float4((idx + 0.5) * grid.w, 0, 0)) : 0; }
 
@@ -337,7 +343,8 @@ VOut main(float2 ij : POSITION)
     o.rel = p.xy - eye.xy;
     float4 q = float4(o.rel, p.z - eye.z, 1);
     o.pos = float4(dot(q, vp0), dot(q, vp1), dot(q, vp2), dot(q, vp3));
-    float viewZ = dot(q.xyz, float3(vr0.z, vr1.z, vr2.z));
+    o.vpos = q.x * vr0.xyz + q.y * vr1.xyz + q.z * vr2.xyz;
+    float viewZ = o.vpos.z;
     o.fog = min(pow(max(viewZ * fogp.x + fogp.y, 0), fogp.z), 1);
     o.d = float2(s.y, s.x < -10000 ? 1 : 0);
     return o;
@@ -346,9 +353,12 @@ VOut main(float2 ij : POSITION)
 
         // PS: c0 = light direction, c1 = colour, c2.x = smallest drawn depth, c3 = the next finer
         // level's box (camera-relative min x, min y, max x, max y): this level isn't drawn there;
-        // c4 = ambient, c5 = diffuse, c6 = fog colour; the tint (rgb, a = strength) comes from the VS.
-        // Lit the way the terrain shader lights:
-        // min(ambient + diffuse * saturate(N.L), 1), then fogged towards the fog colour.
+        // c4 = ambient, c5 = diffuse, c6 = fog colour; c8/c9 = per cover texture slot 1 when its
+        // alpha is a specular mask; c10 = specular colour (rgb) and exponent (w). The tint (rgb, a =
+        // strength) comes from the VS, wetness and vertex colour from the props texture.
+        // Lit the way the terrain shader lights: min(ambient + diffuse * saturate(N.L), 1), plus
+        // Blinn-Phong specular in view space (terrain VS: pow(N.normalize(L + normalize(-pos)), c27.w)
+        // x c27.rgb, times the layer texture's alpha in its PS), then fogged towards the fog colour.
         const char* kPsHlsl = R"(
 float4 light : register(c0);
 float4 albedo : register(c1);
@@ -358,6 +368,9 @@ float4 ambient : register(c4);
 float4 diffuse : register(c5);
 float4 fogColor : register(c6);
 float4 texMap : register(c7);   // 1 / tile size (yd), uv offset (x, y): uv = rel * x + yz
+float4 specOn0 : register(c8);
+float4 specOn1 : register(c9);
+float4 specular : register(c10);
 sampler2D cover0 : register(s0);
 sampler2D cover1 : register(s1);
 sampler2D cover2 : register(s2);
@@ -368,25 +381,37 @@ sampler2D cover6 : register(s6);
 sampler2D cover7 : register(s7);
 sampler2D weights0 : register(s8); // slots 1..4 (r..a)
 sampler2D weights1 : register(s9); // slots 5..8
+sampler2D props : register(s10);   // a = wetness, rgb = vertex colour (0.5 = neutral)
 
-float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float fog : TEXCOORD3, float4 tint : TEXCOORD4, float2 wuv : TEXCOORD5) : COLOR
+float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float fog : TEXCOORD3, float4 tint : TEXCOORD4, float2 wuv : TEXCOORD5, float3 vpos : TEXCOORD6) : COLOR
 {
     clip(d.x - opts.x);
     clip(0.5 - d.y);
     float2 a = step(inner.xy, rel) * step(rel, inner.zw);
     clip(0.5 - a.x * a.y);
-    float ndl = saturate(dot(normalize(n), normalize(light.xyz)));
+    float3 nn = normalize(n), l = normalize(light.xyz);
+    float ndl = saturate(dot(nn, l));
     float3 lit = min(ambient.rgb + diffuse.rgb * ndl, 1);
     // Cover textures, tiled in world space like the terrain's layers, mixed by their share here
-    // (two filtered weight textures, slots 1..8); the plain cover colour fills the rest.
+    // (two filtered weight textures, slots 1..8); the plain cover colour fills the rest. Their
+    // alpha is the specular mask (as on the terrain's layers, or the _s texture's).
     float2 uv = rel * texMap.x + texMap.yz;
     float4 w = tex2D(weights0, wuv), v = tex2D(weights1, wuv);
-    float3 textured = tex2D(cover0, uv).rgb * w.r + tex2D(cover1, uv).rgb * w.g + tex2D(cover2, uv).rgb * w.b + tex2D(cover3, uv).rgb * w.a
-                    + tex2D(cover4, uv).rgb * v.r + tex2D(cover5, uv).rgb * v.g + tex2D(cover6, uv).rgb * v.b + tex2D(cover7, uv).rgb * v.a;
+    float4 t0 = tex2D(cover0, uv), t1 = tex2D(cover1, uv), t2 = tex2D(cover2, uv), t3 = tex2D(cover3, uv);
+    float4 t4 = tex2D(cover4, uv), t5 = tex2D(cover5, uv), t6 = tex2D(cover6, uv), t7 = tex2D(cover7, uv);
+    float3 textured = t0.rgb * w.r + t1.rgb * w.g + t2.rgb * w.b + t3.rgb * w.a + t4.rgb * v.r + t5.rgb * v.g + t6.rgb * v.b + t7.rgb * v.a;
+    float mask = dot(float4(t0.a, t1.a, t2.a, t3.a) * w, specOn0) + dot(float4(t4.a, t5.a, t6.a, t7.a) * v, specOn1);
     float share = saturate(dot(w, 1) + dot(v, 1));
     float3 base = albedo.rgb * (1 - share) + textured * albedo.w;
     float3 colour = lerp(base, tint.rgb, saturate(tint.a));
-    return float4(lerp(fogColor.rgb, colour * lit, fog), 1);
+    // Vertex colour (the terrain multiplies by 2 x it) and wetness: darker, and a stronger, tighter shine.
+    float4 pr = tex2D(props, wuv);
+    float wet = pr.a;
+    colour *= pr.rgb * 2 * (1 - 0.45 * wet);
+    float3 h = normalize(l + normalize(-vpos));
+    float sp = pow(saturate(dot(nn, h)), max(specular.w, 1) * (1 + 3 * wet)) * saturate(mask * (1 + 2 * wet));
+    float3 c = colour * lit + specular.rgb * sp;
+    return float4(lerp(fogColor.rgb, c, fog), 1);
 }
 )";
 
@@ -423,8 +448,58 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         {
             float covered = 0.0f, depth = 0.0f, maxSlope = 45.0f, slopeFade = 15.0f, drift = 0.0f, breakup = 0.5f;
             float tint[3] = {}, tintStrength = 0.0f;
+            float zOffset = 0.0f, wetness = 0.0f;
+            float vertexColor[3] = { 0.5f, 0.5f, 0.5f }; // MCCV mixed in by the rows' "use MCCV" share; 0.5 = neutral
             int   texId[8] = {}; float texShare[8] = {}; int texCount = 0; // cover textures present, by ID
         };
+
+        // Sums per blended property, in this order (cover textures go through AddTexture).
+        enum Sum { kSumDepth, kSumMaxSlope, kSumSlopeFade, kSumDrift, kSumBreakup, kSumTintR, kSumTintG, kSumTintB,
+                   kSumTintStrength, kSumZOffset, kSumWetness, kSumMccv, kSumCount };
+
+        // What the rows' flags need to know about the spot being sampled: how deep it lies under a
+        // liquid surface and the terrain's vertex colour there. Both are looked up only when a row
+        // there asks (lazily, once per sample), and always at the sample's own position -- not the
+        // warped material lookup point -- so the shoreline follows the water exactly.
+        constexpr float kShoreFade = 0.3f; // yd under the surface over which "prevent" covers taper
+        struct Probe
+        {
+            float x = 0.0f, y = 0.0f, z = 0.0f;
+            bool  valid = false;
+            int   waterState = -1;        // -1 not asked, 0 no liquid, 1 liquid
+            float waterDepth = 0.0f;      // surface - terrain (negative: the terrain is above it)
+            int   colorState = -1;
+            float color[3] = { 0.5f, 0.5f, 0.5f };
+
+            float UnderWater()
+            {
+                if (waterState < 0)
+                {
+                    float h;
+                    waterState = valid && terrain::LiquidHeightAt(x, y, h) ? 1 : 0;
+                    waterDepth = waterState ? h - z : 0.0f;
+                }
+                return waterState ? waterDepth : -1.0e6f;
+            }
+            const float* VertexColor()
+            {
+                if (colorState < 0) colorState = valid && terrain::VertexColorAt(x, y, color) ? 1 : 0;
+                return color;
+            }
+        };
+        Probe g_probe;
+
+        // A row's weight after its water flags: "prevent underwater" thins out below the surface,
+        // "prevent on land" only exists there.
+        float WaterFactor(uint32_t flags)
+        {
+            if (!(flags & (covertable::kFlagPreventUnderwater | covertable::kFlagPreventOnLand))) return 1.0f;
+            const float d = g_probe.UnderWater() / kShoreFade;
+            float f = 1.0f;
+            if (flags & covertable::kFlagPreventUnderwater) f *= d <= 0.0f ? 1.0f : (d >= 1.0f ? 0.0f : 1.0f - d);
+            if (flags & covertable::kFlagPreventOnLand)     f *= d <= 0.0f ? 0.0f : (d >= 1.0f ? 1.0f : d);
+            return f;
+        }
 
         const std::array<covertable::Values, 4>& LayerValues(const terrain::LayerWeights& lw)
         {
@@ -451,25 +526,49 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             if (b.texCount < 8) { b.texId[b.texCount] = id; b.texShare[b.texCount++] = w; }
         }
 
-        void AccumulateLayers(float x, float y, float& covered, float sum[9 + covertable::kMaxCoverTextures])
+        // One row's contribution at weight wk (its painted strength or cell weight).
+        void AddRow(const covertable::Values& cv, float wk, float& covered, float sum[kSumCount])
+        {
+            if (wk <= 0.0f || cv.depth <= 0.0f) return;
+            wk *= WaterFactor(cv.flags);
+            if (wk <= 0.0f) return;
+            covered += wk;
+            sum[kSumDepth] += wk * cv.depth;      sum[kSumMaxSlope] += wk * cv.maxSlope;   sum[kSumSlopeFade] += wk * cv.slopeFade;
+            sum[kSumDrift] += wk * cv.driftNoise; sum[kSumBreakup] += wk * cv.edgeBreakup;
+            sum[kSumTintR] += wk * ((cv.tintColor >> 16) & 0xFF) / 255.0f;
+            sum[kSumTintG] += wk * ((cv.tintColor >> 8) & 0xFF) / 255.0f;
+            sum[kSumTintB] += wk * (cv.tintColor & 0xFF) / 255.0f;
+            sum[kSumTintStrength] += wk * cv.tintStrength;
+            sum[kSumZOffset] += wk * cv.zOffset;
+            sum[kSumWetness] += wk * cv.wetness;
+            if (cv.flags & covertable::kFlagUseVertexColor) sum[kSumMccv] += wk;
+            if (cv.coverTexture > 0) AddTexture(cv.coverTexture, wk);
+        }
+
+        void FinishBlend(Blend& b, const float sum[kSumCount])
+        {
+            const float inv = 1.0f / b.covered;
+            b.depth = sum[kSumDepth] * inv; b.maxSlope = sum[kSumMaxSlope] * inv; b.slopeFade = sum[kSumSlopeFade] * inv;
+            b.drift = sum[kSumDrift] * inv; b.breakup = sum[kSumBreakup] * inv;
+            b.tint[0] = sum[kSumTintR] * inv; b.tint[1] = sum[kSumTintG] * inv; b.tint[2] = sum[kSumTintB] * inv;
+            b.tintStrength = sum[kSumTintStrength] * inv;
+            b.zOffset = sum[kSumZOffset] * inv;
+            b.wetness = sum[kSumWetness] * inv;
+            const float mccv = sum[kSumMccv] * inv;
+            if (mccv > 0.0f)
+            {
+                const float* c = g_probe.VertexColor();
+                for (int k = 0; k < 3; ++k) b.vertexColor[k] = 0.5f + (c[k] - 0.5f) * mccv;
+            }
+            for (int t = 0; t < b.texCount; ++t) b.texShare[t] *= inv;
+        }
+
+        void AccumulateLayers(float x, float y, float& covered, float sum[kSumCount])
         {
             terrain::LayerWeights lw;
             if (!terrain::LayerWeightsAt(x, y, lw, g_settings.alphaSwap != 0)) return;
             const std::array<covertable::Values, 4>& vals = LayerValues(lw);
-            for (int l = 0; l < lw.layers; ++l)
-            {
-                const float wk = lw.weight[l];
-                const covertable::Values& cv = vals[l];
-                if (wk <= 0.0f || cv.depth <= 0.0f) continue;
-                covered += wk;
-                sum[0] += wk * cv.depth;      sum[1] += wk * cv.maxSlope;   sum[2] += wk * cv.slopeFade;
-                sum[3] += wk * cv.driftNoise; sum[4] += wk * cv.edgeBreakup;
-                sum[5] += wk * ((cv.tintColor >> 16) & 0xFF) / 255.0f;
-                sum[6] += wk * ((cv.tintColor >> 8) & 0xFF) / 255.0f;
-                sum[7] += wk * (cv.tintColor & 0xFF) / 255.0f;
-                sum[8] += wk * cv.tintStrength;
-                if (cv.coverTexture > 0) AddTexture(cv.coverTexture, wk);
-            }
+            for (int l = 0; l < lw.layers; ++l) AddRow(vals[l], lw.weight[l], covered, sum);
         }
 
         Blend BlendAt(float x, float y)
@@ -484,15 +583,11 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             }
             if (g_settings.materialSource == 0)
             {
-                float sum[9 + covertable::kMaxCoverTextures] = {};
+                float sum[kSumCount] = {};
                 g_blendTarget = &b;
                 AccumulateLayers(x, y, b.covered, sum);
                 if (b.covered <= 0.0f) return b;
-                const float inv = 1.0f / b.covered;
-                b.depth = sum[0] * inv; b.maxSlope = sum[1] * inv; b.slopeFade = sum[2] * inv;
-                b.drift = sum[3] * inv; b.breakup = sum[4] * inv;
-                b.tint[0] = sum[5] * inv; b.tint[1] = sum[6] * inv; b.tint[2] = sum[7] * inv; b.tintStrength = sum[8] * inv;
-                for (int t = 0; t < b.texCount; ++t) b.texShare[t] *= inv;
+                FinishBlend(b, sum);
                 if (b.covered > 1.0f) b.covered = 1.0f;
                 return b;
             }
@@ -501,28 +596,15 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             const float fx = u - cx, fy = v - cy;
             const int c[4][2] = { { cx, cy }, { cx + 1, cy }, { cx, cy + 1 }, { cx + 1, cy + 1 } };
             const float w[4] = { (1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy };
-            float sum[9 + covertable::kMaxCoverTextures] = {};
+            float sum[kSumCount] = {};
             g_blendTarget = &b;
             for (int k = 0; k < 4; ++k)
             {
                 covertable::Values cv;
-                if (!CellValues(c[k][0], c[k][1], cv) || cv.depth <= 0.0f) continue;
-                const float wk = w[k];
-                b.covered += wk;
-                sum[0] += wk * cv.depth;      sum[1] += wk * cv.maxSlope;   sum[2] += wk * cv.slopeFade;
-                sum[3] += wk * cv.driftNoise; sum[4] += wk * cv.edgeBreakup;
-                sum[5] += wk * ((cv.tintColor >> 16) & 0xFF) / 255.0f;
-                sum[6] += wk * ((cv.tintColor >> 8) & 0xFF) / 255.0f;
-                sum[7] += wk * (cv.tintColor & 0xFF) / 255.0f;
-                sum[8] += wk * cv.tintStrength;
-                if (cv.coverTexture > 0) AddTexture(cv.coverTexture, wk);
+                if (CellValues(c[k][0], c[k][1], cv)) AddRow(cv, w[k], b.covered, sum);
             }
             if (b.covered <= 0.0f) return b;
-            const float inv = 1.0f / b.covered;
-            b.depth = sum[0] * inv; b.maxSlope = sum[1] * inv; b.slopeFade = sum[2] * inv;
-            b.drift = sum[3] * inv; b.breakup = sum[4] * inv;
-            b.tint[0] = sum[5] * inv; b.tint[1] = sum[6] * inv; b.tint[2] = sum[7] * inv; b.tintStrength = sum[8] * inv;
-            for (int t = 0; t < b.texCount; ++t) b.texShare[t] *= inv;
+            FinishBlend(b, sum);
             return b;
         }
 
@@ -562,8 +644,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             const float x = i * L.cell, y = j * L.cell;
             float z;
             const bool ok = terrain::HeightAt(x, y, z);
-            const float base = ok ? z : kHole;
-            if (base != L.base[s]) { L.base[s] = base; L.baseDirty = true; }
+            g_probe = Probe{};
+            g_probe.x = x; g_probe.y = y; g_probe.z = z; g_probe.valid = ok;
 
             Blend b;
             uint8_t slopeF = 0;
@@ -591,6 +673,10 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
                 slopeF = ToByte(t * t * (3.0f - 2.0f * t));
             }
+            // The cover's base: the terrain, moved by the rows' ZOffset (below the terrain only what
+            // rises above it shows, e.g. trench rims through grass).
+            const float base = ok ? z + (b.covered > 0.0f ? b.zOffset : 0.0f) : kHole;
+            if (base != L.base[s]) { L.base[s] = base; L.baseDirty = true; }
             const uint8_t material = ToByte(b.covered), driftAmp = ToByte(b.drift), breakup = ToByte(b.breakup);
             const uint8_t drift = static_cast<uint8_t>(Drift(x, y) * 255.0f + 0.5f);
             const uint8_t edge = static_cast<uint8_t>(EdgeNoise(x, y) * 255.0f + 0.5f);
@@ -611,9 +697,11 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             }
             const uint32_t ids = (a >= 0 ? static_cast<uint32_t>(b.texId[a]) & 0xFFFF : 0) | (c >= 0 ? (static_cast<uint32_t>(b.texId[c]) & 0xFFFF) << 16 : 0);
             const uint16_t shares = static_cast<uint16_t>((a >= 0 ? ToByte(b.texShare[a]) : 0) | (c >= 0 ? ToByte(b.texShare[c]) << 8 : 0));
-            if (tint != L.tint[s] || ids != L.texIds[s] || shares != L.texShares[s])
+            const uint32_t props = (static_cast<uint32_t>(ToByte(b.wetness)) << 24) | (static_cast<uint32_t>(ToByte(b.vertexColor[0])) << 16) |
+                                   (static_cast<uint32_t>(ToByte(b.vertexColor[1])) << 8) | ToByte(b.vertexColor[2]);
+            if (tint != L.tint[s] || ids != L.texIds[s] || shares != L.texShares[s] || props != L.props[s])
             {
-                L.tint[s] = tint; L.texIds[s] = ids; L.texShares[s] = shares;
+                L.tint[s] = tint; L.texIds[s] = ids; L.texShares[s] = shares; L.props[s] = props;
                 L.lookDirty = true;
             }
             if (isLevel0 && fresh) { g_press[s] = 0.0f; g_rim[s] = 0.0f; }
@@ -772,10 +860,11 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         {
             auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
             rel(g_vb); rel(g_ib); rel(g_decl); rel(g_vs); rel(g_ps);
-            for (Level& L : g_levels) { rel(L.baseTex); rel(L.coverTex); rel(L.lookTex); rel(L.texWTex[0]); rel(L.texWTex[1]); L.baseDirty = L.coverDirty = L.lookDirty = true; }
+            for (Level& L : g_levels) { rel(L.baseTex); rel(L.coverTex); rel(L.lookTex); rel(L.texWTex[0]); rel(L.texWTex[1]); rel(L.propsTex); L.baseDirty = L.coverDirty = L.lookDirty = true; }
             for (auto& e : g_textureCache) if (e.second) e.second->Release();
             g_textureCache.clear();
             for (IDirect3DTexture9*& t : g_coverTextures) t = nullptr;
+            for (bool& b : g_slotSpecular) b = false;
             for (int& t : g_slotId) t = 0;
             g_slotOfId.clear();
             g_coverTexturesGeneration = 0;
@@ -822,7 +911,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             if (dev != g_device) { ReleaseGpu(); g_gpuFailed = false; g_device = dev; }
             if (g_gpuFailed) return false;
             bool texturesReady = true;
-            for (const Level& L : g_levels) texturesReady &= L.baseTex && L.coverTex && L.texWTex[0] && L.texWTex[1] && (!g_tintSupported || L.lookTex);
+            for (const Level& L : g_levels) texturesReady &= L.baseTex && L.coverTex && L.texWTex[0] && L.texWTex[1] && L.propsTex && (!g_tintSupported || L.lookTex);
             if (g_vb && g_ib && g_decl && g_vs && g_ps && texturesReady) return true;
             ReleaseGpu();
 
@@ -872,6 +961,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 for (IDirect3DTexture9*& t : L.texWTex)
                     if (FAILED(dev->CreateTexture(kTex, kTex, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &t, nullptr)))
                         return fail("cover texture weight textures failed");
+            for (Level& L : g_levels)
+                if (FAILED(dev->CreateTexture(kTex, kTex, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &L.propsTex, nullptr)))
+                    return fail("props textures failed");
 
             g_vs = static_cast<IDirect3DVertexShader9*>(Compile(dev, kVsHlsl, "vs_3_0", false));
             g_ps = static_cast<IDirect3DPixelShader9*>(Compile(dev, kPsHlsl, "ps_3_0", true));
@@ -897,9 +989,23 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                     g_textureCache.erase(it);
                     break;
                 }
+            // The _s variant first (later expansions keep the specular mask in its alpha; the plain one
+            // has none), unless the row says to ignore specular. Stock 3.3.5 textures keep it in the
+            // plain texture's alpha, like the terrain's layers.
             std::string error;
-            IDirect3DTexture9* tex = blp::Load(dev, covertable::CoverTexturePath(id), error);
-            g_textureStatus[id] = tex ? "loaded" : error;
+            IDirect3DTexture9* tex = nullptr;
+            const std::string path = covertable::CoverTexturePath(id);
+            if (!covertable::CoverTextureIgnoresSpecular(id) && path.size() > 4 && _stricmp(path.c_str() + path.size() - 4, ".blp") == 0)
+            {
+                std::string unused;
+                tex = blp::Load(dev, (path.substr(0, path.size() - 4) + "_s.blp").c_str(), unused);
+                if (tex) g_textureStatus[id] = "loaded (_s)";
+            }
+            if (!tex)
+            {
+                tex = blp::Load(dev, path.c_str(), error);
+                g_textureStatus[id] = tex ? "loaded" : error;
+            }
             if (!tex) g_api->Log(WXL_LOG_WARN, kTag, "surface cover: CoverTexture \"%s\": %s", covertable::CoverTexturePath(id), error.c_str());
             g_textureCache[id] = tex;
             return tex;
@@ -951,6 +1057,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             for (int sl = 0; sl < covertable::kMaxCoverTextures; ++sl)
             {
                 g_coverTextures[sl] = g_slotId[sl] ? CachedTexture(dev, g_slotId[sl]) : nullptr;
+                g_slotSpecular[sl] = g_coverTextures[sl] && !covertable::CoverTextureIgnoresSpecular(g_slotId[sl]);
                 if (g_slotId[sl] && g_slotId[sl] <= ids) g_slotOfId[g_slotId[sl]] = sl;
             }
             ++g_slotGeneration;
@@ -975,9 +1082,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                                           (static_cast<uint32_t>(w[q * 4 + 1]) << 8) | w[q * 4 + 2];
             }
             L.slotsUploaded = g_slotGeneration;
-            IDirect3DTexture9* const textures[3] = { L.lookTex, L.texWTex[0], L.texWTex[1] };
-            const std::vector<uint32_t>* const data[3] = { &L.tint, &L.texWeights[0], &L.texWeights[1] };
-            for (int t = 0; t < 3; ++t)
+            IDirect3DTexture9* const textures[4] = { L.lookTex, L.texWTex[0], L.texWTex[1], L.propsTex };
+            const std::vector<uint32_t>* const data[4] = { &L.tint, &L.texWeights[0], &L.texWeights[1], &L.props };
+            for (int t = 0; t < 4; ++t)
             {
                 if (!textures[t]) continue;
                 D3DLOCKED_RECT lr{};
@@ -1103,7 +1210,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             if (sceneLit)
             {
                 dev->GetVertexShaderConstantF(12, g_seenFog, 1);
-                dev->GetVertexShaderConstantF(24, g_seenLight, 3);
+                dev->GetVertexShaderConstantF(24, g_seenLight, 4);
                 dev->GetPixelShaderConstantF(2, g_seenFogColor, 1);
                 g_seenScene = true;
             }
@@ -1170,6 +1277,12 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 std::memcpy(ps0 + 24, g_seenFogColor, 3 * sizeof(float));
             }
             dev->SetVertexShaderConstantF(9, vs9, 4);
+            // Specular: the terrain's colour and exponent (none when not lit like the scene, or when
+            // the terrain has no exponent set).
+            float ps8[12] = {};
+            for (int sl = 0; sl < covertable::kMaxCoverTextures; ++sl) ps8[sl] = g_slotSpecular[sl] ? 1.0f : 0.0f;
+            if (sceneLit && g_seenLight[15] > 0.0f) std::memcpy(ps8 + 8, g_seenLight + 12, 4 * sizeof(float));
+            dev->SetPixelShaderConstantF(8, ps8, 3);
             const float c13[4] = { g_tintSupported ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
             dev->SetVertexShaderConstantF(13, c13, 1);
             dev->SetPixelShaderConstantF(0, ps0, 7);
@@ -1229,9 +1342,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, L.baseTex);
                 dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, L.coverTex);
                 dev->SetTexture(D3DVERTEXTEXTURESAMPLER2, g_tintSupported ? L.lookTex : nullptr);
-                for (int q = 0; q < 2; ++q)
+                for (int q = 0; q < 3; ++q)
                 {
-                    dev->SetTexture(8 + q, L.texWTex[q]);
+                    dev->SetTexture(8 + q, q < 2 ? L.texWTex[q] : L.propsTex);
                     dev->SetSamplerState(8 + q, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
                     dev->SetSamplerState(8 + q, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
                     dev->SetSamplerState(8 + q, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
@@ -1276,7 +1389,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, nullptr);
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER2, nullptr);
-            for (int t = 0; t < covertable::kMaxCoverTextures + 2; ++t) dev->SetTexture(t, nullptr);
+            for (int t = 0; t < covertable::kMaxCoverTextures + 3; ++t) dev->SetTexture(t, nullptr);
             if (swapDepth) dev->SetDepthStencilSurface(oldDepth);
             if (oldDepth) oldDepth->Release();
             saved->Apply(); // includes the viewport
@@ -1322,7 +1435,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
 
         void __cdecl Panel(void* /*user*/)
         {
-            char line[256];
+            char line[384];
             g_api->UiCheckbox("Draw the cover", &g_settings.enabled);
             static const char* const coverage[] = { "Everywhere (test)", "From SurfaceCover.cdbc" };
             g_api->UiCombo("Where", &g_settings.coverage, coverage, 2);
@@ -1384,8 +1497,20 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 std::snprintf(line, sizeof(line), "here: texture \"%s\", ground effect %u, TerrainType %d, area %u",
                               g_hereTexture.c_str(), g_hereSurface.groundEffect, g_hereSurface.terrainType, g_hereSurface.area); add();
                 const covertable::Values& v = g_hereValues;
-                std::snprintf(line, sizeof(line), "here (table): depth %.2f, max slope %.0f, fade %.0f, drift %.2f, breakup %.2f, rim %.2f, relax %.0f s, tint %08X x %.2f, cover texture %d",
-                              v.depth, v.maxSlope, v.slopeFade, v.driftNoise, v.edgeBreakup, v.rim, v.relaxSeconds, v.tintColor, v.tintStrength, v.coverTexture); add();
+                std::snprintf(line, sizeof(line), "here (table): depth %.2f, max slope %.0f, fade %.0f, drift %.2f, breakup %.2f, rim %.2f, relax %.0f s, tint %08X x %.2f, cover texture %d, z offset %.3f, wetness %.2f, flags 0x%X",
+                              v.depth, v.maxSlope, v.slopeFade, v.driftNoise, v.edgeBreakup, v.rim, v.relaxSeconds, v.tintColor, v.tintStrength, v.coverTexture,
+                              v.zOffset, v.wetness, v.flags); add();
+                if (g_hereMccvValid)
+                    std::snprintf(line, sizeof(line), "here: vertex colour (MCCV) r %.2f g %.2f b %.2f (0.50 = neutral)", g_hereMccv[0], g_hereMccv[1], g_hereMccv[2]);
+                else
+                    std::snprintf(line, sizeof(line), "here: no vertex colour (MCCV) in this chunk");
+                add();
+                if (g_hereLiquidValid)
+                    std::snprintf(line, sizeof(line), "here: liquid surface z %.2f, %.2f yd above the terrain (%s)", g_hereLiquid, g_hereLiquidDepth,
+                                  g_hereLiquidDepth > 0.0f ? "underwater" : "dry");
+                else
+                    std::snprintf(line, sizeof(line), "here: no terrain liquid");
+                add();
             }
             else { std::snprintf(line, sizeof(line), "here: no terrain under the player"); add(); }
             if (g_hereLayersValid)
@@ -1574,6 +1699,11 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 here = covertable::Resolve(g_hereSurface.area, snap.mapId, g_hereSurface.texture, g_hereSurface.groundEffect, g_hereSurface.terrainType);
         }
         g_hereValues = here;
+        float terrainZ;
+        g_hereMccvValid = terrain::VertexColorAt(snap.playerPos[0], snap.playerPos[1], g_hereMccv);
+        g_hereLiquidValid = terrain::LiquidHeightAt(snap.playerPos[0], snap.playerPos[1], g_hereLiquid) &&
+                            terrain::HeightAt(snap.playerPos[0], snap.playerPos[1], terrainZ);
+        if (g_hereLiquidValid) g_hereLiquidDepth = g_hereLiquid - terrainZ;
         g_hereLayersValid = terrain::LayerWeightsAt(snap.playerPos[0], snap.playerPos[1], g_hereLayers, false) &&
                             terrain::LayerWeightsAt(snap.playerPos[0], snap.playerPos[1], g_hereLayersSwapped, true);
         for (int l = 0; l < 4; ++l)
