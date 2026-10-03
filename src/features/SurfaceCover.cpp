@@ -80,6 +80,7 @@ namespace wxl_livingazeroth::cover
             float stampScale = 1.0f;        // trench radius x the unit's size
             float farLift = 0.75f;          // yd added far away, against terrain drawn simpler than its heights
             int   sceneLight = 1;           // light and fog the cover like the terrain just drawn (in-pass only)
+            int   shadows = 1;              // the terrain's dynamic shadows on the cover (in-pass, lit like the scene)
             float brightness = 0.93f;       // cover albedo
             float fillBudgetMs = 2.0f;      // sampling work per frame for fills and recentres
             int   materialSource = 0;       // 0 the painted strength of every layer (alpha maps), 1 the dominant layer per cell
@@ -232,6 +233,10 @@ namespace wxl_livingazeroth::cover
         // The terrain's lighting and fog as last read (for the panel): VS c12 fog, c24 sun direction
         // (view space), c25 ambient, c26 diffuse, PS c2 fog colour.
         float g_seenFog[4] = {}, g_seenLight[16] = {}, g_seenFogColor[4] = {}; // light: c24..c27 (c27 = specular colour, exponent)
+        // The terrain's dynamic shadows as found at our draw point: which shadow maps are still bound
+        // on its samplers s5..s8, and whether they were used (all four bound and switched on).
+        bool  g_shadowBound[4] = {};
+        bool  g_shadowUsed = false;
         bool  g_seenScene = false;
 
         // stats
@@ -383,6 +388,9 @@ float4 specOn1 : register(c9);
 float4 specular : register(c10);
 float4 wetMap : register(c11);  // 1 / grid extent (yd), uv offset (x, y), on
 float4 wetBox : register(c12);  // the grid's valid box, camera-relative (min x, min y, max x, max y)
+float4 shadowOn : register(c13); // x = 1: the terrain's dynamic shadows apply
+float4 pcf[8] : register(c20);   // the terrain's PCF offsets (its PS c3..c10)
+float4 shadowM[12] : register(c30); // the terrain's shadow matrices (its VS c37..c48), from view space
 sampler2D cover0 : register(s0);
 sampler2D cover1 : register(s1);
 sampler2D cover2 : register(s2);
@@ -395,6 +403,48 @@ sampler2D weights0 : register(s8); // slots 1..4 (r..a)
 sampler2D weights1 : register(s9); // slots 5..8
 sampler2D props : register(s10);   // a = wetness, rgb = vertex colour (0.5 = neutral)
 sampler2D wetGrid : register(s11); // a = ground moisture above the material's rest (env/Fields)
+sampler2D shadow0 : register(s12); // the terrain's shadow maps (its s5..s8): three cascades, then far
+sampler2D shadow1 : register(s13);
+sampler2D shadow2 : register(s14);
+sampler2D shadow3 : register(s15);
+
+float Tap(sampler2D s, float2 uv, float z) { return tex2Dlod(s, float4(uv, z, 0)).x; }
+
+// 1 = lit, 0 = in shadow. The same cascades, tests and PCF taps as the terrain's Terrain3 shader
+// (dumped 2026-10-02): 9 taps in the nearest cascade, 5 in the next two, then the far map fading out.
+float Shadow(float3 vp)
+{
+    float4 p = float4(vp, 1);
+    float4 a = float4(dot(p, shadowM[0]), dot(p, shadowM[1]), dot(p, shadowM[2]), dot(p, shadowM[9]));
+    float4 b = float4(dot(p, shadowM[3]), dot(p, shadowM[4]), dot(p, shadowM[5]), dot(p, shadowM[10]));
+    float4 c = float4(dot(p, shadowM[6]), dot(p, shadowM[7]), dot(p, shadowM[8]), dot(p, shadowM[11]));
+    [branch] if (saturate(max(abs(a.x), abs(a.y)) * -3.4482758 + 3.41379309) > 0)
+    {
+        float2 uv = a.xy * 0.5 + 0.5;
+        float s = Tap(shadow0, uv, a.z);
+        [unroll] for (int k = 0; k < 8; ++k) s += Tap(shadow0, uv + pcf[k].xy, a.z);
+        return s / 9;
+    }
+    [branch] if (max(abs(b.x), abs(b.y)) < 1)
+    {
+        float2 uv = b.xy * 0.5 + 0.5;
+        float s = Tap(shadow1, uv, b.z);
+        [unroll] for (int k = 0; k < 8; k += 2) s += Tap(shadow1, uv + pcf[k].xy, b.z);
+        return s * 0.2;
+    }
+    [branch] if (max(abs(c.x), abs(c.y)) < 1)
+    {
+        float2 uv = c.xy * 0.5 + 0.5;
+        float s = Tap(shadow2, uv, c.z);
+        [unroll] for (int k = 0; k < 8; k += 2) s += Tap(shadow2, uv + pcf[k].xy, c.z);
+        return s * 0.2;
+    }
+    float2 uv = float2(a.w, b.w) * 0.5 + 0.5;
+    float s = Tap(shadow3, uv, c.w);
+    [unroll] for (int k = 0; k < 8; k += 2) s += Tap(shadow3, uv + pcf[k].xy, c.w);
+    float edge = saturate(max(abs(a.w), abs(b.w)) * -11.1111107 + 11);
+    return edge * (s * 0.2 - 1) + 1;
+}
 
 float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float fog : TEXCOORD3, float4 tint : TEXCOORD4, float2 wuv : TEXCOORD5, float3 vpos : TEXCOORD6) : COLOR
 {
@@ -425,7 +475,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
     colour *= pr.rgb * 2 * (1 - 0.45 * wet);
     float3 h = normalize(l + normalize(-vpos));
     float sp = pow(saturate(dot(nn, h)), max(specular.w, 1) * (1 + 3 * wet)) * saturate(mask * (1 + 2 * wet));
-    float3 c = colour * lit + specular.rgb * sp;
+    // Dynamic shadows like the terrain's: down to 70% in full shadow, no shine there.
+    float shade = shadowOn.x > 0.5 ? Shadow(vpos) : 1;
+    float3 c = colour * lit * (0.7 + 0.3 * shade) + specular.rgb * sp * shade;
     return float4(lerp(fogColor.rgb, c, fog), 1);
 }
 )";
@@ -1250,6 +1302,34 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 g_seenScene = true;
             }
 
+            // The terrain's dynamic shadows (its Terrain2/3 shaders): shadow matrices VS c37..c48, PCF
+            // offsets PS c3..c10, shadow maps s5..s8 with their sampler states. The client applies its
+            // render-state pop lazily (at its next draw), so they're still on the device here.
+            float shadowMatrices[48] = {}, pcfOffsets[32] = {};
+            IDirect3DBaseTexture9* shadowMaps[4] = {};
+            DWORD shadowStates[4][7] = {};
+            constexpr D3DSAMPLERSTATETYPE kShadowStates[7] = { D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER,
+                                                               D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_BORDERCOLOR, D3DSAMP_SRGBTEXTURE };
+            g_shadowUsed = false;
+            if (sceneLit)
+            {
+                bool all = true;
+                for (int k = 0; k < 4; ++k)
+                {
+                    dev->GetTexture(5 + k, &shadowMaps[k]);
+                    g_shadowBound[k] = shadowMaps[k] != nullptr;
+                    all &= g_shadowBound[k];
+                    for (int st = 0; st < 7; ++st) dev->GetSamplerState(5 + k, kShadowStates[st], &shadowStates[k][st]);
+                }
+                g_shadowUsed = all && g_settings.shadows;
+                if (g_shadowUsed)
+                {
+                    dev->GetVertexShaderConstantF(37, shadowMatrices, 12);
+                    dev->GetPixelShaderConstantF(3, pcfOffsets, 8);
+                }
+            }
+            else for (bool& b : g_shadowBound) b = false;
+
             IDirect3DStateBlock9* saved = nullptr;
             if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &saved)) || !saved) return;
             // Depth-test against the surface the world was drawn into; at the end of the scene whatever
@@ -1348,6 +1428,23 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 dev->SetPixelShaderConstantF(12, c12, 1);
             }
 
+            // The terrain's shadow maps on our free samplers s12..s15, exactly as it sampled them.
+            {
+                const float c13[4] = { g_shadowUsed ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+                dev->SetPixelShaderConstantF(13, c13, 1);
+                if (g_shadowUsed)
+                {
+                    dev->SetPixelShaderConstantF(20, pcfOffsets, 8);
+                    dev->SetPixelShaderConstantF(30, shadowMatrices, 12);
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        dev->SetTexture(12 + k, shadowMaps[k]);
+                        for (int st = 0; st < 7; ++st) dev->SetSamplerState(12 + k, kShadowStates[st], shadowStates[k][st]);
+                    }
+                }
+            }
+            for (IDirect3DBaseTexture9*& t : shadowMaps) if (t) { t->Release(); t = nullptr; }
+
             dev->SetVertexDeclaration(g_decl);
             dev->SetStreamSource(0, g_vb, 0, 8);
             dev->SetIndices(g_ib);
@@ -1434,7 +1531,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, nullptr);
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER2, nullptr);
-            for (int t = 0; t < covertable::kMaxCoverTextures + 4; ++t) dev->SetTexture(t, nullptr);
+            for (int t = 0; t < 16; ++t) dev->SetTexture(t, nullptr);
             if (swapDepth) dev->SetDepthStencilSurface(oldDepth);
             if (oldDepth) oldDepth->Release();
             saved->Apply(); // includes the viewport
@@ -1497,6 +1594,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             g_api->UiSliderFloat("Trench width (x unit size)", &g_settings.stampScale, 0.3f, 3.0f);
             g_api->UiSliderFloat("Far lift (yd, 80 -> 400 yd away)", &g_settings.farLift, 0.0f, 3.0f);
             g_api->UiCheckbox("Light and fog like the terrain", &g_settings.sceneLight);
+            g_api->UiCheckbox("Dynamic shadows like the terrain", &g_settings.shadows);
             g_api->UiSliderFloat("Snow brightness", &g_settings.brightness, 0.3f, 1.5f);
             g_api->UiSliderFloat("Fill budget (ms per frame)", &g_settings.fillBudgetMs, 0.5f, 10.0f);
             static const char* const sources[] = { "Painted strength of every layer (alpha maps)", "Dominant layer per terrain cell (old)" };
@@ -1607,6 +1705,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                               g_seenLight[8], g_seenLight[9], g_seenLight[10]); add();
                 std::snprintf(line, sizeof(line), "terrain fog: params %.6f %.4f %.4f %.4f, colour %.3f %.3f %.3f",
                               g_seenFog[0], g_seenFog[1], g_seenFog[2], g_seenFog[3], g_seenFogColor[0], g_seenFogColor[1], g_seenFogColor[2]); add();
+                std::snprintf(line, sizeof(line), "terrain shadow maps at our draw: s5 %s, s6 %s, s7 %s, s8 %s -> cover shadows %s",
+                              g_shadowBound[0] ? "bound" : "-", g_shadowBound[1] ? "bound" : "-", g_shadowBound[2] ? "bound" : "-", g_shadowBound[3] ? "bound" : "-",
+                              g_shadowUsed ? "on" : (g_settings.shadows ? "off (not all bound: shadow quality off, or the client unbinds them)" : "off (switched off)")); add();
             }
 
             static char status[64] = "";
