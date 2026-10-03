@@ -3,6 +3,7 @@
 #include "../env/Climate.hpp"
 #include "../env/Fields.hpp"
 #include "../env/TerrainHeight.hpp"
+#include "../features/TerrainWetness.hpp"
 #include "../env/WorldQuery.hpp"
 
 #include <cstdio>
@@ -90,6 +91,16 @@ namespace wxl_livingazeroth::debug
             std::snprintf(line, sizeof(line), "moisture grid: %u / %u cells sampled, %u under water; fill %.2f ms, shore pass %.2f ms, step %.2f ms",
                           st.filled, st.cells, st.water, st.fillMs, st.transformMs, st.tickMs);
             g_api->UiText(line);
+
+            g_api->UiSeparator();
+            g_api->UiTextWrapped(terrainwet::StatusLine());
+            int terrainOn = terrainwet::Enabled() ? 1 : 0;
+            if (g_api->UiCheckbox("wet terrain (darker where the ground is wetter than its rest)", &terrainOn)) terrainwet::SetEnabled(terrainOn != 0);
+            static const char* const kDebugViews[] = { "debug: off", "debug: whole moisture grid (+-128 yd)", "debug: whole terrain", "debug: 10 yd stripes" };
+            int debugView = terrainwet::Debug();
+            if (g_api->UiCombo("wet terrain debug view", &debugView, kDebugViews, 4)) terrainwet::SetDebug(debugView);
+            float strength = terrainwet::Strength();
+            if (g_api->UiSliderFloat("wet terrain strength", &strength, 0.0f, 1.0f)) terrainwet::SetStrength(strength);
 
             g_api->UiSeparator();
             g_api->UiText("Testing (not saved):");

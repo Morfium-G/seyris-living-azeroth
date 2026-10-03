@@ -1,17 +1,23 @@
-// General stock-shader patching: recognize a stock vertex shader when the client creates it, and
-// create a patched version instead. The patch is applied to the client's own bytecode (disassemble,
+// General stock-shader patching: recognize a stock shader when the client creates it, and create a
+// patched version instead. The patch is applied to the client's own bytecode (disassemble,
 // insert assembly, reassemble), so everything the stock shader does -- every shadow variant,
 // every output -- stays exactly as it was; only the inserted block is ours.
 //
-// One detour on the client's per-shader create entry serves every rule. Recognition is by version
-// token + exact bytecode length (stable per client build). Rules must be registered before
-// Install(), which must run from WXL_Load.
+// One detour per create entry (vertex, pixel) serves every rule. Two kinds of rule:
+//  - VertexRule: recognized by version token + exact bytecode length (stable per client build),
+//    edited by inserting text after fixed anchors.
+//  - TableRule: recognized by the wrapper being in one of the client's shader tables (the set loader
+//    fills a table before any of its shaders is created, so this holds for every variant, GPU class
+//    and device reset), edited by a callback on the disassembly.
+// Rules must be registered before Install(), which must run from WXL_Load.
 #pragma once
 
 #include "wxl/PluginApi.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace wxl_livingazeroth::shaderpatch
@@ -26,15 +32,27 @@ namespace wxl_livingazeroth::shaderpatch
         std::string           body;          // the inserted instructions
     };
 
+    struct TableRule
+    {
+        const char* name;
+        bool        pixel;   // pixel shaders (else vertex)
+        std::vector<std::pair<uintptr_t, int>> tables; // (address, entries) of wrapper-pointer tables
+        /// Edits the disassembly in place. False = leave this shader stock (`why` says why: a variant
+        /// the patch doesn't apply to is skipped, not failed).
+        std::function<bool(std::string& source, std::string& why)> edit;
+    };
+
     struct RuleStatus
     {
         std::string name;
         unsigned    applied = 0;   // shaders created with the patch
+        unsigned    skipped = 0;   // matched, but the edit didn't apply to this variant (left stock)
         unsigned    failed = 0;    // matched but couldn't be patched (see lastError)
         std::string lastError;
     };
 
     void Register(VertexRule rule);
+    void Register(TableRule rule);
 
     /// Attaches the create detour. Call from WXL_Load (core arms detours once, after all loads).
     bool Install(const WXL_Api* api);

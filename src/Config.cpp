@@ -5,6 +5,7 @@
 #include "features/GrassInstanced.hpp"
 #include "features/GrassMotion.hpp"
 #include "features/SurfaceCover.hpp"
+#include "features/TerrainWetness.hpp"
 #include "render/PostAA.hpp"
 #include "wxl_seyris/SettingsApi.hpp"
 
@@ -95,6 +96,9 @@ namespace wxl_livingazeroth::config
             Bool(s, "SurfaceCoverTrenches", "Characters and creatures carve trenches in the cover.", cover::Trenches()),
             Float(s, "SurfaceCoverDepth", "Your multiplier on the cover depth from SurfaceCover.cdbc (1 = as the table says).", cover::DepthMultiplier()),
             Float(s, "SurfaceCoverFillBudgetMs", "Milliseconds per frame spent filling the cover around you (on login, teleports, moving). Lower = smoother, slower to appear.", cover::FillBudgetMs()));
+
+        terrainwet::SetEnabled(Bool(s, "TerrainWetness", "The terrain itself looks darker where the ground is wet (rain, water nearby).", terrainwet::Enabled()));
+        terrainwet::SetStrength(Float(s, "TerrainWetnessStrength", "How much darker soaked terrain gets, 0..1.", terrainwet::Strength()));
 
         shelter::SetEnabled(Bool(s, "WindShelter", "Roofs and overhangs shelter the ground below from wind.", shelter::Enabled()));
         shelter::SetLeeEnabled(Bool(s, "WindLee", "Walls and cliffs cast a wind shadow on their downwind side.", shelter::LeeEnabled()));

@@ -22,6 +22,102 @@ namespace wxl_livingazeroth::shaderpatch
 
         struct CachedBlob { uint32_t stockLength; std::vector<uint8_t> code; };
 
+        const WXL_Api* g_api = nullptr;
+
+        // The client's pixel-shader create entry, twin of the vertex one (core's kShaderCreateVertex
+        // 0x6AA0D0): same wrapper fields, calls the device's CreatePixelShader (vtable +0x1A8).
+        // __thiscall(device, wrapper), ret 4. Verified in XWorkbench 2026-10-03.
+        constexpr uintptr_t kShaderCreatePixel = 0x006AA070;
+
+        struct TableEntry
+        {
+            TableRule  def;
+            RuleStatus status;
+            std::vector<std::pair<uint64_t, std::vector<uint8_t>>> cache; // stock hash -> patched (empty = left stock)
+            std::string skipReasons; // logged once each
+        };
+        std::vector<TableEntry> g_tableRules;
+        sh::off::ShaderCreateVertexFn g_origCreatePixel = nullptr;
+
+        uint64_t Hash(const uint8_t* p, uint32_t n)
+        {
+            uint64_t h = 1469598103934665603ull;
+            for (uint32_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+            return h ^ n;
+        }
+
+        bool InTables(const TableRule& r, const void* wrapper)
+        {
+            for (const auto& t : r.tables)
+                for (int i = 0; i < t.second; ++i)
+                    if (reinterpret_cast<void* const*>(t.first)[i] == wrapper) return true;
+            return false;
+        }
+
+        // The patched bytecode for a table rule's shader, or null to leave it stock.
+        const std::vector<uint8_t>* BuildTablePatched(TableEntry& r, const uint8_t* stock, uint32_t length)
+        {
+            const uint64_t key = Hash(stock, length);
+            for (const auto& c : r.cache)
+                if (c.first == key) return c.second.empty() ? nullptr : &c.second;
+
+            std::string src, why;
+            std::vector<uint8_t> code;
+            if (!Disassemble(stock, length, src, why)) { ++r.status.failed; r.status.lastError = why; }
+            else if (!r.def.edit(src, why))
+            {
+                ++r.status.skipped;
+                // Each distinct reason once.
+                if (r.skipReasons.find(why) == std::string::npos)
+                {
+                    r.skipReasons += why + ";";
+                    g_api->Log(WXL_LOG_INFO, kTag, "shader patch '%s': a variant left stock (%s).", r.def.name, why.c_str());
+                }
+            }
+            else if (!Assemble(src, r.def.name, code, why))
+            {
+                ++r.status.failed;
+                r.status.lastError = why;
+                g_api->Log(WXL_LOG_WARN, kTag, "shader patch '%s': %s", r.def.name, why.c_str());
+                code.clear();
+            }
+            r.cache.emplace_back(key, std::move(code));
+            return r.cache.back().second.empty() ? nullptr : &r.cache.back().second;
+        }
+
+        // Shared by both create detours: substitute the bytecode for this one call, then restore.
+        bool CreateWithTableRules(bool pixel, void* device, void* edx, void* wrapper, sh::off::ShaderCreateVertexFn original)
+        {
+            auto* base    = static_cast<uint8_t*>(wrapper);
+            auto* lenPtr  = reinterpret_cast<uint32_t*>(base + sh::off::kCgxShaderByteLen);
+            auto* codePtr = reinterpret_cast<const uint8_t**>(base + sh::off::kCgxShaderBytePtr);
+            if (!*codePtr || *lenPtr < 8) return false;
+            for (TableEntry& r : g_tableRules)
+            {
+                if (r.def.pixel != pixel || !InTables(r.def, wrapper)) continue;
+                const std::vector<uint8_t>* patched = BuildTablePatched(r, *codePtr, *lenPtr);
+                if (!patched) return false;
+                const uint8_t* savedCode = *codePtr;
+                const uint32_t savedLen  = *lenPtr;
+                *codePtr = patched->data();
+                *lenPtr  = static_cast<uint32_t>(patched->size());
+                original(device, edx, wrapper);
+                *codePtr = savedCode;
+                *lenPtr  = savedLen;
+                if (r.status.applied++ == 0)
+                    g_api->Log(WXL_LOG_INFO, kTag, "shader patch '%s': first shader patched (%u -> %u bytes).",
+                               r.def.name, savedLen, static_cast<unsigned>(patched->size()));
+                return true;
+            }
+            return false;
+        }
+
+        void __fastcall hkCreatePixel(void* device, void* edx, void* wrapper)
+        {
+            if (wrapper && CreateWithTableRules(true, device, edx, wrapper, g_origCreatePixel)) return;
+            g_origCreatePixel(device, edx, wrapper);
+        }
+
         struct Rule
         {
             VertexRule              def;
@@ -29,7 +125,6 @@ namespace wxl_livingazeroth::shaderpatch
             std::vector<CachedBlob> cache; // one patched blob per stock length, kept for the process
         };
 
-        const WXL_Api*    g_api = nullptr;
         std::vector<Rule> g_rules;
         sh::off::ShaderCreateVertexFn g_origCreate = nullptr;
 
@@ -92,6 +187,7 @@ namespace wxl_livingazeroth::shaderpatch
         // one call, then put the stock pointer/length back so the wrapper stays exactly as it was.
         void __fastcall hkCreateVertex(void* device, void* edx, void* wrapper)
         {
+            if (wrapper && CreateWithTableRules(false, device, edx, wrapper, g_origCreate)) return;
             if (wrapper)
             {
                 auto* base    = static_cast<uint8_t*>(wrapper);
@@ -126,15 +222,34 @@ namespace wxl_livingazeroth::shaderpatch
         g_rules.push_back(std::move(r));
     }
 
+    void Register(TableRule rule)
+    {
+        TableEntry r;
+        r.status.name = rule.name;
+        r.def = std::move(rule);
+        g_tableRules.push_back(std::move(r));
+    }
+
     bool Install(const WXL_Api* api)
     {
         g_api = api;
-        if (g_rules.empty()) return true;
-        const int ok = api->HookAttach("LivingAzeroth.ShaderCreateVertex", sh::off::kShaderCreateVertex,
-                                       reinterpret_cast<void*>(&hkCreateVertex),
-                                       reinterpret_cast<void**>(&g_origCreate), WXL_HOOK_DEFAULT_PRIORITY);
-        api->Log(ok ? WXL_LOG_INFO : WXL_LOG_WARN, kTag, "shader patch: create hook %s (%u rule(s)).",
-                 ok ? "installed" : "FAILED to install", static_cast<unsigned>(g_rules.size()));
+        bool vertex = !g_rules.empty(), pixel = false;
+        for (const TableEntry& r : g_tableRules) (r.def.pixel ? pixel : vertex) = true;
+        int ok = 1;
+        if (vertex)
+        {
+            ok &= api->HookAttach("LivingAzeroth.ShaderCreateVertex", sh::off::kShaderCreateVertex,
+                                  reinterpret_cast<void*>(&hkCreateVertex),
+                                  reinterpret_cast<void**>(&g_origCreate), WXL_HOOK_DEFAULT_PRIORITY);
+        }
+        if (pixel)
+        {
+            ok &= api->HookAttach("LivingAzeroth.ShaderCreatePixel", kShaderCreatePixel,
+                                  reinterpret_cast<void*>(&hkCreatePixel),
+                                  reinterpret_cast<void**>(&g_origCreatePixel), WXL_HOOK_DEFAULT_PRIORITY);
+        }
+        api->Log(ok ? WXL_LOG_INFO : WXL_LOG_WARN, kTag, "shader patch: create hooks %s (%u vertex rule(s), %u table rule(s)).",
+                 ok ? "installed" : "FAILED to install", static_cast<unsigned>(g_rules.size()), static_cast<unsigned>(g_tableRules.size()));
         return ok != 0;
     }
 
@@ -142,6 +257,7 @@ namespace wxl_livingazeroth::shaderpatch
     {
         std::vector<RuleStatus> out;
         for (const Rule& r : g_rules) out.push_back(r.status);
+        for (const TableEntry& r : g_tableRules) out.push_back(r.status);
         return out;
     }
 

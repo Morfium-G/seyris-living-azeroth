@@ -30,6 +30,7 @@
 #include "features/GrassMotion.hpp"
 #include "features/GrassPerf.hpp"
 #include "features/SurfaceCover.hpp"
+#include "features/TerrainWetness.hpp"
 #include "render/PostAA.hpp"
 #include "render/SceneDepth.hpp"
 #include "render/ShaderPatch.hpp"
@@ -125,6 +126,7 @@ int __cdecl WXL_Load(const WXL_Api* api)
 
     // Features register their shader patches first; the single create hook goes in after.
     wxl_livingazeroth::grass::Install(api);
+    wxl_livingazeroth::terrainwet::Register();
     wxl_livingazeroth::shaderpatch::Install(api);
 
     // Surface cover spike: draws at the end of the world scene (before anti-aliasing's pass).
