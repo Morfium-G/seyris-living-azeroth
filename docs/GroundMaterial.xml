@@ -5,4 +5,6 @@
     <Field Name="RestMoisture" Type="float" />
     <Field Name="Stiffness" Type="float" />
     <Field Name="Flags" Type="int" />
+    <Field Name="Absorbency" Type="float" />
+    <Field Name="Temperature" Type="float" />
   </Table>

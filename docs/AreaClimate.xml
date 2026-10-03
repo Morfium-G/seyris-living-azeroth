@@ -1,0 +1,11 @@
+  <Table Name="AreaClimate" Build="12340">
+    <Field Name="ID" Type="int" IsIndex="true" />
+    <Field Name="ScopeType" Type="int" />
+    <Field Name="ScopeID" Type="int" />
+    <Field Name="DayTemp" Type="float" />
+    <Field Name="NightTemp" Type="float" />
+    <Field Name="SeasonAmplitude" Type="float" />
+    <Field Name="SeasonOffset" Type="float" />
+    <Field Name="Humidity" Type="float" />
+    <Field Name="Flags" Type="int" />
+  </Table>

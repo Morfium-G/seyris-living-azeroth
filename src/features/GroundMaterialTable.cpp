@@ -1,5 +1,6 @@
 #include "GroundMaterialTable.hpp"
 
+#include "../env/CdbcLoad.hpp"
 #include "../env/WorldQuery.hpp"
 #include "../wxl_seyris/CdbcApi.hpp"
 
@@ -7,6 +8,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -21,8 +23,10 @@ namespace wxl_livingazeroth::materials
             {"RestMoisture", 3, WXL_CDBC_FIELD_VALUE},
             {"Stiffness",    4, WXL_CDBC_FIELD_VALUE},
             {"Flags",        5, WXL_CDBC_FIELD_VALUE},
+            {"Absorbency",   6, WXL_CDBC_FIELD_VALUE}, // appended: older files without it still load
+            {"Temperature",  7, WXL_CDBC_FIELD_VALUE}, // appended; signed (-1000 = none)
         };
-        constexpr WXL_SeyrisCdbcDefinition kMaterialDef = { "GroundMaterial", "DBFilesClient\\GroundMaterial.cdbc", kMaterialFields, 6 };
+        constexpr WXL_SeyrisCdbcDefinition kMaterialDef = { "GroundMaterial", "DBFilesClient\\GroundMaterial.cdbc", kMaterialFields, 8 };
 
         constexpr WXL_SeyrisCdbcField kSelectorFields[] = {
             {"ID",             0, WXL_CDBC_FIELD_VALUE},
@@ -31,7 +35,7 @@ namespace wxl_livingazeroth::materials
             {"TexturePath",    3, WXL_CDBC_FIELD_STRING},
             {"GroundEffectID", 4, WXL_CDBC_FIELD_VALUE},
             {"TerrainType",    5, WXL_CDBC_FIELD_VALUE},
-            {"LiquidType",     6, WXL_CDBC_FIELD_VALUE}, // reserved for liquid materials: rows with one aren't terrain rows
+            {"LiquidType",     6, WXL_CDBC_FIELD_VALUE}, // liquid rows: LiquidType.dbc ID; they aren't terrain rows
             {"MaterialID",     7, WXL_CDBC_FIELD_VALUE},
             {"Flags",          8, WXL_CDBC_FIELD_VALUE},
         };
@@ -43,7 +47,7 @@ namespace wxl_livingazeroth::materials
         {
             std::string name;
             uint32_t    parent = 0;
-            float       restMoisture = -1.0f, stiffness = -1.0f;
+            float       restMoisture = -1.0f, stiffness = -1.0f, absorbency = -1.0f, temperature = -1000.0f;
             uint32_t    flags = 0;
         };
         std::unordered_map<uint32_t, Material> g_materials;
@@ -56,6 +60,9 @@ namespace wxl_livingazeroth::materials
             uint32_t    material = 0;
         };
         std::map<std::pair<uint32_t, uint32_t>, std::vector<Selector>> g_selectors; // (scope type, scope id) -> rows
+        // Liquid rows by place: LiquidType ID -> material.
+        std::map<std::pair<uint32_t, uint32_t>, std::unordered_map<uint32_t, uint32_t>> g_liquidSelectors;
+        std::map<std::tuple<uint32_t, int, uint32_t>, uint32_t> g_liquidCache; // (area, map, liquid) -> material
         unsigned    g_selectorCount = 0;
         std::string g_status = "not loaded yet";
         uint32_t    g_generation = 1;
@@ -120,6 +127,8 @@ namespace wxl_livingazeroth::materials
     {
         g_materials.clear();
         g_selectors.clear();
+        g_liquidSelectors.clear();
+        g_liquidCache.clear();
         g_cache.clear();
         g_selectorCount = 0;
         ++g_generation;
@@ -129,7 +138,7 @@ namespace wxl_livingazeroth::materials
 
         char err[256] = {};
         std::string materialStatus, selectorStatus;
-        if (void* table = cdbc->Load(&kMaterialDef, err, sizeof(err)))
+        if (void* table = cdbcload::LoadAppendOnly(cdbc, kMaterialDef, err, sizeof(err)))
         {
             const uint32_t count = cdbc->RowCount(table);
             for (uint32_t i = 0; i < count; ++i)
@@ -142,6 +151,8 @@ namespace wxl_livingazeroth::materials
                 m.restMoisture = BitsToFloat(cdbc->Value(table, rec, "RestMoisture", 0));
                 m.stiffness = BitsToFloat(cdbc->Value(table, rec, "Stiffness", 0));
                 m.flags = cdbc->Value(table, rec, "Flags", 0);
+                m.absorbency = cdbcload::Float(cdbc, table, rec, "Absorbency", -1.0f);
+                m.temperature = cdbcload::Float(cdbc, table, rec, "Temperature", -1000.0f);
                 if (m.parent == 0xFFFFFFFFu) m.parent = 0; // -1 written for "none" works too
                 g_materials[cdbc->Value(table, rec, "ID", 0)] = std::move(m);
             }
@@ -157,10 +168,15 @@ namespace wxl_livingazeroth::materials
             {
                 const void* rec = cdbc->RowAt(table, i);
                 if (!rec) continue;
-                if (cdbc->Value(table, rec, "LiquidType", 0)) continue; // liquid materials: not used yet
-                Selector s;
                 const uint32_t scope = cdbc->Value(table, rec, "ScopeType", 0);
                 const uint32_t id = scope == kGlobal ? 0 : cdbc->Value(table, rec, "ScopeID", 0);
+                if (const uint32_t liquid = cdbc->Value(table, rec, "LiquidType", 0))
+                {
+                    g_liquidSelectors[{ scope, id }][liquid] = cdbc->Value(table, rec, "MaterialID", 0);
+                    ++g_selectorCount;
+                    continue;
+                }
+                Selector s;
                 s.texture = Normalize(cdbc->GetString(table, rec, "TexturePath"));
                 s.effect = cdbc->Value(table, rec, "GroundEffectID", 0);
                 s.terrain = static_cast<int32_t>(cdbc->Value(table, rec, "TerrainType", 0));
@@ -211,17 +227,45 @@ namespace wxl_livingazeroth::materials
     Values Get(uint32_t materialId)
     {
         Values v;
-        bool moisture = false, stiffness = false;
+        bool moisture = false, stiffness = false, absorbency = false, temperature = false;
         ForChain(materialId, [&](uint32_t id)
         {
             const Material* m = Find(id);
             if (!m) return false;
-            if (!moisture && m->restMoisture >= 0.0f) { v.restMoisture = m->restMoisture; moisture = true; }
+            if (!moisture && m->restMoisture >= 0.0f) { v.restMoisture = m->restMoisture > 1.0f ? 1.0f : m->restMoisture; moisture = true; }
             if (!stiffness && m->stiffness >= 0.0f)   { v.stiffness = m->stiffness > 1.0f ? 1.0f : m->stiffness; stiffness = true; }
+            if (!absorbency && m->absorbency >= 0.0f) { v.absorbency = m->absorbency > 1.0f ? 1.0f : m->absorbency; absorbency = true; }
+            if (!temperature && m->temperature > -1000.0f) { v.temperature = m->temperature; temperature = true; }
             if (id == materialId) v.flags = m->flags;
-            return !(moisture && stiffness);
+            return !(moisture && stiffness && absorbency && temperature);
         });
+        v.restMoistureSet = moisture;
+        v.hasTemperature = temperature;
         return v;
+    }
+
+    uint32_t SelectLiquid(uint32_t liquidType, uint32_t areaId, int mapId)
+    {
+        const auto key = std::make_tuple(areaId, mapId, liquidType);
+        if (auto it = g_liquidCache.find(key); it != g_liquidCache.end()) return it->second;
+        uint32_t material = 0;
+        bool found = false;
+        auto look = [&](uint32_t scope, uint32_t id)
+        {
+            if (found) return;
+            auto rows = g_liquidSelectors.find({ scope, id });
+            if (rows == g_liquidSelectors.end()) return;
+            auto row = rows->second.find(liquidType);
+            if (row != rows->second.end()) { material = row->second; found = true; }
+        };
+        uint32_t chain[world::kMaxAreaChain];
+        const int n = world::AreaChain(areaId, chain, world::kMaxAreaChain);
+        for (int i = 0; i < n; ++i) look(kArea, chain[i]);
+        if (mapId >= 0) look(kMap, static_cast<uint32_t>(mapId));
+        look(kGlobal, 0);
+        if (g_liquidCache.size() > 4096) g_liquidCache.clear();
+        g_liquidCache.emplace(key, material);
+        return material;
     }
 
     uint32_t Parent(uint32_t materialId)

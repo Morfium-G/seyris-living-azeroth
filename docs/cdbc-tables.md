@@ -3,6 +3,15 @@
 Plain WDBC files in the client's `DBFilesClient\` folder. Editor definitions (WDBC-editor XML) are
 next to this file.
 
+**Rules for every table here:**
+- Columns are only ever **appended**. A file from before a column existed still loads: the missing
+  column counts as "not set" (inherit), so adding a column never needs a converter. To get the new
+  columns into a file for editing: `python tools/upgrade_tables.py <DBFilesClient folder>` (fills
+  them with "not set", keeps a timestamped `.bak`). Layout changes that aren't appends ship with a
+  converter in `tools/`.
+- **−1 inherits** (takes the value from the next row up, as each table describes). **Signed columns**
+  (temperatures, offsets) inherit at **−1000** and below instead, since −1 °C is a real value.
+
 ## WindProfile.cdbc — `WindProfile.xml`
 
 Wind per scope. Lookup: Global < Map < Area (zone) < Area (sub-area); the more specific row wins
@@ -99,7 +108,7 @@ all three.
 | TexturePath | the painted texture's path, e.g. as the panel shows it; **empty = any**. Case and `/` vs `\` don't matter |
 | GroundEffectID | GroundEffectTexture.dbc ID (the effect painted with the texture); **0 = any** |
 | TerrainType | TerrainType.dbc ID; **-1 = any** (0 is Dirt). Stock: 0 Dirt, 1 Metallic, 2 Stone, 3 Snow, 4 Wood, 5 Grass, 6 Leaves, 7 Sand, 8 Soggy, 9 Dusty Grass, 10 None, 11 Water |
-| LiquidType | **reserved** for liquid materials (LiquidType.dbc IDs, as baked into ADTs and WMOs); 0 for terrain rows. Rows with a LiquidType are skipped for now |
+| LiquidType | **0 for terrain rows.** A LiquidType.dbc ID (as baked into ADTs and WMOs) makes this a **liquid row**: that liquid is this material. Only ScopeType/ScopeID and MaterialID count on liquid rows (place: area chain → map → global, the most specific wins) |
 | MaterialID | the GroundMaterial; **0 = no material here** (switches a broader row off, e.g. no snow in one zone) |
 | Flags | reserved, 0 |
 
@@ -119,9 +128,28 @@ should be a different material gets a TexturePath row; a zone that's different g
 | RestMoisture | 0 = bone dry .. 1 = soaked: **what the texture already shows** (wet-painted sand ≈ 0.8). Moisture rests here; later, visuals react to the difference from it. Not used yet |
 | Stiffness | resistance to deformation: **0 = gives way completely .. 1 = rigid** (the same meaning as GroundEffectDoodadWind's Stiffness). For a cover: feet press away (1 − Stiffness) of its depth, so mud at 0.4 keeps a floor in every print |
 | Flags | reserved, 0 |
+| Absorbency | 0..1, how much outside moisture reaches it: **rain** on open ground and **water nearby**. Rock and ice ≈ 0.1 (rain runs off), sand and soil ≈ 0.9. Appended: older files without it still load |
+| Temperature | °C of the material itself; **−1000 = none** (signed). Used by liquid materials: ground near a liquid with a temperature is warmed (or cooled) toward it, by 5% of the difference at the edge, fading out by 12 yd and 4 yd above its surface. Appended |
 
 A float of **−1 takes the value from the Parent** (and so on up). Defaults where no material in the
-chain sets one: RestMoisture 0.3, Stiffness 0.
+chain sets one: RestMoisture 0.3, Stiffness 0, Absorbency 0.5.
+
+**Ground moisture** (runtime, not stored; the climate panel shows it where you stand): every
+2 yd around you (±128 yd) the ground's moisture settles toward its **equilibrium**:
+- the materials' RestMoisture (mixed by painted strength),
+- wetter near a liquid: Absorbency × the liquid's RestMoisture × how close (full within 2 yd,
+  none beyond 6) × how low (full up to 0.5 yd above the surface, none from 2 yd),
+- drier in hot, dry air (from 20 °C, up to 60% below rest at 40 °C with no humidity).
+
+It moves there over minutes: faster when warm and windy, slower in humid air, very slowly
+below freezing. **Rain** wets ground that's open to the sky (no roof above), at Absorbency × the rain's
+intensity. Submerged ground takes the liquid's RestMoisture.
+
+**What a liquid does:** its liquid row's material (RestMoisture: how wet it makes the ground;
+Temperature: heat), else built in by the liquid's category (LiquidType.dbc's Type column): water,
+ocean and slime RestMoisture 1 and no temperature; magma RestMoisture 0 and 1000 °C, so the ground
+around lava is hot and dry. The climate panel names the nearest liquid, its category and what it does. Nothing shows it on the terrain itself yet (that needs the terrain
+shader patch); covers already look wetter where it's above rest.
 
 ### SurfaceCover.cdbc — `SurfaceCover.xml`
 
@@ -146,8 +174,8 @@ in over time. Grass and small doodads are buried under it.
 | CoverTexture | a BLP drawn on the cover, tiled like the terrain's layers (one repeat per terrain cell), e.g. the same texture as the ground it covers. **Empty = from the parent material's row, `-` = none.** Any number of paths per table; up to 8 different ones are drawn at once in view (the ones most present around you; the panel lists them and says when more are around). TintColor/TintStrength still apply on top |
 | Opacity | **reserved, not used yet** (see-through covers: slush, goo) |
 | Flatten | **reserved, not used yet** (liquid-like covers that fill hollows) |
-| ZOffset | yards the cover's base sits above (+) or **below (−)** the terrain. Below the terrain only what rises above it shows. Muddy footprint outlines: Depth 0.015, ZOffset −0.02 (the top stays 0.005 yd under the grass), Rim 4 (rims rise 0.055 yd above it), DriftNoise 0. **Only exactly −1 inherits**; every other negative is a real offset |
-| Wetness | how wet the cover **looks**: 0 = as its texture .. 1 = soaked: darker, and the specular gets stronger (up to ×3) and tighter. The shine comes from the CoverTexture's specular mask, so a cover without a CoverTexture doesn't shine |
+| ZOffset | yards the cover's base sits above (+) or **below (−)** the terrain. Below the terrain only what rises above it shows. Muddy footprint outlines: Depth 0.015, ZOffset −0.02 (the top stays 0.005 yd under the grass), Rim 4 (rims rise 0.055 yd above it), DriftNoise 0. Signed: **−1000 inherits** (exactly −1 does too, as older files wrote it) |
+| Wetness | how wet the cover **looks** at rest: 0 = as its texture .. 1 = soaked: darker, and the specular gets stronger (up to ×3) and tighter. On top of it, the ground moisture above its rest (rain, water nearby) makes it look wetter still. The shine comes from the CoverTexture's specular mask, so a cover without a CoverTexture doesn't shine |
 | Flags | 0x1 **prevent underwater**: the cover thins out over 0.3 yd below a terrain liquid's surface (rivers, lakes, sea; not WMO water). 0x2 **prevent on land**: cover only there (river and sea floors). 0x4 **use MCCV**: tinted by the terrain's vertex colours, like the terrain. 0x8 **ignore specular map**: no shine from the CoverTexture. Flags come from the row that decides Depth, except 0x8, which belongs to the CoverTexture named in the same row |
 
 **Specular:** a CoverTexture's alpha is its specular mask, as on the terrain's layers. If a `_s.blp`
@@ -177,3 +205,31 @@ Shipped baseline: snow 0.35 yd everywhere it's painted (bare above ~40°), sand 
   `converted-v4/` next to the input: one material, selector and cover row per old row, same IDs,
   with Parents set so −1 fields resolve exactly as before.
 - 19 columns (before ZOffset/Wetness): run `convert_surface_cover_v3.py` first.
+
+## AreaClimate.cdbc — `AreaClimate.xml`
+
+The air's baseline per place: temperature through the day and the year, and humidity. Read by the
+ground moisture (drying) now; later by snow melting and freezing, frost, fog and breath.
+
+| Field | Meaning |
+|---|---|
+| ID | row id |
+| ScopeType | 0 = Global, 1 = Map, 2 = Area |
+| ScopeID | Map.dbc ID or AreaTable ID (ignored for Global) |
+| DayTemp | °C at the warmest time of day (15:00). Signed: −1000 inherits |
+| NightTemp | °C at the coldest (05:00). Signed: −1000 inherits |
+| SeasonAmplitude | °C between midsummer and midwinter (Elwynn ~12, jungle ~2, Outland 0) |
+| SeasonOffset | months the seasons are shifted (6 = flipped, a "southern" continent) |
+| Humidity | 0 = dry air .. 1 = saturated: humid places dry slowly (later: fog, dust) |
+| Flags | reserved, 0 |
+
+Lookup: Global < Map < Area (zone) < Area (sub-area); the more specific row wins **field by field**.
+No row at all: 18 °C day, 8 °C night, ±6 °C over the year, humidity 0.5.
+
+**Temperature** = night .. day by the time of day (the sky's clock) + the season (from the server's
+game date: warmest around 20 July, shifted by SeasonOffset) + the weather (rain −3 °C, snow −6 °C,
+sandstorm +2 °C, × its intensity). The climate panel shows each part, and can override the weather
+and the time of day for testing.
+
+Generator: `tools/gen_default_climate.py` (one Global row; `--examples` adds Northrend, Outland,
+Winterspring, Dun Morogh, Tanaris, Stranglethorn and Swamp of Sorrows).

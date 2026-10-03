@@ -14,10 +14,13 @@
 
 #include "Config.hpp"
 
+#include "debug/ClimateView.hpp"
 #include "debug/DepthView.hpp"
 #include "debug/SurfaceView.hpp"
 #include "debug/WindView.hpp"
 #include "env/Actors.hpp"
+#include "env/Climate.hpp"
+#include "env/Fields.hpp"
 #include "env/Wind.hpp"
 #include "env/WorldQuery.hpp"
 #include "features/GrassDensity.hpp"
@@ -61,6 +64,8 @@ namespace
         wxl_livingazeroth::grassdoodads::LoadOverrides(cdbc);
         wxl_livingazeroth::grassdensity::Load(cdbc);
         wxl_livingazeroth::cover::LoadTable(cdbc);
+        wxl_livingazeroth::climate::Load(cdbc);
+        wxl_livingazeroth::debug::SetClimateCdbc(cdbc);
 
         wxl_livingazeroth::config::Apply(g_api);
         wxl_livingazeroth::grassdistance::OnFirstFrame();
@@ -79,11 +84,14 @@ namespace
     void __cdecl OnUpdate(void* /*user*/, const void* args)
     {
         const auto* a = static_cast<const ev::UpdateArgs*>(args);
+        const float dt = a ? a->dt : 0.0f;
         const auto& snap = wxl_livingazeroth::world::Refresh();
-        wxl_livingazeroth::wind::Update(a ? a->dt : 0.0f, snap);
+        wxl_livingazeroth::climate::Update(snap);
+        wxl_livingazeroth::wind::Update(dt, snap);
         if (snap.inWorld)
             wxl_livingazeroth::actors::Refresh(snap.playerPos, wxl_livingazeroth::grass::kActorRange);
-        wxl_livingazeroth::cover::Update(a ? a->dt : 0.0f, snap);
+        wxl_livingazeroth::fields::Update(dt, snap);
+        wxl_livingazeroth::cover::Update(dt, snap);
     }
 
     void __cdecl OnDeviceLost(void* /*user*/, const void* /*args*/)
@@ -128,6 +136,7 @@ int __cdecl WXL_Load(const WXL_Api* api)
     wxl_livingazeroth::debug::RegisterPanel(api);
     wxl_livingazeroth::debug::RegisterWindPanel(api);
     wxl_livingazeroth::debug::RegisterSurfacePanel(api);
+    wxl_livingazeroth::debug::RegisterClimatePanel(api);
 
     api->Log(WXL_LOG_INFO, "wxl-seyris-living-azeroth", "v1.1 loaded (WXL_Load reached).");
     return 1;

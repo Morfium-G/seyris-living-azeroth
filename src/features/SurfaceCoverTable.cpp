@@ -51,8 +51,9 @@ namespace wxl_livingazeroth::covertable
             "ZOffset", "Wetness",
         };
 
-        // Whether a row sets field f. ZOffset is a signed offset, so only exactly -1 inherits there.
-        bool IsSet(int f, float v) { return f == kZOffset ? v != -1.0f : v >= 0.0f; }
+        // Whether a row sets field f. ZOffset is signed: -1000 and below inherit (the rule for every
+        // signed column), and so does exactly -1 (what older files and the v3 converter wrote).
+        bool IsSet(int f, float v) { return f == kZOffset ? (v != -1.0f && v > -1000.0f) : v >= 0.0f; }
 
         struct Row
         {

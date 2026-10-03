@@ -59,10 +59,32 @@ def build(columns, rows) -> bytes:
 
 
 # The three ground tables' layouts (see docs/cdbc-tables.md). Append-only.
-GROUND_MATERIAL = ["u", "s", "u", "f", "f", "u"]
-#                  ID  Name Parent RestMoisture Stiffness Flags
+GROUND_MATERIAL = ["u", "s", "u", "f", "f", "u", "f", "f"]
+#                  ID  Name Parent RestMoisture Stiffness Flags Absorbency Temperature
 GROUND_MATERIAL_SELECTOR = ["u", "u", "u", "s", "u", "i", "u", "u", "u"]
 #                  ID  ScopeType ScopeID TexturePath GroundEffectID TerrainType LiquidType MaterialID Flags
 SURFACE_COVER = ["u", "u", "u", "f", "f", "f", "f", "f", "f", "f", "u", "f", "s", "f", "f", "f", "f", "u"]
 #  ID MaterialID CoverMaterial Depth MaxSlope SlopeFade DriftNoise EdgeBreakup Rim RelaxSeconds
 #  TintColor TintStrength CoverTexture Opacity Flatten ZOffset Wetness Flags
+AREA_CLIMATE = ["u", "u", "u", "f", "f", "f", "f", "f", "u"]
+#  ID ScopeType ScopeID DayTemp NightTemp SeasonAmplitude SeasonOffset Humidity Flags
+
+# Per table: (layout, the "not set" value of every column). upgrade_tables.py appends missing
+# columns with these, so an upgraded file behaves exactly as before.
+TABLES = {
+    "GroundMaterial": (GROUND_MATERIAL, [0, "", 0, -1.0, -1.0, 0, -1.0, -1000.0]),
+    "GroundMaterialSelector": (GROUND_MATERIAL_SELECTOR, [0, 0, 0, "", 0, -1, 0, 0, 0]),
+    "SurfaceCover": (SURFACE_COVER, [0, 0, 0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 0, -1.0, "", -1.0, -1.0, -1000.0, -1.0, 0]),
+    "AreaClimate": (AREA_CLIMATE, [0, 0, 0, -1000.0, -1000.0, -1.0, -1.0, -1.0, 0]),
+}
+
+
+def encode(column_type, value) -> int:
+    """A Python value as the raw uint32 of a column (strings: only "" -> offset 0)."""
+    if column_type == "f":
+        return struct.unpack("<I", struct.pack("<f", value))[0]
+    if column_type == "s":
+        if value != "":
+            raise SystemExit("can only pad string columns with the empty string")
+        return 0
+    return value & 0xFFFFFFFF

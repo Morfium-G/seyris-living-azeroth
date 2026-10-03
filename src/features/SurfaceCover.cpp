@@ -1,6 +1,7 @@
 #include "SurfaceCover.hpp"
 
 #include "../env/Actors.hpp"
+#include "../env/Fields.hpp"
 #include "../env/TerrainHeight.hpp"
 #include "../render/BlpTexture.hpp"
 #include "GrassPerf.hpp"
@@ -267,6 +268,8 @@ namespace wxl_livingazeroth::cover
         IDirect3DVertexDeclaration9* g_decl = nullptr;
         IDirect3DVertexShader9*      g_vs = nullptr;
         IDirect3DPixelShader9*       g_ps = nullptr;
+        IDirect3DTexture9*           g_wetTex = nullptr;   // fields::Wet() as a texture (A8R8G8B8, a = excess)
+        uint32_t                     g_wetVersion = 0;
         bool                         g_gpuFailed = false;
 
         // VS: c0..c3 view-projection columns; c4 = (patch first cell i, j, cell size, 1 / texture
@@ -378,6 +381,8 @@ float4 texMap : register(c7);   // 1 / tile size (yd), uv offset (x, y): uv = re
 float4 specOn0 : register(c8);
 float4 specOn1 : register(c9);
 float4 specular : register(c10);
+float4 wetMap : register(c11);  // 1 / grid extent (yd), uv offset (x, y), on
+float4 wetBox : register(c12);  // the grid's valid box, camera-relative (min x, min y, max x, max y)
 sampler2D cover0 : register(s0);
 sampler2D cover1 : register(s1);
 sampler2D cover2 : register(s2);
@@ -389,6 +394,7 @@ sampler2D cover7 : register(s7);
 sampler2D weights0 : register(s8); // slots 1..4 (r..a)
 sampler2D weights1 : register(s9); // slots 5..8
 sampler2D props : register(s10);   // a = wetness, rgb = vertex colour (0.5 = neutral)
+sampler2D wetGrid : register(s11); // a = ground moisture above the material's rest (env/Fields)
 
 float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float fog : TEXCOORD3, float4 tint : TEXCOORD4, float2 wuv : TEXCOORD5, float3 vpos : TEXCOORD6) : COLOR
 {
@@ -413,7 +419,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
     float3 colour = lerp(base, tint.rgb, saturate(tint.a));
     // Vertex colour (the terrain multiplies by 2 x it) and wetness: darker, and a stronger, tighter shine.
     float4 pr = tex2D(props, wuv);
-    float wet = pr.a;
+    // The row's own wet look, plus how much wetter than its rest the ground is now (rain, water nearby).
+    float2 inBox = step(wetBox.xy, rel) * step(rel, wetBox.zw);
+    float wet = saturate(pr.a + wetMap.w * inBox.x * inBox.y * tex2D(wetGrid, rel * wetMap.x + wetMap.yz).a);
     colour *= pr.rgb * 2 * (1 - 0.45 * wet);
     float3 h = normalize(l + normalize(-vpos));
     float sp = pow(saturate(dot(nn, h)), max(specular.w, 1) * (1 + 3 * wet)) * saturate(mask * (1 + 2 * wet));
@@ -886,7 +894,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         void ReleaseGpu()
         {
             auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
-            rel(g_vb); rel(g_ib); rel(g_decl); rel(g_vs); rel(g_ps);
+            rel(g_vb); rel(g_ib); rel(g_decl); rel(g_vs); rel(g_ps); rel(g_wetTex); g_wetVersion = 0;
             for (Level& L : g_levels) { rel(L.baseTex); rel(L.coverTex); rel(L.lookTex); rel(L.texWTex[0]); rel(L.texWTex[1]); rel(L.propsTex); L.baseDirty = L.coverDirty = L.lookDirty = true; }
             for (auto& e : g_textureCache) if (e.second) e.second->Release();
             g_textureCache.clear();
@@ -939,7 +947,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             if (g_gpuFailed) return false;
             bool texturesReady = true;
             for (const Level& L : g_levels) texturesReady &= L.baseTex && L.coverTex && L.texWTex[0] && L.texWTex[1] && L.propsTex && (!g_tintSupported || L.lookTex);
-            if (g_vb && g_ib && g_decl && g_vs && g_ps && texturesReady) return true;
+            if (g_vb && g_ib && g_decl && g_vs && g_ps && g_wetTex && texturesReady) return true;
             ReleaseGpu();
 
             auto fail = [](const char* why) { g_inactive = why; g_gpuFailed = true; g_api->Log(WXL_LOG_WARN, kTag, "surface cover: %s", why); return false; };
@@ -991,6 +999,11 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             for (Level& L : g_levels)
                 if (FAILED(dev->CreateTexture(kTex, kTex, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &L.propsTex, nullptr)))
                     return fail("props textures failed");
+            {
+                const int n = fields::Wet().size > 0 ? fields::Wet().size : 128;
+                if (FAILED(dev->CreateTexture(n, n, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_wetTex, nullptr)))
+                    return fail("moisture texture failed");
+            }
 
             g_vs = static_cast<IDirect3DVertexShader9*>(Compile(dev, kVsHlsl, "vs_3_0", false));
             g_ps = static_cast<IDirect3DPixelShader9*>(Compile(dev, kPsHlsl, "ps_3_0", true));
@@ -1330,6 +1343,41 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 dev->SetSamplerState(t, D3DSAMP_SRGBTEXTURE, FALSE);
             }
 
+            // Ground moisture (env/Fields): re-uploaded when it changes (a few times a second).
+            const fields::WetGrid& wet = fields::Wet();
+            D3DSURFACE_DESC wetDesc{};
+            const bool wetOk = wet.excess && wet.size > 0 && SUCCEEDED(g_wetTex->GetLevelDesc(0, &wetDesc)) && wetDesc.Width == static_cast<UINT>(wet.size);
+            if (wetOk && wet.version != g_wetVersion)
+            {
+                D3DLOCKED_RECT lr{};
+                if (SUCCEEDED(g_wetTex->LockRect(0, &lr, nullptr, 0)))
+                {
+                    for (int row = 0; row < wet.size; ++row)
+                    {
+                        uint32_t* out = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(lr.pBits) + row * lr.Pitch);
+                        for (int col = 0; col < wet.size; ++col) out[col] = static_cast<uint32_t>(wet.excess[row * wet.size + col]) << 24;
+                    }
+                    g_wetTex->UnlockRect(0);
+                    g_wetVersion = wet.version;
+                }
+            }
+            {
+                const float extent = wet.size * wet.cellSize;
+                const float winv = extent > 0.0f ? 1.0f / extent : 0.0f;
+                const float c11[4] = { winv, eye[0] * winv - std::floor(eye[0] * winv), eye[1] * winv - std::floor(eye[1] * winv), wetOk ? 1.0f : 0.0f };
+                const float c12[4] = { wet.firstI * wet.cellSize - eye[0], wet.firstJ * wet.cellSize - eye[1],
+                                       (wet.firstI + wet.size) * wet.cellSize - eye[0], (wet.firstJ + wet.size) * wet.cellSize - eye[1] };
+                dev->SetPixelShaderConstantF(11, c11, 1);
+                dev->SetPixelShaderConstantF(12, c12, 1);
+                dev->SetTexture(11, g_wetTex);
+                dev->SetSamplerState(11, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+                dev->SetSamplerState(11, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+                dev->SetSamplerState(11, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+                dev->SetSamplerState(11, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+                dev->SetSamplerState(11, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+                dev->SetSamplerState(11, D3DSAMP_SRGBTEXTURE, FALSE);
+            }
+
             dev->SetVertexDeclaration(g_decl);
             dev->SetStreamSource(0, g_vb, 0, 8);
             dev->SetIndices(g_ib);
@@ -1416,7 +1464,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, nullptr);
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER2, nullptr);
-            for (int t = 0; t < covertable::kMaxCoverTextures + 3; ++t) dev->SetTexture(t, nullptr);
+            for (int t = 0; t < covertable::kMaxCoverTextures + 4; ++t) dev->SetTexture(t, nullptr);
             if (swapDepth) dev->SetDepthStencilSurface(oldDepth);
             if (oldDepth) oldDepth->Release();
             saved->Apply(); // includes the viewport

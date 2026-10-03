@@ -19,7 +19,11 @@ namespace wxl_livingazeroth::materials
     {
         float    restMoisture = 0.3f; // 0 bone dry .. 1 soaked: what the texture already shows
         float    stiffness = 0.0f;    // resistance to deformation: 0 gives way completely .. 1 rigid
+        float    absorbency = 0.5f;   // how much outside moisture (rain, water nearby) reaches it: rock ~0.1 .. sand/soil ~0.9
+        float    temperature = 0.0f;  // degC of the material itself (liquids: magma ~1000); only if hasTemperature
         uint32_t flags = 0;           // reserved
+        bool     hasTemperature = false;  // a row in the chain sets Temperature
+        bool     restMoistureSet = false; // a row in the chain sets RestMoisture (else the default above)
     };
 
     /// (Re)loads both tables through wxl-seyris-tools' cdbc reader.
@@ -30,6 +34,11 @@ namespace wxl_livingazeroth::materials
     /// matched, or the winning one says MaterialID 0).
     /// Cached; Generation() changes on reload.
     uint32_t Select(uint32_t areaId, int mapId, const char* texturePath, uint32_t groundEffectId, int terrainType);
+
+    /// The material for a liquid: GroundMaterialSelector rows with this LiquidType (LiquidType.dbc
+    /// ID), by place (area chain, map, global; the most specific wins). 0 = no row (callers fall back
+    /// to built-in values per liquid category).
+    uint32_t SelectLiquid(uint32_t liquidType, uint32_t areaId, int mapId);
 
     /// The material's values, with -1 fields taken along its Parent chain; defaults where no row sets them.
     Values Get(uint32_t materialId);

@@ -9,7 +9,9 @@ design docs/r&d/immersion/world-fields.md).
                           0 = "no material here" (switches a broader row off). LiquidType: reserved, 0.
   GroundMaterial          WHAT a material is: Name, Parent (0 = none; -1 fields come from the
                           parent), RestMoisture (0 bone dry .. 1 soaked: what the texture already
-                          shows), Stiffness (0 gives way completely .. 1 rigid), Flags (0).
+                          shows), Stiffness (0 gives way completely .. 1 rigid), Flags (0),
+                          Absorbency (how much rain and water nearby reach it: rock ~0.1 .. sand ~0.9),
+                          Temperature (degC of the material itself; -1000 = none; liquids: magma ~1000).
   SurfaceCover            the cover a material carries, keyed by MaterialID; -1 fields come from the
                           parent material's row. CoverMaterial = what lies on top (0 = the ground
                           material itself; its Stiffness decides how far feet press the cover down).
@@ -39,8 +41,11 @@ SNOW, SAND, SOGGY = 3, 7, 8
 PREVENT_UNDERWATER, PREVENT_ON_LAND, USE_MCCV, IGNORE_SPECULAR = 0x1, 0x2, 0x4, 0x8
 
 
-def material(id, name, parent=0, rest_moisture=I, stiffness=I, flags=0):
-    return (id, name, parent, rest_moisture, stiffness, flags)
+T = -1000.0  # signed columns: not set
+
+
+def material(id, name, parent=0, rest_moisture=I, stiffness=I, flags=0, absorbency=I, temperature=T):
+    return (id, name, parent, rest_moisture, stiffness, flags, absorbency, temperature)
 
 
 def selector(id, material_id, scope=GLOBAL, scope_id=0, texture="", effect=0, terrain=ANY, liquid=0, flags=0):
@@ -54,8 +59,8 @@ def cover(id, material_id, cover_material=0, depth=I, max_slope=I, slope_fade=I,
 
 
 DEFAULT_MATERIALS = [
-    material(1, "Snow", rest_moisture=0.5, stiffness=0.0),
-    material(2, "Sand", rest_moisture=0.2, stiffness=0.2),
+    material(1, "Snow", rest_moisture=0.5, stiffness=0.0, absorbency=0.3),
+    material(2, "Sand", rest_moisture=0.2, stiffness=0.2, absorbency=0.9),
 ]
 DEFAULT_SELECTORS = [
     selector(1, 1, terrain=SNOW),
@@ -75,7 +80,11 @@ EXAMPLE_MATERIALS = [
     # A wet sand texture: same sand, but its texture already shows it wet.
     material(101, "WestfallSandWet", parent=2, rest_moisture=0.8),
     # Mud: soft but not bottomless -- feet press 60% of it away, so prints keep a wet floor.
-    material(102, "Mud", rest_moisture=0.8, stiffness=0.4),
+    material(102, "Mud", rest_moisture=0.8, stiffness=0.4, absorbency=0.7),
+    # Liquids (selected by LiquidType.dbc ID below). Without rows they're built in by category:
+    # water, ocean and slime wet the ground around them, magma doesn't and is 1000 degC.
+    material(200, "Magma", rest_moisture=0.0, temperature=1100.0),
+    material(201, "HotSpring", rest_moisture=1.0, temperature=45.0),
 ]
 EXAMPLE_SELECTORS = [
     selector(100, 100, scope=AREA, scope_id=210, terrain=SNOW),                       # Icecrown (area 210)
@@ -83,6 +92,9 @@ EXAMPLE_SELECTORS = [
     selector(102, 102, terrain=SOGGY),
     # Kalimdor (map 1): no snow material at all (MaterialID 0 switches the global row off there).
     selector(103, 0, scope=MAP, scope_id=1, terrain=SNOW),
+    # Liquids by LiquidType.dbc ID: 3 Magma everywhere; water (1) in Un'Goro Crater (490) is a hot spring.
+    selector(200, 200, liquid=3),
+    selector(201, 201, scope=AREA, scope_id=490, liquid=1),
 ]
 EXAMPLE_COVERS = [
     # Deeper snow, trenches stay longer; the rest from Snow's row.

@@ -96,7 +96,7 @@ def main() -> None:
     print(f"{src}: {len(rows)} row(s)")
     for r in rows:
         p = parent_of(r)
-        materials.append((r["id"], name_of(r), p["id"] if p else 0, -1.0, -1.0, 0))
+        materials.append((r["id"], name_of(r), p["id"] if p else 0, -1.0, -1.0, 0, -1.0, -1000.0))
         selectors.append((r["id"], r["scope"], r["scope_id"], r["texture"], r["effect"], r["terrain"], 0, r["id"], 0))
         v = r["values"]  # Depth .. Flags (15 raw values)
         f = io.as_float

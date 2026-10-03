@@ -362,14 +362,53 @@ namespace wxl_livingazeroth::terrain
         return true;
     }
 
-    bool LiquidHeightAt(float x, float y, float& outZ)
+    bool LiquidAt(float x, float y, float& outZ, uint32_t& outLiquidType)
     {
         const float pos[3] = { x, y, -100000.0f };
         uint32_t type = 0;
         float h = 0.0f;
         if (!reinterpret_cast<QueryTerrainLiquidFn>(kQueryTerrainLiquid)(pos, &type, &h, 0)) return false;
         outZ = h;
+        outLiquidType = type;
         return std::isfinite(h);
+    }
+
+    bool LiquidHeightAt(float x, float y, float& outZ)
+    {
+        uint32_t type;
+        return LiquidAt(x, y, outZ, type);
+    }
+
+    namespace
+    {
+        // LiquidType.dbc as the client holds it (core offsets/game/ADT.hpp): rows by ID - minId. Row
+        // layout as in the file, strings resolved to pointers: +0x04 Name, +0x08 Flags, +0x0C Type
+        // (core's own flag test reads +0x08 and its darken columns start at +0x18 = column 6, so
+        // Type is column 3) [believed: layout; the Type values 0..3 match the dbc].
+        constexpr uintptr_t kLiquidRows = 0x00AD4084, kLiquidMinId = 0x00AD4074, kLiquidMaxId = 0x00AD4070;
+        constexpr size_t    kLiquidRowName = 0x04, kLiquidRowType = 0x0C;
+
+        const uint8_t* LiquidRow(uint32_t id)
+        {
+            const uint32_t minId = *reinterpret_cast<const uint32_t*>(kLiquidMinId);
+            const uint32_t maxId = *reinterpret_cast<const uint32_t*>(kLiquidMaxId);
+            const auto* rows = *reinterpret_cast<const uint8_t* const* const*>(kLiquidRows);
+            if (!rows || id < minId || id > maxId) return nullptr;
+            return rows[id - minId];
+        }
+    }
+
+    int LiquidCategoryOf(uint32_t liquidType)
+    {
+        const uint8_t* row = LiquidRow(liquidType);
+        return row ? *reinterpret_cast<const int32_t*>(row + kLiquidRowType) : -1;
+    }
+
+    const char* LiquidNameOf(uint32_t liquidType)
+    {
+        const uint8_t* row = LiquidRow(liquidType);
+        const char* name = row ? *reinterpret_cast<const char* const*>(row + kLiquidRowName) : nullptr;
+        return name ? name : "";
     }
 
     void ClearLayerCache() { g_decoded.clear(); }

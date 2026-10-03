@@ -4,6 +4,8 @@
 // is the surface the deformable cover sits on.
 #pragma once
 
+#include <cstdint>
+
 namespace wxl_livingazeroth::terrain
 {
     /// Height of the terrain surface at world (x, y). False when the chunk isn't loaded or the spot
@@ -45,6 +47,15 @@ namespace wxl_livingazeroth::terrain
     /// The surface height of terrain liquid (rivers, lakes, sea; not WMO liquid) at world (x, y),
     /// from the client's own liquid probe. False where the terrain cell has no liquid.
     bool LiquidHeightAt(float x, float y, float& outZ);
+
+    /// The same, plus the liquid's LiquidType.dbc ID (as baked into the ADT).
+    bool LiquidAt(float x, float y, float& outZ, uint32_t& outLiquidType);
+
+    /// A LiquidType's category from the client's LiquidType table (its Type column): 0 water,
+    /// 1 ocean, 2 magma, 3 slime; -1 for an unknown ID. And its Name ("" if unknown).
+    enum LiquidCategory : int { kLiquidWater = 0, kLiquidOcean = 1, kLiquidMagma = 2, kLiquidSlime = 3 };
+    int         LiquidCategoryOf(uint32_t liquidType);
+    const char* LiquidNameOf(uint32_t liquidType);
 
     /// Forgets every decoded chunk (call when the map changes or the world is left). Texture
     /// names in LayerWeights from before are invalid afterwards.
