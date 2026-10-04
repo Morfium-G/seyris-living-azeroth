@@ -1,7 +1,9 @@
 #include "SurfaceCover.hpp"
 
 #include "../env/Actors.hpp"
+#include "../env/Climate.hpp"
 #include "../env/Fields.hpp"
+#include "../env/Regional.hpp"
 #include "../env/TerrainHeight.hpp"
 #include "../render/BlpTexture.hpp"
 #include "../render/MoistureTexture.hpp"
@@ -66,8 +68,9 @@ namespace wxl_livingazeroth::cover
         constexpr float kOuterFadeStart = 0.80f, kOuterFadeEnd = 0.97f; // outermost level: cover fades out (share of its half)
         constexpr float kHole = -100000.0f;        // base height of a hole / unloaded spot
 
+        // "Everywhere" (test): no painted cover, but fallen snow may lie anywhere (with the plain look);
+        // the panel's deposit button puts some down.
         enum class Coverage : int { Everywhere = 0, Table = 1 };
-        constexpr float kTestDepth = 0.35f; // "everywhere" test mode
 
         struct Settings
         {
@@ -108,6 +111,15 @@ namespace wxl_livingazeroth::cover
             std::vector<uint8_t>  driftAmp = std::vector<uint8_t>(kTex * kTex, 0);
             std::vector<uint8_t>  breakup = std::vector<uint8_t>(kTex * kTex, 0);
             std::vector<uint8_t>  stiff = std::vector<uint8_t>(kTex * kTex, 0); // cover material's stiffness (level 0's trenches)
+            // Fallen snow (regional-layer-and-snow.md): how much of the spot may hold it (0..255, the
+            // share of bare and snow-covered layers, none on or beside other covers, none under
+            // liquids), and the share of the painted depth that is snow (it melts by the near grid's
+            // kept share). Both static; the fallen depth and kept share are folded in at upload.
+            std::vector<uint8_t>  snowShare = std::vector<uint8_t>(kTex * kTex, 0);
+            std::vector<uint8_t>  paintedSnow = std::vector<uint8_t>(kTex * kTex, 0);
+            uint32_t snowVersion = 0;       // the snow values last folded in (fields::SnowVersion)
+            bool     snowFolded = false;    // whether that fold had any snow in it
+            double   foldMs = 0;            // the last full depth pass (upload)
             std::vector<uint8_t>  drift = std::vector<uint8_t>(kTex * kTex, 128);
             std::vector<uint8_t>  edgeNoise = std::vector<uint8_t>(kTex * kTex, 128);
             std::vector<uint32_t> tint = std::vector<uint32_t>(kTex * kTex, 0);
@@ -161,6 +173,8 @@ namespace wxl_livingazeroth::cover
         std::vector<float>   g_static0(kTex * kTex, 0.0f);        // level 0 cover without trenches
         std::vector<float>   g_deformK(kTex * kTex, 0.0f);        // level 0 trench strength (fade-out)
         unsigned             g_frame = 0;
+        int                  g_snowCursor = 0;                    // the level the next snow re-fold starts looking at
+        float                g_depositYards = 0.2f;               // the panel's snow deposit
 
         void MarkActive(int s)
         {
@@ -207,20 +221,38 @@ namespace wxl_livingazeroth::cover
         float g_lastDepthMul = -1.0f, g_lastDriftMul = -1.0f, g_lastBreakupMul = -1.0f;
         constexpr float kEdgeWarpYards = 5.0f; // how far the material edge wanders at full breakup
 
+        // What the table says about one terrain layer (or cell): its own row (Depth > 0 = a painted
+        // cover), whether that cover is snow (fallen snow adds to it), and the look fallen snow takes
+        // on it where nothing is painted.
+        struct LayerRows
+        {
+            covertable::Values painted;
+            covertable::Values look;
+            bool paintedSnow = false;
+        };
+        LayerRows RowsFor(uint32_t area, int map, const char* texture, uint32_t effect, int terrainType)
+        {
+            LayerRows r;
+            r.painted = covertable::Resolve(area, map, texture, effect, terrainType);
+            r.paintedSnow = r.painted.depth > 0.0f && covertable::IsSnow(r.painted.coverMaterial, area, map);
+            r.look = covertable::SnowLook(area, map, texture, effect, terrainType);
+            return r;
+        }
+
         // The table's values per terrain cell (what the cell is made of is constant over one: it's
         // the cell's dominant layer). Unloaded cells aren't cached, so they're asked again.
         constexpr float kTerrainCell = 33.3333333f / 8.0f;
         // A fixed window of terrain cells around the player (384 cells = +-800 yd, beyond the
         // outermost level), indexed by cell mod the window: one array access per lookup.
         constexpr int kCellWindow = 384;
-        struct CellEntry { int cx = INT_MIN, cy = INT_MIN; covertable::Values v; };
+        struct CellEntry { int cx = INT_MIN, cy = INT_MIN; LayerRows rows; };
         std::vector<CellEntry> g_cellCache(kCellWindow * kCellWindow);
         unsigned g_cellMisses = 0;
 
         void ClearCellCache() { for (CellEntry& e : g_cellCache) e.cx = INT_MIN; }
 
         // The table's values for every layer of a decoded chunk, by the chunk's decode serial.
-        std::unordered_map<unsigned, std::array<covertable::Values, 4>> g_layerValues;
+        std::unordered_map<unsigned, std::array<LayerRows, 4>> g_layerValues;
 
         // Under the player, for the panel: the layer weights both ways round and the client's own
         // dominant layer (the check that the alpha maps are read the right way round).
@@ -533,25 +565,30 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             return n < 1 ? 1 : (n > kMaxLevels ? kMaxLevels : n);
         }
 
-        // The table's values at the centre of terrain cell (cx, cy); false while its chunk isn't loaded.
-        bool CellValues(int cx, int cy, covertable::Values& out)
+        // The table's values at the centre of terrain cell (cx, cy); null while its chunk isn't loaded.
+        const LayerRows* CellRows(int cx, int cy)
         {
             const int wx = ((cx % kCellWindow) + kCellWindow) % kCellWindow, wy = ((cy % kCellWindow) + kCellWindow) % kCellWindow;
             CellEntry& e = g_cellCache[wy * kCellWindow + wx];
-            if (e.cx == cx && e.cy == cy) { out = e.v; return true; }
+            if (e.cx == cx && e.cy == cy) return &e.rows;
             terrain::Surface surface;
             if (!terrain::SurfaceAt((cx + 0.5f) * kTerrainCell, (cy + 0.5f) * kTerrainCell, surface))
-                return false; // not loaded (or a hole): ask again later
-            out = covertable::Resolve(surface.area, g_mapNow, surface.texture, surface.groundEffect, surface.terrainType);
-            e.cx = cx; e.cy = cy; e.v = out;
+                return nullptr; // not loaded (or a hole): ask again later
+            e.rows = RowsFor(surface.area, g_mapNow, surface.texture, surface.groundEffect, surface.terrainType);
+            e.cx = cx; e.cy = cy;
             ++g_cellMisses;
-            return true;
+            return &e.rows;
         }
 
         // The cover between terrain cell centres: how covered (0..1, blended, so the cover tapers out
         // over about one terrain cell instead of stopping in a staircase), and every other property
         // as the covered neighbours' values weighted the same way (so an edge isn't thinned twice,
         // and two materials meeting blend their depth, slope limits, tint, ...).
+        //
+        // Fallen snow: layers without a painted cover add their snow look to every property but the
+        // depth -- only where little is painted (fully below a quarter covered), so a painted cover's
+        // own look stays as it was. snowShare says how much of the spot fallen snow may lie on
+        // (shaped and filled in at upload), paintedSnow the share of the painted depth that is snow.
         struct Blend
         {
             float covered = 0.0f, depth = 0.0f, maxSlope = 45.0f, slopeFade = 15.0f, drift = 0.0f, breakup = 0.5f;
@@ -559,6 +596,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             float zOffset = 0.0f, wetness = 0.0f, stiffness = 0.0f, rim = 0.3f, relax = 30.0f;
             float vertexColor[3] = { 0.5f, 0.5f, 0.5f }; // MCCV mixed in by the rows' "use MCCV" share; 0.5 = neutral
             int   texId[8] = {}; float texShare[8] = {}; int texCount = 0; // cover textures present, by ID
+            float snowShare = 0.0f, paintedSnow = 0.0f;
+            bool  hasLook = false; // some row (painted or fallen snow's look) set the properties above
         };
 
         // Sums per blended property, in this order (cover textures go through AddTexture).
@@ -609,16 +648,16 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             return f;
         }
 
-        const std::array<covertable::Values, 4>& LayerValues(const terrain::LayerWeights& lw)
+        const std::array<LayerRows, 4>& LayerValues(const terrain::LayerWeights& lw)
         {
             auto found = g_layerValues.find(lw.serial);
             if (found != g_layerValues.end()) return found->second;
             if (g_layerValues.size() > 3000) g_layerValues.clear();
-            std::array<covertable::Values, 4>& v = g_layerValues[lw.serial];
+            std::array<LayerRows, 4>& v = g_layerValues[lw.serial];
             for (int l = 0; l < lw.layers; ++l)
             {
                 const terrain::Surface& sf = lw.surface[l];
-                v[l] = covertable::Resolve(sf.area, g_mapNow, sf.texture, sf.groundEffect, sf.terrainType);
+                v[l] = RowsFor(sf.area, g_mapNow, sf.texture, sf.groundEffect, sf.terrainType);
             }
             return v;
         }
@@ -634,14 +673,12 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             if (b.texCount < 8) { b.texId[b.texCount] = id; b.texShare[b.texCount++] = w; }
         }
 
-        // One row's contribution at weight wk (its painted strength or cell weight).
-        void AddRow(const covertable::Values& cv, float wk, float& covered, float sum[kSumCount])
+        // One row's look (everything but the depth) at weight wk.
+        void AddLook(const covertable::Values& cv, float wk, float& lookW, float sum[kSumCount])
         {
-            if (wk <= 0.0f || cv.depth <= 0.0f) return;
-            wk *= WaterFactor(cv.flags);
             if (wk <= 0.0f) return;
-            covered += wk;
-            sum[kSumDepth] += wk * cv.depth;      sum[kSumMaxSlope] += wk * cv.maxSlope;   sum[kSumSlopeFade] += wk * cv.slopeFade;
+            lookW += wk;
+            sum[kSumMaxSlope] += wk * cv.maxSlope; sum[kSumSlopeFade] += wk * cv.slopeFade;
             sum[kSumDrift] += wk * cv.driftNoise; sum[kSumBreakup] += wk * cv.edgeBreakup;
             sum[kSumTintR] += wk * ((cv.tintColor >> 16) & 0xFF) / 255.0f;
             sum[kSumTintG] += wk * ((cv.tintColor >> 8) & 0xFF) / 255.0f;
@@ -656,10 +693,14 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             if (cv.coverTexture > 0) AddTexture(cv.coverTexture, wk);
         }
 
-        void FinishBlend(Blend& b, const float sum[kSumCount])
+        void FinishBlend(Blend& b, float lookW, const float sum[kSumCount])
         {
-            const float inv = 1.0f / b.covered;
-            b.depth = sum[kSumDepth] * inv; b.maxSlope = sum[kSumMaxSlope] * inv; b.slopeFade = sum[kSumSlopeFade] * inv;
+            if (b.covered > 0.0f) b.depth = sum[kSumDepth] / b.covered;
+            if (b.covered > 1.0f) b.covered = 1.0f;
+            if (lookW <= 0.0f) return;
+            b.hasLook = true;
+            const float inv = 1.0f / lookW;
+            b.maxSlope = sum[kSumMaxSlope] * inv; b.slopeFade = sum[kSumSlopeFade] * inv;
             b.drift = sum[kSumDrift] * inv; b.breakup = sum[kSumBreakup] * inv;
             b.tint[0] = sum[kSumTintR] * inv; b.tint[1] = sum[kSumTintG] * inv; b.tint[2] = sum[kSumTintB] * inv;
             b.tintStrength = sum[kSumTintStrength] * inv;
@@ -677,49 +718,77 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             for (int t = 0; t < b.texCount; ++t) b.texShare[t] *= inv;
         }
 
-        void AccumulateLayers(float x, float y, float& covered, float sum[kSumCount])
+        // The layers (or cells) at a point with their weights, combined. Painted rows (Depth > 0,
+        // after their water flags) make the cover and its look; the rest of every layer is bare
+        // ground, where fallen snow may lie with the layer's snow look.
+        struct Part { float weight; const LayerRows* rows; };
+        Blend Combine(const Part* parts, int count)
         {
-            terrain::LayerWeights lw;
-            if (!terrain::LayerWeightsAt(x, y, lw, g_settings.alphaSwap != 0)) return;
-            const std::array<covertable::Values, 4>& vals = LayerValues(lw);
-            for (int l = 0; l < lw.layers; ++l) AddRow(vals[l], lw.weight[l], covered, sum);
+            Blend b;
+            g_blendTarget = &b;
+            float sum[kSumCount] = {}, lookW = 0.0f, total = 0.0f, snowPainted = 0.0f, otherPainted = 0.0f;
+            float paintedDepth = 0.0f, snowDepth = 0.0f;
+            float bare[4] = {};
+            for (int k = 0; k < count; ++k)
+            {
+                const float wk = parts[k].weight;
+                if (wk <= 0.0f) continue;
+                total += wk;
+                const covertable::Values& pv = parts[k].rows->painted;
+                const float pw = pv.depth > 0.0f ? wk * WaterFactor(pv.flags) : 0.0f;
+                bare[k] = wk - pw;
+                if (pw <= 0.0f) continue;
+                b.covered += pw;
+                sum[kSumDepth] += pw * pv.depth;
+                AddLook(pv, pw, lookW, sum);
+                paintedDepth += pw * pv.depth;
+                if (parts[k].rows->paintedSnow) { snowPainted += pw; snowDepth += pw * pv.depth; }
+                else otherPainted += pw;
+            }
+            if (total <= 0.0f) return b;
+            // Fallen snow's look on the bare parts, fully only where nothing is painted.
+            float bareTotal = 0.0f;
+            for (int k = 0; k < count; ++k) bareTotal += bare[k];
+            const float lookShare = 1.0f - (b.covered * 4.0f > 1.0f ? 1.0f : b.covered * 4.0f);
+            if (lookShare > 0.0f)
+                for (int k = 0; k < count; ++k) AddLook(parts[k].rows->look, bare[k] * lookShare, lookW, sum);
+            // Where fallen snow may lie: bare ground and snow covers, not on or beside other covers,
+            // not under a liquid's surface.
+            const float other = otherPainted * 4.0f / total;
+            const float dry = WaterFactor(covertable::kFlagPreventUnderwater);
+            b.snowShare = (snowPainted + bareTotal) / total * (1.0f - (other > 1.0f ? 1.0f : other)) * dry;
+            b.paintedSnow = paintedDepth > 0.0f ? snowDepth / paintedDepth : 0.0f;
+            FinishBlend(b, lookW, sum);
+            return b;
         }
 
         Blend BlendAt(float x, float y)
         {
-            Blend b;
             if (static_cast<Coverage>(g_settings.coverage) == Coverage::Everywhere)
             {
-                const covertable::Values v;
-                b.covered = 1.0f; b.depth = kTestDepth; b.maxSlope = v.maxSlope; b.slopeFade = v.slopeFade;
-                b.drift = v.driftNoise; b.breakup = v.edgeBreakup;
-                return b;
+                // No painted cover; fallen snow anywhere above water, with the plain look.
+                static const LayerRows kPlain = [] { LayerRows r; r.painted.depth = 0.0f; return r; }();
+                const Part part{ 1.0f, &kPlain };
+                return Combine(&part, 1);
             }
+            Part parts[4];
+            int count = 0;
             if (g_settings.materialSource == 0)
             {
-                float sum[kSumCount] = {};
-                g_blendTarget = &b;
-                AccumulateLayers(x, y, b.covered, sum);
-                if (b.covered <= 0.0f) return b;
-                FinishBlend(b, sum);
-                if (b.covered > 1.0f) b.covered = 1.0f;
-                return b;
+                terrain::LayerWeights lw;
+                if (!terrain::LayerWeightsAt(x, y, lw, g_settings.alphaSwap != 0)) return Blend{};
+                const std::array<LayerRows, 4>& rows = LayerValues(lw);
+                for (int l = 0; l < lw.layers && l < 4; ++l) parts[count++] = { lw.weight[l], &rows[l] };
+                return Combine(parts, count);
             }
             const float u = x / kTerrainCell - 0.5f, v = y / kTerrainCell - 0.5f;
             const int cx = static_cast<int>(std::floor(u)), cy = static_cast<int>(std::floor(v));
             const float fx = u - cx, fy = v - cy;
             const int c[4][2] = { { cx, cy }, { cx + 1, cy }, { cx, cy + 1 }, { cx + 1, cy + 1 } };
             const float w[4] = { (1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy };
-            float sum[kSumCount] = {};
-            g_blendTarget = &b;
             for (int k = 0; k < 4; ++k)
-            {
-                covertable::Values cv;
-                if (CellValues(c[k][0], c[k][1], cv)) AddRow(cv, w[k], b.covered, sum);
-            }
-            if (b.covered <= 0.0f) return b;
-            FinishBlend(b, sum);
-            return b;
+                if (const LayerRows* rows = CellRows(c[k][0], c[k][1])) parts[count++] = { w[k], rows };
+            return Combine(parts, count);
         }
 
         uint8_t ToByte(float v) { return static_cast<uint8_t>((v <= 0.0f ? 0.0f : (v >= 1.0f ? 1.0f : v)) * 255.0f + 0.5f); }
@@ -769,7 +838,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 // snowy terrain cell's border follows an irregular line instead of a rounded square.
                 // How far comes from the rows near the unwarped point.
                 const Blend around = BlendAt(x, y);
-                const float breakup0 = (around.covered > 0.0f ? around.breakup : covertable::Values().edgeBreakup) * g_settings.breakupMul;
+                const float breakup0 = (around.hasLook ? around.breakup : covertable::Values().edgeBreakup) * g_settings.breakupMul;
                 const float warp = kEdgeWarpYards * (breakup0 > 1.0f ? 1.0f : breakup0);
                 const float mx = x + warp * (2.0f * ValueNoise(x / 7.0f, y / 7.0f, 1) - 1.0f);
                 const float my = y + warp * (2.0f * ValueNoise(x / 7.0f, y / 7.0f, 2) - 1.0f);
@@ -789,18 +858,21 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             }
             // The cover's base: the terrain, moved by the rows' ZOffset (below the terrain only what
             // rises above it shows, e.g. trench rims through grass).
-            const float base = ok ? z + (b.covered > 0.0f ? b.zOffset : 0.0f) : kHole;
+            const float base = ok ? z + (b.hasLook ? b.zOffset : 0.0f) : kHole;
             if (base != L.base[s]) { L.base[s] = base; L.baseDirty = true; }
             const uint8_t material = ToByte(b.covered), driftAmp = ToByte(b.drift), breakup = ToByte(b.breakup), stiff = ToByte(b.stiffness);
             const uint8_t drift = static_cast<uint8_t>(Drift(x, y) * 255.0f + 0.5f);
             const uint8_t edge = static_cast<uint8_t>(EdgeNoise(x, y) * 255.0f + 0.5f);
+            const uint8_t snowShare = ToByte(b.snowShare), paintedSnow = ToByte(b.paintedSnow);
             const uint32_t tint = (static_cast<uint32_t>(ToByte(b.tintStrength)) << 24) | (static_cast<uint32_t>(ToByte(b.tint[0])) << 16) |
                                   (static_cast<uint32_t>(ToByte(b.tint[1])) << 8) | ToByte(b.tint[2]);
             if (material != L.material[s] || b.depth != L.depth[s] || slopeF != L.slope[s] || driftAmp != L.driftAmp[s] ||
-                breakup != L.breakup[s] || drift != L.drift[s] || edge != L.edgeNoise[s] || stiff != L.stiff[s])
+                breakup != L.breakup[s] || drift != L.drift[s] || edge != L.edgeNoise[s] || stiff != L.stiff[s] ||
+                snowShare != L.snowShare[s] || paintedSnow != L.paintedSnow[s])
             {
                 L.material[s] = material; L.depth[s] = b.depth; L.slope[s] = slopeF; L.driftAmp[s] = driftAmp;
                 L.breakup[s] = breakup; L.drift[s] = drift; L.edgeNoise[s] = edge; L.stiff[s] = stiff;
+                L.snowShare[s] = snowShare; L.paintedSnow[s] = paintedSnow;
                 L.coverDirty = true;
             }
             int a = -1, c = -1; // the two strongest
@@ -1264,27 +1336,53 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             }
             // The others only change when their coverage or a multiplier does.
             if (!L.coverDirty) return UploadLook(L);
+            const double foldStart = grassperf::Now();
             if (FAILED(L.coverTex->LockRect(0, &lr, nullptr, 0))) return false;
             const float depthMul = g_settings.depthMul, driftMul = g_settings.driftMul, breakupMul = g_settings.breakupMul;
             const int slotI0 = Slot(L.gridI), slotJ0 = Slot(L.gridJ);
+            const bool snowOn = fields::SnowActive();
+            // Material shaping: steeper with more breakup, and the fine edge noise moves the
+            // threshold, so the transition breaks into patches. Fully covered and bare stay so.
+            auto shape = [](uint8_t coverage, float b, uint8_t edgeNoise)
+            {
+                float m = (coverage / 255.0f - 0.5f) * (1.0f + 2.0f * b) + 0.5f + 1.5f * b * (edgeNoise / 255.0f - 0.5f);
+                return m <= 0.0f ? 0.0f : (m >= 1.0f ? 1.0f : m * m * (3.0f - 2.0f * m));
+            };
             for (int row = 0; row < kTex; ++row)
             {
                 float* out = reinterpret_cast<float*>(static_cast<uint8_t*>(lr.pBits) + row * lr.Pitch);
                 // Where this row sits in the grid (Chebyshev distance from the centre feeds the trench fade).
                 const int dj = (row - slotJ0 + kTex) % kTex;
                 const int cj = std::abs(dj - kHalfCells);
+                // The world cell this row holds (the apron sits just before the grid's first cell).
+                const float wy = static_cast<float>(L.gridJ + (dj >= kTex - kApron ? dj - kTex : dj)) * L.cell;
                 for (int col = 0; col < kTex; ++col)
                 {
                     const int s = row * kTex + col;
-                    // Material shaping: steeper with more breakup, and the fine edge noise moves the
-                    // threshold, so the transition breaks into patches. Fully covered and bare stay so.
                     float b = L.breakup[s] / 255.0f * breakupMul;
                     b = b > 1.0f ? 1.0f : b;
-                    float m = (L.material[s] / 255.0f - 0.5f) * (1.0f + 2.0f * b) + 0.5f + 1.5f * b * (L.edgeNoise[s] / 255.0f - 0.5f);
-                    m = m <= 0.0f ? 0.0f : (m >= 1.0f ? 1.0f : m * m * (3.0f - 2.0f * m));
                     float driftF = 1.0f + L.driftAmp[s] / 255.0f * driftMul * (L.drift[s] / 127.5f - 1.0f);
                     driftF = driftF < 0.0f ? 0.0f : driftF;
-                    const float cover = depthMul * L.depth[s] * m * (L.slope[s] / 255.0f) * driftF;
+                    const float slope = L.slope[s] / 255.0f;
+                    float cover = L.depth[s] > 0.0f ? depthMul * L.depth[s] * shape(L.material[s], b, L.edgeNoise[s]) * slope * driftF : 0.0f;
+                    // Snow: painted snow thinned by its kept share (patchy: where the drift and edge
+                    // noise are low it opens first), fallen snow on top.
+                    if (snowOn && (L.snowShare[s] || L.paintedSnow[s]))
+                    {
+                        const int di = (col - slotI0 + kTex) % kTex;
+                        const float wx = static_cast<float>(L.gridI + (di >= kTex - kApron ? di - kTex : di)) * L.cell;
+                        float fallen, keep;
+                        fields::SnowAt(wx, wy, fallen, keep);
+                        if (L.paintedSnow[s] && keep < 1.0f && cover > 0.0f)
+                        {
+                            constexpr float kPatchy = 0.6f;
+                            const float noise = (0.6f * L.drift[s] + 0.4f * L.edgeNoise[s]) / 255.0f;
+                            float t = keep * (1.0f + kPatchy) - kPatchy * (1.0f - noise);
+                            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+                            cover *= 1.0f - L.paintedSnow[s] / 255.0f * (1.0f - t);
+                        }
+                        if (L.snowShare[s] && fallen > 0.0f) cover += fallen * shape(L.snowShare[s], b, L.edgeNoise[s]) * slope * driftF;
+                    }
                     if (!isLevel0) { out[col] = cover > 0.0f ? cover : 0.0f; continue; }
                     g_static0[s] = cover > 0.0f ? cover : 0.0f;
                     if (cover <= 0.0f) { g_deformK[s] = 0.0f; out[col] = 0.0f; continue; }
@@ -1302,6 +1400,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             }
             L.coverTex->UnlockRect(0);
             L.coverDirty = false;
+            L.foldMs = grassperf::Now() - foldStart;
             if (isLevel0) { g_changed.clear(); g_changedPending = false; } // the full pass included them
             return UploadLook(L);
         }
@@ -1634,7 +1733,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         {
             char line[384];
             g_api->UiCheckbox("Draw the cover", &g_settings.enabled);
-            static const char* const coverage[] = { "Everywhere (test)", "From SurfaceCover.cdbc" };
+            static const char* const coverage[] = { "Everywhere (test: nothing painted, fallen snow anywhere)", "From SurfaceCover.cdbc" };
             g_api->UiCombo("Where", &g_settings.coverage, coverage, 2);
             g_api->UiSliderInt("Levels (40 / 80 / 160 / 320 / 640 yd)", &g_settings.levels, 1, kMaxLevels);
             g_api->UiText("Multipliers on SurfaceCover.cdbc (1 = exactly the table):");
@@ -1656,6 +1755,13 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             g_api->UiCheckbox("Wireframe", &g_settings.wireframe);
             static const char* const drawPoints[] = { "Right after the terrain (inside the world pass)", "End of the scene (old)" };
             g_api->UiCombo("Draw point", &g_settings.drawPoint, drawPoints, 2);
+
+            g_api->UiSeparator();
+            g_api->UiText("Fallen snow (test, not saved): a deposit on your zone, which then melts or stays by the climate.");
+            g_api->UiSliderFloat("Deposit (yd)", &g_depositYards, 0.02f, 0.6f);
+            if (g_api->UiButton("Deposit snow")) regional::DepositSnow(g_depositYards);
+            g_api->UiSameLine();
+            if (g_api->UiButton("Clear fallen snow")) regional::ClearSnow();
 
             g_api->UiSeparator();
             std::snprintf(line, sizeof(line), "SurfaceCover.cdbc: %s", covertable::Status());
@@ -1749,6 +1855,23 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                     std::snprintf(line, sizeof(line), "  layer %d: %.2f  \"%s\", effect %u, TerrainType %d", l, g_hereLayers.weight[l],
                                   g_hereLayerTexture[l].c_str(), sf.groundEffect, sf.terrainType); add();
                 }
+            }
+            {
+                const world::Snapshot& snap = world::Current();
+                const fields::SnowDetail sd = snap.inWorld ? fields::Snow(snap.playerPos) : fields::SnowDetail{};
+                if (sd.known)
+                {
+                    std::snprintf(line, sizeof(line), "here (snow): fallen %.3f yd -> %.3f (zones' %.3f x held %.2f), painted %.2f yd, kept %.2f -> cap %.2f (kept share %.2f, gone at %.0f degC)",
+                                  sd.fallen, sd.target, sd.zoneSnow, sd.hold, sd.painted, sd.keep, sd.cap, sd.keptShare, sd.goneTemperature); add();
+                    std::snprintf(line, sizeof(line), "here (snow): effective %.1f degC (sun %+.1f), zone's snow sees %.1f degC, heat reach %.2f, melt water %.2f",
+                                  sd.temperature, sd.sun, sd.zoneTemperature, sd.heatReach, sd.meltWet); add();
+                }
+                else { std::snprintf(line, sizeof(line), "here (snow): not sampled yet"); add(); }
+                const climate::Sun& sun = climate::SunNow();
+                std::snprintf(line, sizeof(line), "snow: published %u time(s), %s; sun %.2f %.2f %.2f (%s), daylight %.2f; last depth folds %.2f / %.2f / %.2f / %.2f / %.2f ms",
+                              fields::GetStats().snowPublished, fields::SnowActive() ? "some snow around" : "none around",
+                              sun.dir[0], sun.dir[1], sun.dir[2], sun.fromClient ? "client" : "from the time", sun.daylight,
+                              g_levels[0].foldMs, g_levels[1].foldMs, g_levels[2].foldMs, g_levels[3].foldMs, g_levels[4].foldMs); add();
             }
             std::snprintf(line, sizeof(line), "CPU: sim %.2f ms, upload %.2f ms, draw submit %.2f ms", g_simMs, g_uploadMs, g_drawMs); add();
             if (g_seenScene)
@@ -1906,9 +2029,26 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             WorkFill(g_levels[k], k == 0, deadline);
         }
 
+        // New snow values (fallen snow, painted snow melting): one level re-folds its depth per frame.
+        // While there's no snow anywhere and the last fold had none either, there's nothing to redo.
+        {
+            const uint32_t version = fields::SnowVersion();
+            const bool active = fields::SnowActive();
+            for (int n = 0; n < levels; ++n)
+            {
+                const int k = (g_snowCursor + n) % levels;
+                Level& L = g_levels[k];
+                if (!L.haveGrid || L.snowVersion == version) continue;
+                L.snowVersion = version;
+                if (active || L.snowFolded) L.coverDirty = true;
+                L.snowFolded = active;
+                g_snowCursor = k + 1;
+                break;
+            }
+        }
+
         // The table's values where the player is, for the panel's "here" lines.
         covertable::Values here;
-        if (static_cast<Coverage>(g_settings.coverage) == Coverage::Everywhere) here.depth = kTestDepth;
         g_hereValid = terrain::SurfaceAt(snap.playerPos[0], snap.playerPos[1], g_hereSurface);
         if (g_hereValid)
         {

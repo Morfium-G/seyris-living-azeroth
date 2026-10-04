@@ -177,6 +177,8 @@ in over time. Grass and small doodads are buried under it.
 | ZOffset | yards the cover's base sits above (+) or **below (−)** the terrain. Below the terrain only what rises above it shows. Muddy footprint outlines: Depth 0.015, ZOffset −0.02 (the top stays 0.005 yd under the grass), Rim 4 (rims rise 0.055 yd above it), DriftNoise 0. Signed: **−1000 inherits** (exactly −1 does too, as older files wrote it) |
 | Wetness | how wet the cover **looks** at rest: 0 = as its texture .. 1 = soaked: darker, and the specular gets stronger (up to ×3) and tighter. On top of it, the ground moisture above its rest (rain, water nearby) makes it look wetter still. The shine comes from the CoverTexture's specular mask, so a cover without a CoverTexture doesn't shine |
 | Flags | 0x1 **prevent underwater**: the cover thins out over 0.3 yd below a terrain liquid's surface (rivers, lakes, sea; not WMO water). 0x2 **prevent on land**: cover only there (river and sea floors). 0x4 **use MCCV**: tinted by the terrain's vertex colours, like the terrain. 0x8 **ignore specular map**: no shine from the CoverTexture. Flags come from the row that decides Depth, except 0x8, which belongs to the CoverTexture named in the same row |
+| MeltKeptShare | **snow covers only**: the share of the painted depth mild weather melts it down to (at 15 °C; less above 0 °C, nothing at or below). 0.6 if no row sets it. Appended |
+| MeltGoneTemperature | **snow covers only**: °C at which painted snow melts away completely (from MeltKeptShare at 15 °C down to nothing here). 25 if no row sets it; set it low (e.g. 16) for "no snow in summer" in a zone or on a texture. Signed: **−1000 inherits**. Appended |
 
 **Specular:** a CoverTexture's alpha is its specular mask, as on the terrain's layers. If a `_s.blp`
 next to it exists (later expansions keep the mask there), that one is used instead. The shine uses the
@@ -198,6 +200,33 @@ table for testing or taste; at 1 the table applies exactly.
 
 Shipped baseline: snow 0.35 yd everywhere it's painted (bare above ~40°), sand listed but off
 (Depth 0, with a sandy tint ready).
+
+**Snow: fallen and painted** (runtime; the cover panel's "here (snow)" lines and the climate
+panel's zone list show it). A cover is **snow** when its CoverMaterial is the fallback snow material
+(what GroundMaterialSelector gives for **TerrainType 3** at the place, or globally) or a child of it.
+- **Fallen snow** builds up while it snows on ground below 0 °C (0.2 yd an hour at full intensity, up
+  to 0.6 yd) and melts above 0 °C (~1.5 cm per °C per day; its water soaks the ground). Snow falling
+  on ground above 0 °C melts on arrival and soaks it, more slowly than rain. While it isn't
+  snowing, fallen snow also **sublimates** (turns to vapour, no melt water), even below 0 °C: half
+  of it in ~8 h in calm air at night, down to ~1 h in strong wind, dry air and sunshine. So
+  always-cold zones don't keep fallen snow forever; their painted snow stays. It's kept
+  per zone (a zone you enter while it snows catches up on half an hour of snowfall) and follows that
+  zone near you, less where a spot is warmer than its zone (hot ground and liquids, sunny slopes),
+  none under roofs and liquids. Where a **snow cover** is painted it adds to its depth and keeps its
+  look. Elsewhere it takes the look of the layer's own row **if that row's CoverMaterial is snow, even
+  with Depth 0** ("no snow until it snows, then it looks like this", per area or texture), else of
+  the fallback snow's row, else built-in values (plain white, slope limits 45°/15°). It never lies
+  on or right beside **other** covers (sand, mud).
+- **Painted snow** keeps its Depth as a baseline. Warm weather melts it down, slowly (degree-days),
+  toward a cap: all of it at 0 °C or below, MeltKeptShare at 15 °C, nothing at MeltGoneTemperature.
+  It opens in small holes and patches first. Heat sources (hot ground, hot liquids) melt it down to
+  nothing on top and less further away, leaving pits. Colder again (night), it grows back toward its
+  cap (~4.5 cm an hour, faster while it snows). Melt water wets the ground.
+- The **effective temperature** of a spot is the ground's (air, hot liquids and ground nearby,
+  toward a hot material's own on lava textures) plus up to 4 °C of sun by day on ground facing it.
+- Testing: the cover panel's **Deposit snow** adds fallen snow to your zone; the **Everywhere** mode
+  paints nothing, so fallen snow lies anywhere with the plain look. The climate panel's **Set your
+  zone's soak** does the same for moisture.
 
 **Older files:**
 - 21 columns (place keys inside SurfaceCover itself): the panel says so. Split them with
