@@ -292,11 +292,30 @@ float4 lift : register(c8);
 float4 vr0 : register(c9); float4 vr1 : register(c10); float4 vr2 : register(c11);
 float4 fogp : register(c12);
 float4 look : register(c13);
+float4 farMap : register(c14);   // 1 / chunk size, map size, 1 / map size, on
+float4 farBox : register(c15);   // the far map's box, world yd (min x, min y, max x, max y)
+float4 farMisc : register(c16);  // x = the value outside that box
 sampler2D baseTex : register(s0);
 sampler2D coverTex : register(s1);
 sampler2D lookTex : register(s2);
+sampler2D farTex : register(s3);  // ground moisture beyond the near grid, per terrain chunk (R32F)
 
-struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1; float2 rel : TEXCOORD2; float fog : TEXCOORD3; float4 tint : TEXCOORD4; float2 wuv : TEXCOORD5; float3 vpos : TEXCOORD6; };
+// The far map at a world position, filtered here (vertex textures aren't).
+float FarAt(float2 w)
+{
+    float2 t = w * farMap.x - 0.5;
+    float2 f = frac(t);
+    float4 uv = float4((t - f + 0.5) * farMap.z, 0, 0);
+    float a = tex2Dlod(farTex, uv).r;
+    float b = tex2Dlod(farTex, uv + float4(farMap.z, 0, 0, 0)).r;
+    float c = tex2Dlod(farTex, uv + float4(0, farMap.z, 0, 0)).r;
+    float d = tex2Dlod(farTex, uv + float4(farMap.z, farMap.z, 0, 0)).r;
+    float v = lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+    float inside = (w.x >= farBox.x && w.y >= farBox.y && w.x <= farBox.z && w.y <= farBox.w) ? farMap.w : 0;
+    return lerp(farMisc.x, v, inside);
+}
+
+struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1; float2 rel : TEXCOORD2; float fog : TEXCOORD3; float4 tint : TEXCOORD4; float2 wuv : TEXCOORD5; float3 vpos : TEXCOORD6; float far : TEXCOORD7; };
 
 float4 Tint(float2 idx) { return look.x > 0.5 ? tex2Dlod(lookTex, float4((idx + 0.5) * grid.w, 0, 0)) : 0; }
 
@@ -363,6 +382,8 @@ VOut main(float2 ij : POSITION)
         else        { p = lerp(p, p1, m); n = lerp(normalize(n), normalize(n1), m); s = lerp(s, s1, m); o.tint = lerp(o.tint, t1, m); o.wuv = lerp(o.wuv, w1, m); }
     }
 
+    o.far = FarAt(p.xy);
+
     // Far away the client draws simpler terrain than its heights, which pokes through a thin
     // cover; a lift that only depends on the distance stays seamless across the levels.
     float dist = length(float3(p.xy - eye.xy, p.z - eye.z));
@@ -405,7 +426,7 @@ float4 specOn1 : register(c9);
 float4 specular : register(c10);
 float4 wetMap : register(c11);  // 1 / grid extent (yd), uv offset (x, y), on
 float4 wetBox : register(c12);  // the grid's valid box, camera-relative (min x, min y, max x, max y)
-float4 misc : register(c13);     // x = 1: the terrain's dynamic shadows apply; y = moisture beyond the grid, z = 1 / its edge fade (yd),
+float4 misc : register(c13);     // x = 1: the terrain's dynamic shadows apply; y = (unused), z = 1 / the near grid's edge fade (yd),
                                  // w = how much darker soaked ground gets (the wet terrain's strength, so both match)
 float4 pcf[8] : register(c20);   // the terrain's PCF offsets (its PS c3..c10)
 float4 shadowM[12] : register(c30); // the terrain's shadow matrices (its VS c37..c48), from view space
@@ -464,7 +485,7 @@ float Shadow(float3 vp)
     return edge * (s * 0.2 - 1) + 1;
 }
 
-float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float fog : TEXCOORD3, float4 tint : TEXCOORD4, float2 wuv : TEXCOORD5, float3 vpos : TEXCOORD6) : COLOR
+float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float fog : TEXCOORD3, float4 tint : TEXCOORD4, float2 wuv : TEXCOORD5, float3 vpos : TEXCOORD6, float far : TEXCOORD7) : COLOR
 {
     clip(d.x - opts.x);
     clip(0.5 - d.y);
@@ -491,7 +512,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
     // Inside its last yards the grid fades into the one regional value used beyond it.
     float2 fromMin = rel - wetBox.xy, toMax = wetBox.zw - rel;
     float inner = saturate(min(min(fromMin.x, fromMin.y), min(toMax.x, toMax.y)) * misc.z);
-    float wet = saturate(pr.a + wetMap.w * lerp(misc.y, tex2D(wetGrid, rel * wetMap.x + wetMap.yz).a, inner));
+    float wet = saturate(pr.a + wetMap.w * lerp(far, tex2D(wetGrid, rel * wetMap.x + wetMap.yz).a, inner));
     colour *= pr.rgb * 2 * (1 - misc.w * wet);
     float3 h = normalize(l + normalize(-vpos));
     float sp = pow(saturate(dot(nn, h)), max(specular.w, 1) * (1 + 3 * wet)) * saturate(mask * (1 + 2 * wet));
@@ -1465,6 +1486,17 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             }
             for (IDirect3DBaseTexture9*& t : shadowMaps) if (t) { t->Release(); t = nullptr; }
 
+            // Ground moisture beyond the near grid, per terrain chunk (its zone's), on vertex sampler 3.
+            {
+                float farInv = 0.0f, box[4] = {}, outside = 0.0f;
+                int size = 0;
+                const bool farOn = moisturetex::FarMapping(farInv, box, size, outside) && moisturetex::BindFarVertex(dev, D3DVERTEXTEXTURESAMPLER3);
+                const float vs14[12] = { farInv * size, static_cast<float>(size), size > 0 ? 1.0f / size : 0.0f, farOn ? 1.0f : 0.0f,
+                                         box[0], box[1], box[2], box[3],
+                                         outside, 0.0f, 0.0f, 0.0f };
+                dev->SetVertexShaderConstantF(14, vs14, 3);
+            }
+
             dev->SetVertexDeclaration(g_decl);
             dev->SetStreamSource(0, g_vb, 0, 8);
             dev->SetIndices(g_ib);
@@ -1551,6 +1583,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, nullptr);
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER2, nullptr);
+            dev->SetTexture(D3DVERTEXTEXTURESAMPLER3, nullptr);
             for (int t = 0; t < 16; ++t) dev->SetTexture(t, nullptr);
             if (swapDepth) dev->SetDepthStencilSurface(oldDepth);
             if (oldDepth) oldDepth->Release();

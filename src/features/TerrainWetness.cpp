@@ -32,8 +32,9 @@ namespace wxl_livingazeroth::terrainwet
         // paired with the VS that write it that way) -- that output is re-labelled texcoord7 and
         // carries the world XY instead. Packing a second semantic into a register's free .zw does NOT
         // work (in-client 2026-10-04: the PS read zeros, whichever components it declared).
-        // c200 = (1 / grid extent, debug: whole grid wet, beyond the grid, strength), c201 = grid box
-        // (world yd), c203 = (debug: ignore the box, stripe scale, stripes on, 1 / edge fade yards);
+        // c200 = (1 / grid extent, debug: whole grid wet, beyond everything, strength), c201 = grid box
+        // (world yd), c203 = (debug: ignore the box, stripe scale, stripes on, 1 / edge fade yards),
+        // c204 = (1 / far map extent, 0, far map on, 0), c205 = the far map's box (world yd);
         // c202 is defined in the shader. Inside its last kEdgeFadeYards the grid fades into the one
         // regional value used beyond it, so its edge doesn't show.
         constexpr int kPsConstant = 200;
@@ -103,8 +104,8 @@ namespace wxl_livingazeroth::terrainwet
         bool EditPixel(std::string& src, std::string& why)
         {
             if (src.find("ps_3_0") == std::string::npos) { why = "not ps_3_0"; return false; }
-            if (src.find(" v9") != std::string::npos || src.find(" s11") != std::string::npos || src.find("c200") != std::string::npos)
-            { why = "v9/s11/c200 in use"; return false; }
+            if (src.find(" v9") != std::string::npos || src.find(" s11") != std::string::npos || src.find(" s12") != std::string::npos || src.find("c200") != std::string::npos)
+            { why = "v9/s11/s12/c200 in use"; return false; }
             // The stock ending: the colour minus the fog colour, then lerped toward it by the fog.
             static const std::regex fog(R"((\n[ \t]*)add (r\d+)\.xyz, \2, -c2[ \t]*\n[ \t]*mad oC0\.xyz, v\d+\.x, \2, c2)");
             std::smatch m;
@@ -126,13 +127,25 @@ namespace wxl_livingazeroth::terrainwet
                 "\n    cmp r28.x, r28.x, c202.y, c202.x"
                 "\n    mul r28.x, r28.x, c203.z"
                 "\n    max r30.w, r30.w, r28.x"
-                "\n    add r30.w, r30.w, -c200.z"
-                "\n    mad r30.w, r31.x, r30.w, c200.z"
+                // Beyond the near grid: the far map (per chunk, its zone's value) inside its box, the
+                // single fallback value outside it.
+                "\n    mul r27.xy, v9.xy, c204.x"
+                "\n    texld r27, r27, s12"
+                "\n    add r26.xy, v9.xy, -c205.xy"
+                "\n    add r26.zw, -v9.xyxy, c205.zwzw"
+                "\n    min r26.xy, r26.xy, r26.zw"
+                "\n    min r26.x, r26.x, r26.y"
+                "\n    cmp r26.x, r26.x, c202.x, c202.y"
+                "\n    mul r26.x, r26.x, c204.z"
+                "\n    add r27.w, r27.w, -c200.z"
+                "\n    mad r27.w, r26.x, r27.w, c200.z"
+                "\n    add r30.w, r30.w, -r27.w"
+                "\n    mad r30.w, r31.x, r30.w, r27.w"
                 "\n    mov r30.x, r30.w"
                 "\n    mul r30.x, r30.x, c200.w"
                 "\n    mad " + r + ".xyz, " + r + ", -r30.x, " + r;
             src.insert(static_cast<size_t>(m.position(0)), block);
-            src.insert(src.find('\n') + 1, "    def c202, 1, 0, 0.5, 0\n    dcl_texcoord7 v9.xy\n    dcl_2d s11\n");
+            src.insert(src.find('\n') + 1, "    def c202, 1, 0, 0.5, 0\n    dcl_texcoord7 v9.xy\n    dcl_2d s11\n    dcl_2d s12\n");
             return true;
         }
 
@@ -177,6 +190,14 @@ namespace wxl_livingazeroth::terrainwet
         if (g_debug == 3) c[1] = 0.0f;        // stripes only
         device->SetPixelShaderConstantF(kPsConstant, c, 2);
         device->SetPixelShaderConstantF(kPsConstant + 3, c + 12, 1);
+
+        // The far map (per terrain chunk, its zone's value) on s12.
+        float farConstants[8] = {};
+        int farSize = 0;
+        float outside = 0.0f;
+        const bool farOn = on && !g_debug && moisturetex::FarMapping(farConstants[0], farConstants + 4, farSize, outside) && moisturetex::BindFarPixel(device, 12);
+        farConstants[2] = farOn ? 1.0f : 0.0f;
+        device->SetPixelShaderConstantF(kPsConstant + 4, farConstants, 2);
     }
 
     void  SetEnabled(bool enabled) { g_enabled = enabled; }

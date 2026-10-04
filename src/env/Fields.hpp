@@ -68,7 +68,15 @@ namespace wxl_livingazeroth::fields
         int            firstI = 0, firstJ = 0;
         const uint8_t* excess = nullptr;
         uint32_t       version = 0;
-        float          farExcess = 0.0f; // beyond the grid: the mean excess of its outer ring (rain is regional)
+        float          farExcess = 0.0f; // beyond the grid where no zone is known: the player's zone's value
+
+        // Beyond the grid: per terrain chunk (env/Regional's zone map, same layout), the excess of
+        // the zone it belongs to, scaled to match the grid's own outer ring. Bytes (0..255) and floats.
+        int            farSize = 0;
+        float          farCellSize = 0.0f;
+        int            farFirstI = 0, farFirstJ = 0;
+        const uint8_t* farBytes = nullptr;
+        const float*   farValues = nullptr;
     };
     const WetGrid& Wet();
 

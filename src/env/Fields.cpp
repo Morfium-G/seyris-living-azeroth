@@ -73,6 +73,16 @@ namespace wxl_livingazeroth::fields
         };
         std::vector<Cell>    g_cells(kSize * kSize);
         std::vector<uint8_t> g_excess(kSize * kSize, 0);
+        std::vector<uint8_t> g_farBytes;   // per chunk of the zone map
+        std::vector<float>   g_farValues;
+
+        // The excess of typical ground (rest 0.3, absorbency 0.5, open sky) at a zone soak s, by the
+        // same rule the near spots follow.
+        float TypicalExcess(float s)
+        {
+            constexpr float kRest = 0.3f, kAbsorbency = 0.5f;
+            return (1.0f - kRest) * (1.0f - std::pow(1.0f - (s < 0.999f ? s : 0.999f), kAbsorbency));
+        }
         WetGrid  g_wet;
         int      g_firstI = 0, g_firstJ = 0;
         bool     g_haveGrid = false;
@@ -316,7 +326,7 @@ namespace wxl_livingazeroth::fields
             }
 
             // Temperature and humidity per area, once per tick.
-            double ringSum = 0.0;
+            double ringSum = 0.0, ringTypical = 0.0;
             unsigned ringCount = 0;
             uint32_t lastArea = 0xFFFFFFFFu;
             float temperature = 0.0f, humidity = 0.5f;
@@ -361,9 +371,36 @@ namespace wxl_livingazeroth::fields
                     g_excess[s] = static_cast<uint8_t>(Clamp01(excess) * 255.0f + 0.5f);
                     // The outer ring (8 cells) on dry land feeds the value used beyond the grid.
                     if (!c.submerged && (a < kRing || b < kRing || a >= kSize - kRing || b >= kSize - kRing))
-                    { ringSum += Clamp01(excess); ++ringCount; }
+                    { ringSum += Clamp01(excess); ringTypical += TypicalExcess(mix); ++ringCount; }
                 }
-            g_wet.farExcess = ringCount ? static_cast<float>(ringSum / ringCount) : Clamp01(regional::RainSoak(g_map, playerZone) * 0.35f);
+            // Beyond the grid: each chunk's zone, as typical ground, scaled so the grid's outer ring
+            // and the far values agree where they meet (its real materials differ from "typical").
+            float scale = 1.0f;
+            if (ringCount && ringTypical / ringCount > 0.02)
+            {
+                scale = static_cast<float>((ringSum / ringCount) / (ringTypical / ringCount));
+                scale = scale < 0.25f ? 0.25f : (scale > 4.0f ? 4.0f : scale);
+            }
+            const float playerFar = Clamp01(scale * TypicalExcess(regional::RainSoak(g_map, playerZone)));
+            g_wet.farExcess = playerFar;
+            const regional::ZoneMap& zm = regional::Map();
+            if (zm.zone && zm.size > 0)
+            {
+                const size_t n = static_cast<size_t>(zm.size) * zm.size;
+                g_farBytes.resize(n); g_farValues.resize(n);
+                uint32_t lastZone = 0xFFFFFFFFu;
+                float lastValue = playerFar;
+                for (size_t k = 0; k < n; ++k)
+                {
+                    const uint32_t z = zm.zone[k];
+                    if (z != lastZone) { lastValue = z ? Clamp01(scale * TypicalExcess(regional::RainSoak(g_map, z))) : playerFar; lastZone = z; }
+                    g_farValues[k] = lastValue;
+                    g_farBytes[k] = static_cast<uint8_t>(lastValue * 255.0f + 0.5f);
+                }
+                g_wet.farSize = zm.size; g_wet.farCellSize = zm.cellSize;
+                g_wet.farFirstI = zm.firstI; g_wet.farFirstJ = zm.firstJ;
+                g_wet.farBytes = g_farBytes.data(); g_wet.farValues = g_farValues.data();
+            }
             ++g_wet.version;
             g_stats.tickMs = grassperf::Now() - t0;
         }

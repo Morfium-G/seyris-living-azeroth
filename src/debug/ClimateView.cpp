@@ -111,6 +111,10 @@ namespace wxl_livingazeroth::debug
                 std::snprintf(line, sizeof(line), "you are in zone %u \"%s\" (AreaTable name; the client says \"%s\")",
                               zone, regional::AreaName(zone), s.zoneText);
                 g_api->UiText(line);
+                const regional::ZoneMap& zm = regional::Map();
+                std::snprintf(line, sizeof(line), "far map: %u / %d chunks known (+-%.0f yd), each showing its zone's state",
+                              zm.known, zm.size * zm.size, zm.size * zm.cellSize * 0.5f);
+                g_api->UiText(line);
                 for (const regional::Zone& z : regional::Zones())
                 {
                     const double ago = regional::Now() - z.lastSeen;

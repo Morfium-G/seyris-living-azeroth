@@ -26,6 +26,15 @@ namespace wxl_livingazeroth::moisturetex
     float FarExcess();
     constexpr float kEdgeFadeYards = 64.0f;
 
-    /// Drops the texture (device lost or replaced).
+    /// Beyond the grid, per terrain chunk (the zone each belongs to): the same world-aligned toroidal
+    /// layout at chunk size. BindFarPixel puts the filtered A8R8G8B8 copy (alpha) on a pixel
+    /// sampler; BindFarVertex the R32F copy (point sampled: the cover's vertex shader filters it
+    /// itself) on a vertex sampler. FarMapping: 1 / extent, the valid box (world yd), the map's
+    /// size in chunks, and the value outside the box.
+    bool BindFarPixel(IDirect3DDevice9* device, DWORD sampler);
+    bool BindFarVertex(IDirect3DDevice9* device, DWORD vertexSampler);
+    bool FarMapping(float& inverseExtent, float box[4], int& size, float& outside);
+
+    /// Drops the textures (device lost or replaced).
     void Release();
 }

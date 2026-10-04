@@ -48,6 +48,20 @@ namespace wxl_livingazeroth::regional
     /// near the player can fast-forward with it.
     float PlayerZoneSpeed();
 
+    /// Which zone each terrain chunk around the player belongs to, for the far distance: a
+    /// world-aligned toroidal grid of `size` x `size` chunks (chunk i = floor(x / cellSize) lives at
+    /// [mod(j, size) * size + mod(i, size)]), valid for i in [firstI, firstI + size) (same for j).
+    /// zone 0 = not known yet (chunk not loaded).
+    struct ZoneMap
+    {
+        int             size = 0;
+        float           cellSize = 0.0f;
+        int             firstI = 0, firstJ = 0;
+        const uint32_t* zone = nullptr;
+        unsigned        known = 0;
+    };
+    const ZoneMap& Map();
+
     /// Every zone seen this session (for the panel).
     const std::vector<Zone>& Zones();
 

@@ -362,6 +362,15 @@ namespace wxl_livingazeroth::terrain
         return true;
     }
 
+    bool ChunkAreaAt(float x, float y, uint32_t& outArea)
+    {
+        float pos[3] = { x, y, 0.0f };
+        const auto* chunk = static_cast<const uint8_t*>(wxl::game::adt::GetChunk(pos));
+        if (!chunk) return false;
+        outArea = *reinterpret_cast<const uint32_t*>(chunk + kChunkArea);
+        return true;
+    }
+
     bool LiquidAt(float x, float y, float& outZ, uint32_t& outLiquidType)
     {
         const float pos[3] = { x, y, -100000.0f };

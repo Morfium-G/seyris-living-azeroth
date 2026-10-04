@@ -44,6 +44,10 @@ namespace wxl_livingazeroth::terrain
     /// (and no change to `rgb`) when the chunk has no MCCV, isn't loaded, or the spot is a hole.
     bool VertexColorAt(float x, float y, float rgb[3]);
 
+    /// The area ID of the loaded terrain chunk at world (x, y), holes included (unlike SurfaceAt).
+    /// False when no chunk is loaded there.
+    bool ChunkAreaAt(float x, float y, uint32_t& outArea);
+
     /// The surface height of terrain liquid (rivers, lakes, sea; not WMO liquid) at world (x, y),
     /// from the client's own liquid probe. False where the terrain cell has no liquid.
     bool LiquidHeightAt(float x, float y, float& outZ);

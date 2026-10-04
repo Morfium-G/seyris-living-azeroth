@@ -4,7 +4,9 @@
 #include "TerrainHeight.hpp"
 #include "Wind.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace wxl_livingazeroth::regional
 {
@@ -26,6 +28,64 @@ namespace wxl_livingazeroth::regional
         constexpr size_t    kAreaNameField = 0x2C;
 
         std::vector<Zone> g_zones;
+
+        // The zone map: one entry per terrain chunk (33.3 yd) in a 64 x 64 window (+-1066 yd) around
+        // the player, world-aligned and toroidal; refilled a slice per frame, unknown chunks retried.
+        constexpr int   kMapSize = 64;
+        constexpr float kChunk = 100.0f / 3.0f;
+        constexpr int   kMapRecentre = 4;     // chunks the player moves before the window follows
+        constexpr int   kMapPerFrame = 256;   // chunk lookups per frame
+        struct MapSlot { int i = 0x7FFFFFFF, j = 0; };
+        std::vector<MapSlot>  g_mapSlots(kMapSize * kMapSize);
+        std::vector<uint32_t> g_mapZone(kMapSize * kMapSize, 0);
+        ZoneMap g_map;
+        int     g_mapCursor = 0;
+        bool    g_haveMap = false;
+        int     g_mapMap = -1;
+
+        int MapMod(int v) { const int m = v % kMapSize; return m < 0 ? m + kMapSize : m; }
+
+        void UpdateZoneMap(const world::Snapshot& snap)
+        {
+            if (snap.mapId != g_mapMap)
+            {
+                for (MapSlot& m : g_mapSlots) m = MapSlot{};
+                std::fill(g_mapZone.begin(), g_mapZone.end(), 0u);
+                g_mapMap = snap.mapId;
+                g_haveMap = false;
+            }
+            const int pi = static_cast<int>(std::floor(snap.playerPos[0] / kChunk)) - kMapSize / 2;
+            const int pj = static_cast<int>(std::floor(snap.playerPos[1] / kChunk)) - kMapSize / 2;
+            if (!g_haveMap || std::abs(pi - g_map.firstI) >= kMapRecentre || std::abs(pj - g_map.firstJ) >= kMapRecentre)
+            {
+                g_map.firstI = pi; g_map.firstJ = pj;
+                g_haveMap = true;
+            }
+            g_map.size = kMapSize; g_map.cellSize = kChunk; g_map.zone = g_mapZone.data();
+
+            // A slice per frame: chunks whose slot holds another world chunk or isn't known yet.
+            for (int n = 0; n < kMapPerFrame; ++n)
+            {
+                const int k = g_mapCursor;
+                g_mapCursor = (g_mapCursor + 1) % (kMapSize * kMapSize);
+                const int i = g_map.firstI + k % kMapSize, j = g_map.firstJ + k / kMapSize;
+                const int slot = MapMod(j) * kMapSize + MapMod(i);
+                MapSlot& m = g_mapSlots[slot];
+                if (m.i == i && m.j == j && g_mapZone[slot]) continue;
+                m.i = i; m.j = j;
+                uint32_t area = 0;
+                g_mapZone[slot] = terrain::ChunkAreaAt((i + 0.5f) * kChunk, (j + 0.5f) * kChunk, area) ? ZoneOf(area) : 0;
+            }
+            unsigned known = 0;
+            for (int b = 0; b < kMapSize; ++b)
+                for (int a = 0; a < kMapSize; ++a)
+                {
+                    const int i = g_map.firstI + a, j = g_map.firstJ + b;
+                    const int slot = MapMod(j) * kMapSize + MapMod(i);
+                    known += g_mapSlots[slot].i == i && g_mapSlots[slot].j == j && g_mapZone[slot] != 0;
+                }
+            g_map.known = known;
+        }
         uint32_t g_playerZone = 0;
         int      g_playerMap = -1;
         double   g_now = 0.0;
@@ -67,6 +127,7 @@ namespace wxl_livingazeroth::regional
     {
         g_now += dt;
         if (!snap.inWorld) return;
+        UpdateZoneMap(snap);
         g_playerMap = snap.mapId;
         // The client's area query on the player's location gives nothing while flying: then the
         // area of the terrain chunk below.
@@ -129,6 +190,7 @@ namespace wxl_livingazeroth::regional
     }
 
     const std::vector<Zone>& Zones() { return g_zones; }
+    const ZoneMap& Map() { return g_map; }
 
     const char* AreaName(uint32_t area)
     {
