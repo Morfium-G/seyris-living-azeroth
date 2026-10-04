@@ -129,7 +129,7 @@ should be a different material gets a TexturePath row; a zone that's different g
 | Stiffness | resistance to deformation: **0 = gives way completely .. 1 = rigid** (the same meaning as GroundEffectDoodadWind's Stiffness). For a cover: feet press away (1 − Stiffness) of its depth, so mud at 0.4 keeps a floor in every print |
 | Flags | reserved, 0 |
 | Absorbency | 0..1, how much outside moisture reaches it: **rain** on open ground and **water nearby**. Rock and ice ≈ 0.1 (rain runs off), sand and soil ≈ 0.9. Appended: older files without it still load |
-| Temperature | °C of the material itself; **−1000 = none** (signed). Used by liquid materials: ground near a liquid with a temperature is warmed (or cooled) toward it, by 5% of the difference at the edge, fading out by 12 yd and 4 yd above its surface. Appended |
+| Temperature | °C of the material itself; **−1000 = none** (signed). A heat source: **liquid materials** (magma) and **terrain materials** (e.g. a painted lava-stream texture, where it's painted at least 50%) warm (or cool) the ground toward it, by 5% of the difference at the source, fading out by 12 yd and 4 yd above it. Liquid and ground heat don't add up; the stronger one counts. Hot ground dries out by itself (heat drying). Appended |
 
 A float of **−1 takes the value from the Parent** (and so on up). Defaults where no material in the
 chain sets one: RestMoisture 0.3, Stiffness 0, Absorbency 0.5.

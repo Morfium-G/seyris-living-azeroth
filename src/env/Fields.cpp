@@ -38,6 +38,8 @@ namespace wxl_livingazeroth::fields
         // there the ground is warmed by this share of the difference (magma 1000 degC: ~+50 degC).
         constexpr float kHeatNear = 1.0f, kHeatFar = 12.0f, kHeatLow = 0.5f, kHeatHigh = 4.0f;
         constexpr float kHeatShare = 0.05f;
+        // Ground counts as a heat source where materials with a Temperature are painted at least this strongly.
+        constexpr float kHotGroundShare = 0.5f;
         // Built-in liquid values by category when no GroundMaterialSelector row names the liquid.
         constexpr float kMagmaTemperature = 1000.0f;
 
@@ -56,7 +58,9 @@ namespace wxl_livingazeroth::fields
             uint32_t nearLiquid = 0;  // the nearest liquid (from the shore pass) and its values
             float    nearMoisture = 0.0f, nearTemp = 0.0f, heat = 0.0f;
             bool     nearHot = false;
-            float    temperature = 0.0f; // the ground's, last step (air + heat from a hot liquid)
+            float    temperature = 0.0f; // the ground's, last step (air + heat from a hot liquid or hot ground)
+            float    hotShare = 0.0f, hotTemp = 0.0f; // painted strength of materials with a Temperature, and theirs
+            float    groundHeat = 0.0f, groundHeatTemp = 0.0f, groundHeatDist = -1.0f; // the nearest hot ground's reach here
             float    open = 1.0f;
             float    shore = 0.0f, waterDist = -1.0f, aboveWater = 0.0f;
             float    value = 0.3f;    // current moisture
@@ -100,13 +104,13 @@ namespace wxl_livingazeroth::fields
 
         // The ground's materials at a point, weighted by painted strength (layers without a material
         // count with the defaults).
-        void MaterialAt(float x, float y, float& rest, float& absorbency, uint32_t& area)
+        void MaterialAt(float x, float y, float& rest, float& absorbency, uint32_t& area, float& hotShare, float& hotTemp)
         {
             terrain::LayerWeights lw;
             const materials::Values defaults;
-            rest = defaults.restMoisture; absorbency = defaults.absorbency; area = 0;
+            rest = defaults.restMoisture; absorbency = defaults.absorbency; area = 0; hotShare = 0.0f; hotTemp = 0.0f;
             if (!terrain::LayerWeightsAt(x, y, lw) || lw.layers <= 0) return;
-            float r = 0.0f, a = 0.0f, w = 0.0f;
+            float r = 0.0f, a = 0.0f, w = 0.0f, hot = 0.0f, hotSum = 0.0f;
             for (int l = 0; l < lw.layers; ++l)
             {
                 const float wk = lw.weight[l];
@@ -114,9 +118,11 @@ namespace wxl_livingazeroth::fields
                 const terrain::Surface& sf = lw.surface[l];
                 const materials::Values v = materials::Get(materials::Select(sf.area, g_map, sf.texture, sf.groundEffect, sf.terrainType));
                 r += wk * v.restMoisture; a += wk * v.absorbency; w += wk;
+                if (v.hasTemperature) { hot += wk; hotSum += wk * v.temperature; }
                 area = sf.area;
             }
-            if (w > 0.0f) { rest = r / w; absorbency = a / w; }
+            if (w > 0.0f) { rest = r / w; absorbency = a / w; hotShare = Clamp01(hot / w); }
+            if (hot > 0.0f) hotTemp = hotSum / hot;
         }
 
         bool FillCell(Cell& c, int i, int j)
@@ -127,7 +133,7 @@ namespace wxl_livingazeroth::fields
             float z;
             if (!terrain::HeightAt(x, y, z)) return false; // not loaded (or a hole): asked again later
             c.z = z;
-            MaterialAt(x, y, c.rest, c.absorbency, c.area);
+            MaterialAt(x, y, c.rest, c.absorbency, c.area, c.hotShare, c.hotTemp);
             float waterZ;
             uint32_t liquid = 0;
             if (terrain::LiquidAt(x, y, waterZ, liquid) && waterZ > z)
@@ -203,7 +209,45 @@ namespace wxl_livingazeroth::fields
                     c.nearTemp = w ? w->liquidTemp : 0.0f;
                     c.heat = c.nearHot ? (c.submerged ? 1.0f : Smooth(kHeatNear, kHeatFar, c.waterDist) * Smooth(kHeatLow, kHeatHigh, c.aboveWater)) : 0.0f;
                 }
+            // The same pass for hot ground: painted materials with a Temperature (lava streams, ...)
+            // heat the ground around them like hot liquids do.
+            unsigned hot = 0;
+            for (int b = 0; b < kSize; ++b)
+                for (int a = 0; a < kSize; ++a)
+                {
+                    const Cell* c = Live(a, b);
+                    const bool h = c && !c->submerged && c->hotShare >= kHotGroundShare;
+                    dist[at(a, b)] = h ? 0.0f : kInf;
+                    src[at(a, b)] = h ? at(a, b) : -1;
+                    hot += h;
+                }
+            auto relaxHot = [&](int a, int b, int na, int nb, float step)
+            {
+                if (na < 0 || nb < 0 || na >= kSize || nb >= kSize) return;
+                const float d = dist[at(na, nb)] + step;
+                if (d < dist[at(a, b)]) { dist[at(a, b)] = d; src[at(a, b)] = src[at(na, nb)]; }
+            };
+            for (int b = 0; b < kSize; ++b)
+                for (int a = 0; a < kSize; ++a)
+                { relaxHot(a, b, a - 1, b, 1.0f); relaxHot(a, b, a, b - 1, 1.0f); relaxHot(a, b, a - 1, b - 1, kDiag); relaxHot(a, b, a + 1, b - 1, kDiag); }
+            for (int b = kSize - 1; b >= 0; --b)
+                for (int a = kSize - 1; a >= 0; --a)
+                { relaxHot(a, b, a + 1, b, 1.0f); relaxHot(a, b, a, b + 1, 1.0f); relaxHot(a, b, a + 1, b + 1, kDiag); relaxHot(a, b, a - 1, b + 1, kDiag); }
+            for (int b = 0; b < kSize; ++b)
+                for (int a = 0; a < kSize; ++a)
+                {
+                    Cell* live = Live(a, b);
+                    if (!live) continue;
+                    Cell& c = *live;
+                    const Cell* h = src[at(a, b)] >= 0 ? Live(src[at(a, b)] % kSize, src[at(a, b)] / kSize) : nullptr;
+                    if (!h || dist[at(a, b)] >= kInf) { c.groundHeat = 0.0f; c.groundHeatDist = -1.0f; continue; }
+                    c.groundHeatDist = dist[at(a, b)] * kCell;
+                    c.groundHeatTemp = h->hotTemp;
+                    c.groundHeat = dist[at(a, b)] == 0.0f ? c.hotShare
+                                 : Smooth(kHeatNear, kHeatFar, c.groundHeatDist) * Smooth(kHeatLow, kHeatHigh, c.z - h->z);
+                }
             g_stats.water = water;
+            g_stats.hotGround = hot;
             g_stats.transformMs = grassperf::Now() - t0;
         }
 
@@ -255,7 +299,10 @@ namespace wxl_livingazeroth::fields
                         lastArea = c.area;
                     }
                     // The ground's temperature: the air, warmed (or cooled) near a liquid with a temperature.
-                    c.temperature = temperature + (c.nearHot ? c.heat * kHeatShare * (c.nearTemp - temperature) : 0.0f);
+                    // Heat from a hot liquid or hot ground nearby: whichever moves it more (they don't add up).
+                    const float fromLiquid = c.nearHot ? c.heat * kHeatShare * (c.nearTemp - temperature) : 0.0f;
+                    const float fromGround = c.groundHeat > 0.0f ? c.groundHeat * kHeatShare * (c.groundHeatTemp - temperature) : 0.0f;
+                    c.temperature = temperature + (std::fabs(fromGround) > std::fabs(fromLiquid) ? fromGround : fromLiquid);
                     const float eq = Equilibrium(c, c.temperature, humidity);
                     if (!c.started)
                     {
@@ -340,6 +387,8 @@ namespace wxl_livingazeroth::fields
         d.liquidHot = c->submerged ? c->liquidHot : c->nearHot;
         d.liquidTemperature = c->submerged ? c->liquidTemp : c->nearTemp;
         d.heat = c->heat;
+        d.hotShare = c->hotShare; d.hotTemperature = c->hotTemp;
+        d.groundHeat = c->groundHeat; d.groundHeatTemperature = c->groundHeatTemp; d.groundHeatDistance = c->groundHeatDist;
         d.value = c->value;
         return d;
     }

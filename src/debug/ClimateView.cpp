@@ -86,10 +86,17 @@ namespace wxl_livingazeroth::debug
                     std::snprintf(line + len, sizeof(line) - len, "; liquid %.0f degC, heat reach %.2f", m.liquidTemperature, m.heat);
                 }
                 g_api->UiText(line);
+                if (m.hotShare > 0.0f)
+                    std::snprintf(line, sizeof(line), "  hot ground here: %.0f%% painted, %.0f degC", m.hotShare * 100.0f, m.hotTemperature);
+                else if (m.groundHeatDistance >= 0.0f)
+                    std::snprintf(line, sizeof(line), "  hot ground %.1f yd away (%.0f degC), heat reach %.2f", m.groundHeatDistance, m.groundHeatTemperature, m.groundHeat);
+                else
+                    std::snprintf(line, sizeof(line), "  no hot ground within the grid");
+                g_api->UiText(line);
             }
             const fields::Stats st = fields::GetStats();
-            std::snprintf(line, sizeof(line), "moisture grid: %u / %u cells sampled, %u under water; rain soak so far %.2f; fill %.2f ms, shore pass %.2f ms, step %.2f ms",
-                          st.filled, st.cells, st.water, st.rainSoak, st.fillMs, st.transformMs, st.tickMs);
+            std::snprintf(line, sizeof(line), "moisture grid: %u / %u cells sampled, %u under water, %u hot ground; rain soak so far %.2f; fill %.2f ms, shore pass %.2f ms, step %.2f ms",
+                          st.filled, st.cells, st.water, st.hotGround, st.rainSoak, st.fillMs, st.transformMs, st.tickMs);
             g_api->UiText(line);
 
             g_api->UiSeparator();

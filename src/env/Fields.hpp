@@ -2,7 +2,8 @@
 // world-fields.md, "Kind 2"). Consumers ask by name once (Find) and then sample by handle.
 //
 //  - "temperature" (degC): the place's climate (env/Climate), and on the grid warmed near hot
-//    liquids (magma); local sources (spells, campfires) come later.
+//    liquids (magma) and hot ground (painted materials with a Temperature, e.g. lava streams);
+//    local sources (spells, campfires) come later.
 //  - "moisture" (0 bone dry .. 1 soaked): the ground, on a 2 yd grid around the player. It rests at
 //    an equilibrium -- the material's RestMoisture, wetter near a wet liquid (Absorbency x how close
 //    and how low; magma doesn't wet), drier in hot dry air (and near magma, which heats it) -- and
@@ -43,6 +44,8 @@ namespace wxl_livingazeroth::fields
         bool  liquidHot = false;                  // it has a temperature of its own...
         float liquidTemperature = 0.0f;           // ...this one
         float heat = 0.0f;                        // 0..1 how much its heat reaches here
+        float hotShare = 0.0f, hotTemperature = 0.0f; // painted strength of hot materials here (lava textures), and their degC
+        float groundHeat = 0.0f, groundHeatTemperature = 0.0f, groundHeatDistance = -1.0f; // the nearest hot ground: reach, degC, yd
         float airTemperature = 0.0f;              // the place's climate
         float temperature = 0.0f, humidity = 0.0f; // the ground's (air + liquid heat), the air's humidity
         float equilibrium = 0.0f, value = 0.0f;
@@ -64,7 +67,7 @@ namespace wxl_livingazeroth::fields
     };
     const WetGrid& Wet();
 
-    struct Stats { unsigned filled = 0, cells = 0, water = 0; double fillMs = 0.0, transformMs = 0.0, tickMs = 0.0; float rainSoak = 0.0f; };
+    struct Stats { unsigned filled = 0, cells = 0, water = 0; double fillMs = 0.0, transformMs = 0.0, tickMs = 0.0; float rainSoak = 0.0f; unsigned hotGround = 0; };
     Stats GetStats();
 
     /// Once per frame, after world::Refresh(), climate::Update() and wind::Update().
