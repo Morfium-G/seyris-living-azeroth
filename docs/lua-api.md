@@ -14,7 +14,7 @@ nothing is known yet.
 | `LivingAzeroth_GetHumidity()` | the air's humidity, 0..1 (AreaClimate.cdbc) |
 | `LivingAzeroth_GetGroundMoisture()` | `moisture, rest`, 0..1: how wet the ground is now, and where it rests when nothing wets or dries it |
 | `LivingAzeroth_GetWeather()` | `"fine"`, `"rain"`, `"snow"` or `"sand"`, and the intensity 0..1 |
-| `LivingAzeroth_GetField(name)` | any world field by name (`"temperature"`, `"moisture"`, and every field added later), or `nil` |
+| `LivingAzeroth_GetField(name)` | any world field by name, or `nil`: `"temperature"` (°C, the ground's), `"moisture"` (0..1), `"snow"` (yd of snow lying there: fallen + what's left of painted snow; painted depth as on flat open ground), and every field added later |
 | `LivingAzeroth_GetFieldNames()` | the names of all world fields, as multiple returns |
 
 Example: `addons/LivingAzerothClimate` (temperature, humidity and weather under the minimap clock,

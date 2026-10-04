@@ -3,9 +3,12 @@
 #include "Climate.hpp"
 #include "Regional.hpp"
 #include "Shelter.hpp"
+#include "Snow.hpp"
 #include "TerrainHeight.hpp"
+#include "Wind.hpp"
 #include "../features/GrassPerf.hpp"
 #include "../features/GroundMaterialTable.hpp"
+#include "../features/SurfaceCoverTable.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -16,8 +19,15 @@ namespace wxl_livingazeroth::fields
 {
     namespace
     {
-        enum FieldId { kTemperature = 0, kMoisture = 1, kFieldCount };
-        constexpr const char* kNames[kFieldCount] = { "temperature", "moisture" };
+        enum FieldId { kTemperature = 0, kMoisture = 1, kSnow = 2, kFieldCount };
+        constexpr const char* kNames[kFieldCount] = { "temperature", "moisture", "snow" };
+
+        // Fallen snow eases toward its value (its zone's changes slowly anyway): quickly down (it melts
+        // on arrival on hot ground), a little slower up (a pit left by heat fills back in).
+        constexpr float kSnowDownSeconds = 2.0f, kSnowUpSeconds = 5.0f;
+        // Published to the cover when a spot's snow moved by this much (yd) since the last publish.
+        constexpr float kSnowPublishYards = 0.01f;
+        constexpr float kSnowEdgeFade = 32.0f; // yd inside the grid's edge where it fades into the zones' values
 
         // --- the moisture grid --------------------------------------------------------------------
         constexpr int   kSize = 128;          // cells per side
@@ -70,11 +80,39 @@ namespace wxl_livingazeroth::fields
             // Diagnostics (panel): the last step's inputs and change.
             float    lastShare = 0.0f, lastSoak = 0.0f, lastRain = 0.0f, lastChange = 0.0f, lastDt = 0.0f;
             bool     started = false; // value initialised (to its equilibrium)
+
+            // Snow (env/Snow.hpp). The ground's slope (unit normal x, y) for the sun; the painted snow
+            // cover here (yd, mixed by painted strength) and its rows' melt columns.
+            float    nx = 0.0f, ny = 0.0f;
+            float    snowPainted = 0.0f;
+            float    keptShare = snow::kDefaultKeptShare, goneTemp = snow::kDefaultGoneTemperature;
+            float    fallen = 0.0f;   // yd of fallen snow
+            float    keep = 1.0f;     // painted snow's share left
+            float    meltWet = 0.0f;  // soak from its own melt water (0..1)
+            bool     snowStarted = false;
+            float    lastSnowTarget = 0.0f, lastSnowMix = 0.0f, lastHold = 1.0f, lastTeff = 0.0f, lastSun = 0.0f,
+                     lastZoneT = 0.0f, lastCap = 1.0f, lastReach = 0.0f;
         };
         std::vector<Cell>    g_cells(kSize * kSize);
         std::vector<uint8_t> g_excess(kSize * kSize, 0);
         std::vector<uint8_t> g_farBytes;   // per chunk of the zone map
         std::vector<float>   g_farValues;
+
+        // Snow as last computed, and as last published to the cover (same toroidal layout as the
+        // grid; fallen < 0 = spot not known). Far: per chunk of the zone map.
+        struct SnowMap
+        {
+            std::vector<float> fallen = std::vector<float>(kSize * kSize, -1.0f), keep = std::vector<float>(kSize * kSize, 1.0f);
+            std::vector<float> farFallen, farKeep;
+            std::vector<uint8_t> farKnown;   // the chunk's zone is known (else it shows the player's zone)
+            int   firstI = 0, firstJ = 0, farFirstI = 0, farFirstJ = 0, farSize = 0;
+            float farCell = 0.0f;
+            float outsideFallen = 0.0f, outsideKeep = 1.0f; // beyond the zone map: the player's zone
+            bool  valid = false, active = false;
+        };
+        SnowMap  g_snowNow, g_snowPub;
+        uint32_t g_snowVersion = 1;
+        unsigned g_snowPublishes = 0;
 
         // The excess of typical ground (rest 0.3, absorbency 0.5, open sky) at a zone soak s, by the
         // same rule the near spots follow.
@@ -115,15 +153,18 @@ namespace wxl_livingazeroth::fields
             return c.filled && c.i == i && c.j == j ? &c : nullptr;
         }
 
-        // The ground's materials at a point, weighted by painted strength (layers without a material
-        // count with the defaults).
-        void MaterialAt(float x, float y, float& rest, float& absorbency, uint32_t& area, float& hotShare, float& hotTemp)
+        // The ground's materials at a cell's centre, weighted by painted strength (layers without a
+        // material count with the defaults), and the painted snow cover there: rows with Depth > 0
+        // whose CoverMaterial is snow, their depth mixed over every layer, their melt columns over the
+        // snowy ones.
+        void MaterialAt(float x, float y, Cell& c)
         {
             terrain::LayerWeights lw;
             const materials::Values defaults;
-            rest = defaults.restMoisture; absorbency = defaults.absorbency; area = 0; hotShare = 0.0f; hotTemp = 0.0f;
+            c.rest = defaults.restMoisture; c.absorbency = defaults.absorbency; c.area = 0; c.hotShare = 0.0f; c.hotTemp = 0.0f;
             if (!terrain::LayerWeightsAt(x, y, lw) || lw.layers <= 0) return;
             float r = 0.0f, a = 0.0f, w = 0.0f, hot = 0.0f, hotSum = 0.0f;
+            float snowW = 0.0f, snowDepth = 0.0f, kept = 0.0f, gone = 0.0f;
             for (int l = 0; l < lw.layers; ++l)
             {
                 const float wk = lw.weight[l];
@@ -132,10 +173,17 @@ namespace wxl_livingazeroth::fields
                 const materials::Values v = materials::Get(materials::Select(sf.area, g_map, sf.texture, sf.groundEffect, sf.terrainType));
                 r += wk * v.restMoisture; a += wk * v.absorbency; w += wk;
                 if (v.hasTemperature) { hot += wk; hotSum += wk * v.temperature; }
-                area = sf.area;
+                c.area = sf.area;
+                const covertable::Values cv = covertable::Resolve(sf.area, g_map, sf.texture, sf.groundEffect, sf.terrainType);
+                if (cv.depth > 0.0f && covertable::IsSnow(cv.coverMaterial, sf.area, g_map))
+                {
+                    snowW += wk; snowDepth += wk * cv.depth;
+                    kept += wk * cv.meltKeptShare; gone += wk * cv.meltGoneTemperature;
+                }
             }
-            if (w > 0.0f) { rest = r / w; absorbency = a / w; hotShare = Clamp01(hot / w); }
-            if (hot > 0.0f) hotTemp = hotSum / hot;
+            if (w > 0.0f) { c.rest = r / w; c.absorbency = a / w; c.hotShare = Clamp01(hot / w); c.snowPainted = snowDepth / w; }
+            if (hot > 0.0f) c.hotTemp = hotSum / hot;
+            if (snowW > 0.0f) { c.keptShare = kept / snowW; c.goneTemp = gone / snowW; }
         }
 
         bool FillCell(Cell& c, int i, int j)
@@ -146,8 +194,17 @@ namespace wxl_livingazeroth::fields
             float z;
             if (!terrain::HeightAt(x, y, z)) return false; // not loaded (or a hole): asked again later
             c.z = z;
-            MaterialAt(x, y, c.rest, c.absorbency, c.area, c.hotShare, c.hotTemp);
+            MaterialAt(x, y, c);
             c.zone = regional::ZoneOf(c.area);
+            // The slope over +-1 yd, for the sun (what faces it melts first).
+            float ex0, ex1, ey0, ey1;
+            if (terrain::HeightAt(x - 1.0f, y, ex0) && terrain::HeightAt(x + 1.0f, y, ex1) &&
+                terrain::HeightAt(x, y - 1.0f, ey0) && terrain::HeightAt(x, y + 1.0f, ey1))
+            {
+                const float gx = (ex1 - ex0) * 0.5f, gy = (ey1 - ey0) * 0.5f;
+                const float inv = 1.0f / std::sqrt(1.0f + gx * gx + gy * gy);
+                c.nx = -gx * inv; c.ny = -gy * inv;
+            }
             float waterZ;
             uint32_t liquid = 0;
             if (terrain::LiquidAt(x, y, waterZ, liquid) && waterZ > z)
@@ -273,6 +330,77 @@ namespace wxl_livingazeroth::fields
             return Clamp01(c.rest + wetter - heat);
         }
 
+        // The snow as computed this tick (near: filled in by Tick; beyond: per chunk of the zone map,
+        // its zone's record) is handed to the cover as a new version when a spot or chunk known both
+        // times, at the same place, moved by about a centimetre, or "anything at all" became true or
+        // false. Spots and chunks coming in and the grids moving wait for the next such change (at
+        // most 10 s): the grid fades into the zones' values toward its edge anyway, so they barely
+        // differ, and every publish makes the cover re-fold its depth (several ms per level).
+        double g_lastSnowPublish = 0.0;
+        void PublishSnow()
+        {
+            SnowMap& now = g_snowNow;
+            now.firstI = g_firstI; now.firstJ = g_firstJ;
+            const uint32_t playerZone = regional::PlayerZone();
+            now.outsideFallen = regional::SnowDepth(g_map, playerZone);
+            now.outsideKeep = regional::PaintedKeep(g_map, playerZone);
+            const regional::ZoneMap& zm = regional::Map();
+            if (zm.zone && zm.size > 0)
+            {
+                const size_t n = static_cast<size_t>(zm.size) * zm.size;
+                now.farFallen.resize(n); now.farKeep.resize(n); now.farKnown.resize(n);
+                uint32_t lastZone = 0xFFFFFFFFu;
+                float f = now.outsideFallen, k = now.outsideKeep;
+                for (size_t q = 0; q < n; ++q)
+                {
+                    const uint32_t z = zm.zone[q];
+                    now.farKnown[q] = z != 0;
+                    if (z != lastZone)
+                    {
+                        f = z ? regional::SnowDepth(g_map, z) : now.outsideFallen;
+                        k = z ? regional::PaintedKeep(g_map, z) : now.outsideKeep;
+                        lastZone = z;
+                    }
+                    now.farFallen[q] = f; now.farKeep[q] = k;
+                }
+                now.farSize = zm.size; now.farCell = zm.cellSize; now.farFirstI = zm.firstI; now.farFirstJ = zm.firstJ;
+            }
+            else now.farSize = 0;
+            now.valid = true;
+
+            auto some = [](float f, float k) { return f > 0.001f || k < 0.999f; };
+            bool active = some(now.outsideFallen, now.outsideKeep);
+            for (size_t q = 0; q < now.fallen.size() && !active; ++q) active = some(now.fallen[q], now.keep[q]);
+            for (size_t q = 0; q < now.farFallen.size() && now.farSize > 0 && !active; ++q) active = some(now.farFallen[q], now.farKeep[q]);
+            now.active = active;
+
+            // Only values that changed at the same place count: a slot compared across a moved grid,
+            // or a chunk whose zone only just became known, holds another place (flying, every tick).
+            const SnowMap& pub = g_snowPub;
+            auto moved = [](float f0, float k0, float f1, float k1)
+            {
+                return std::fabs(f0 - f1) > kSnowPublishYards || std::fabs(k0 - k1) * snow::kTypicalPaintedDepth > kSnowPublishYards;
+            };
+            bool publish = !pub.valid || pub.active != now.active || moved(now.outsideFallen, now.outsideKeep, pub.outsideFallen, pub.outsideKeep);
+            const bool sameNear = pub.firstI == now.firstI && pub.firstJ == now.firstJ;
+            for (size_t q = 0; sameNear && q < now.fallen.size() && !publish; ++q)
+                if (now.fallen[q] >= 0.0f && pub.fallen[q] >= 0.0f) publish = moved(now.fallen[q], now.keep[q], pub.fallen[q], pub.keep[q]);
+            const bool sameFar = pub.farSize == now.farSize && pub.farFirstI == now.farFirstI && pub.farFirstJ == now.farFirstJ;
+            for (size_t q = 0; sameFar && q < now.farFallen.size() && now.farSize > 0 && !publish; ++q)
+                if (now.farKnown[q] && pub.farKnown[q]) publish = moved(now.farFallen[q], now.farKeep[q], pub.farFallen[q], pub.farKeep[q]);
+            // Spots and chunks that came in, a moved grid: at the latest after 10 s (only where there's snow).
+            if (!publish && now.active && regional::Now() - g_lastSnowPublish > 10.0)
+            {
+                publish = !sameNear || !sameFar || pub.farKnown != now.farKnown;
+                for (size_t q = 0; q < now.fallen.size() && !publish; ++q) publish = (now.fallen[q] >= 0.0f) != (pub.fallen[q] >= 0.0f);
+            }
+            if (!publish) return;
+            g_snowPub = now;
+            ++g_snowVersion;
+            ++g_snowPublishes;
+            g_lastSnowPublish = regional::Now();
+        }
+
         // One moisture step for every cell.
         void Tick(float dt)
         {
@@ -283,19 +411,27 @@ namespace wxl_livingazeroth::fields
             const uint32_t playerZone = regional::PlayerZone();
             // Zone borders as gradients: per cell, the share of the player's zone around it (rain falls
             // by it) and the mix of the zones' rain soak around it (new ground starts from it).
-            static std::vector<float> share(kSize * kSize), soak(kSize * kSize), weight(kSize * kSize), tmpA(kSize * kSize), tmpB(kSize * kSize), tmpW(kSize * kSize);
+            // The zones' fallen snow blends across borders the same way.
+            static std::vector<float> share(kSize * kSize), soak(kSize * kSize), snowMix(kSize * kSize), weight(kSize * kSize),
+                                      tmpA(kSize * kSize), tmpB(kSize * kSize), tmpC(kSize * kSize), tmpW(kSize * kSize);
             {
                 uint32_t lastZone = 0xFFFFFFFFu;
-                float zoneSoak = 0.0f;
+                float zoneSoak = 0.0f, zoneSnow = 0.0f;
                 for (int b = 0; b < kSize; ++b)
                     for (int a = 0; a < kSize; ++a)
                     {
                         const int k = b * kSize + a;
                         const Cell* c = Live(a, b);
-                        if (!c) { share[k] = soak[k] = weight[k] = 0.0f; continue; }
-                        if (c->zone != lastZone) { zoneSoak = regional::RainSoak(g_map, c->zone); lastZone = c->zone; }
+                        if (!c) { share[k] = soak[k] = snowMix[k] = weight[k] = 0.0f; continue; }
+                        if (c->zone != lastZone)
+                        {
+                            zoneSoak = regional::RainSoak(g_map, c->zone);
+                            zoneSnow = regional::SnowDepth(g_map, c->zone);
+                            lastZone = c->zone;
+                        }
                         share[k] = (c->zone == playerZone || !c->zone) ? 1.0f : 0.0f;
                         soak[k] = zoneSoak;
+                        snowMix[k] = zoneSnow;
                         weight[k] = 1.0f;
                     }
                 // Separable box blur (running sums), weighted by which cells are known.
@@ -303,39 +439,42 @@ namespace wxl_livingazeroth::fields
                 {
                     for (int line = 0; line < kSize; ++line)
                     {
-                        float sa = 0.0f, sb = 0.0f, sw = 0.0f;
+                        float sa = 0.0f, sb = 0.0f, sc = 0.0f, sw = 0.0f;
                         auto idx = [&](int n) { return rows ? line * kSize + n : n * kSize + line; };
                         for (int n = -kZoneBlend; n < kSize + kZoneBlend; ++n)
                         {
                             const int in = n + kZoneBlend, out = n - kZoneBlend;
-                            if (in >= 0 && in < kSize) { const int k = idx(in); sa += share[k] * weight[k]; sb += soak[k] * weight[k]; sw += weight[k]; }
-                            if (out >= 0 && out < kSize) { const int k = idx(out); sa -= share[k] * weight[k]; sb -= soak[k] * weight[k]; sw -= weight[k]; }
+                            if (in >= 0 && in < kSize) { const int k = idx(in); sa += share[k] * weight[k]; sb += soak[k] * weight[k]; sc += snowMix[k] * weight[k]; sw += weight[k]; }
+                            if (out >= 0 && out < kSize) { const int k = idx(out); sa -= share[k] * weight[k]; sb -= soak[k] * weight[k]; sc -= snowMix[k] * weight[k]; sw -= weight[k]; }
                             if (n >= 0 && n < kSize)
                             {
                                 const int k = idx(n);
                                 tmpA[k] = sw > 0.0f ? sa / sw : 0.0f;
                                 tmpB[k] = sw > 0.0f ? sb / sw : 0.0f;
+                                tmpC[k] = sw > 0.0f ? sc / sw : 0.0f;
                                 tmpW[k] = sw > 0.0f ? 1.0f : 0.0f;
                             }
                         }
                     }
-                    share.swap(tmpA); soak.swap(tmpB); weight.swap(tmpW);
+                    share.swap(tmpA); soak.swap(tmpB); snowMix.swap(tmpC); weight.swap(tmpW);
                 };
                 blur(true);
                 blur(false);
             }
+            const float snowing = weather.type == 2 ? weather.intensity : 0.0f;
+            const float wind = wind::SteadyGround();
 
             // Temperature and humidity per area, once per tick.
             double ringSum = 0.0, ringTypical = 0.0;
             unsigned ringCount = 0;
-            uint32_t lastArea = 0xFFFFFFFFu;
-            float temperature = 0.0f, humidity = 0.5f;
+            uint32_t lastArea = 0xFFFFFFFFu, lastZone = 0xFFFFFFFFu;
+            float temperature = 0.0f, humidity = 0.5f, zoneT = 0.0f, zoneKeep = 1.0f;
             for (int b = 0; b < kSize; ++b)
                 for (int a = 0; a < kSize; ++a)
                 {
                     const int s = SlotOf(g_firstI + a, g_firstJ + b);
                     Cell* live = Live(a, b);
-                    if (!live) { g_excess[s] = 0; continue; }
+                    if (!live) { g_excess[s] = 0; g_snowNow.fallen[s] = -1.0f; g_snowNow.keep[s] = 1.0f; continue; }
                     Cell& c = *live;
                     if (c.area != lastArea)
                     {
@@ -344,11 +483,65 @@ namespace wxl_livingazeroth::fields
                         humidity = row.humidity;
                         lastArea = c.area;
                     }
+                    if (c.zone != lastZone)
+                    {
+                        zoneT = regional::ZoneTemperature(g_map, c.zone);
+                        zoneKeep = regional::PaintedKeep(g_map, c.zone);
+                        lastZone = c.zone;
+                    }
                     // The ground's temperature: the air, warmed (or cooled) near a liquid with a temperature.
                     // Heat from a hot liquid or hot ground nearby: whichever moves it more (they don't add up).
                     const float fromLiquid = c.nearHot ? c.heat * kHeatShare * (c.nearTemp - temperature) : 0.0f;
                     const float fromGround = c.groundHeat > 0.0f ? c.groundHeat * kHeatShare * (c.groundHeatTemp - temperature) : 0.0f;
                     c.temperature = temperature + (std::fabs(fromGround) > std::fabs(fromLiquid) ? fromGround : fromLiquid);
+
+                    // --- snow (env/Snow.hpp) ---
+                    // Effective temperature: the surface (the ground's, toward a hot material's own by
+                    // its painted share) plus the sun on this slope.
+                    const float surface = c.hotShare > 0.0f ? c.temperature + (c.hotTemp - c.temperature) * c.hotShare : c.temperature;
+                    const float normal[3] = { c.nx, c.ny, std::sqrt(std::fmax(0.0f, 1.0f - c.nx * c.nx - c.ny * c.ny)) };
+                    const float sun = climate::SunWarming(normal, c.open);
+                    const float teff = surface + sun;
+                    // Local heat's reach (0..1): on a hot source itself everything melts.
+                    float reach = c.nearHot && c.nearTemp >= snow::kHotSource ? c.heat : 0.0f;
+                    if (c.groundHeatTemp >= snow::kHotSource && c.groundHeat > reach) reach = c.groundHeat;
+                    if (c.hotShare >= kHotGroundShare && c.hotTemp >= snow::kHotSource) reach = 1.0f;
+                    // Fallen snow follows its zones' (blended), less where this spot is warmer than they are.
+                    const float warmer = std::fmax(0.0f, teff) - std::fmax(0.0f, zoneT);
+                    const float hold = warmer <= 0.0f ? 1.0f : Smooth(0.0f, snow::kLocalMeltRange, warmer);
+                    const float mixSnow = snowMix[b * kSize + a];
+                    const float snowTarget = c.submerged ? 0.0f : mixSnow * c.open * hold * (1.0f - reach);
+                    if (!c.snowStarted) c.fallen = snowTarget;
+                    else
+                    {
+                        const float ease = dt / (snowTarget < c.fallen ? kSnowDownSeconds : kSnowUpSeconds);
+                        c.fallen += (snowTarget - c.fallen) * (ease >= 1.0f ? 1.0f : ease);
+                    }
+                    // Painted snow: its kept share toward the cap, melt water into the ground.
+                    float cap = 1.0f;
+                    if (c.snowPainted > 0.0f)
+                    {
+                        cap = snow::MeltCap(teff, c.keptShare, c.goneTemp) * (1.0f - reach);
+                        if (!c.snowStarted) c.keep = zoneKeep * (1.0f - reach); // pits by heat sources are already there
+                        else
+                        {
+                            const float melted = snow::StepKeep(c.keep, cap, teff, reach, snowing * share[b * kSize + a] * c.open, c.snowPainted, dt);
+                            if (melted > 0.0f && teff < snow::kEvaporateTemperature)
+                                c.meltWet = 1.0f - (1.0f - c.meltWet) * std::exp(-melted * snow::kMeltToSoak);
+                        }
+                    }
+                    else c.keep = 1.0f;
+                    if (c.meltWet > 0.0f)
+                    {
+                        const float dry = regional::DryingRate(c.temperature, humidity, wind) * dt;
+                        c.meltWet -= c.meltWet * (dry > 1.0f ? 1.0f : dry);
+                    }
+                    c.snowStarted = true;
+                    c.lastSnowTarget = snowTarget; c.lastSnowMix = mixSnow; c.lastHold = hold; c.lastTeff = teff; c.lastSun = sun;
+                    c.lastZoneT = zoneT; c.lastCap = cap; c.lastReach = reach;
+                    g_snowNow.fallen[s] = c.fallen;
+                    g_snowNow.keep[s] = c.keep;
+
                     const float eq = Equilibrium(c, c.temperature, humidity);
                     // The rain lives in the zone records (env/Regional: rain only in the player's zone,
                     // catch-up, drying by each zone's climate); a spot follows the zones around it.
@@ -359,8 +552,11 @@ namespace wxl_livingazeroth::fields
                     // the soak mix blends across zone borders.
                     const float mix = soak[b * kSize + a];
                     const float rainShare = raining && c.open > 0.0f ? share[b * kSize + a] * c.open : 0.0f;
+                    // The spot's own melt water (painted snow melting here) soaks it from below like
+                    // water nearby: at its absorbency, roof or not.
                     const float target = c.submerged ? c.liquidMoisture
-                                       : 1.0f - (1.0f - eq) * std::pow(1.0f - (mix < 0.999f ? mix : 0.999f), c.absorbency * c.open);
+                                       : 1.0f - (1.0f - eq) * std::pow(1.0f - (mix < 0.999f ? mix : 0.999f), c.absorbency * c.open)
+                                                            * std::pow(1.0f - (c.meltWet < 0.999f ? c.meltWet : 0.999f), c.absorbency);
                     const float before = c.value;
                     if (!c.started) { c.value = target; c.started = true; }
                     else c.value += (target - c.value) * (dt >= kFollowSeconds ? 1.0f : dt / kFollowSeconds); // eased, so nothing pops
@@ -402,6 +598,7 @@ namespace wxl_livingazeroth::fields
                 g_wet.farBytes = g_farBytes.data(); g_wet.farValues = g_farValues.data();
             }
             ++g_wet.version;
+            PublishSnow();
             g_stats.tickMs = grassperf::Now() - t0;
         }
 
@@ -441,8 +638,83 @@ namespace wxl_livingazeroth::fields
             out = c->value;
             return true;
         }
+        if (field == kSnow)
+        {
+            const Cell* c = CellAt(pos);
+            if (!c || !c->snowStarted) return false;
+            out = c->fallen + c->snowPainted * c->keep;
+            return true;
+        }
         return false;
     }
+
+    SnowDetail Snow(const float pos[3])
+    {
+        SnowDetail d;
+        const Cell* c = CellAt(pos);
+        if (!c || !c->snowStarted) return d;
+        d.known = true;
+        d.fallen = c->fallen; d.target = c->lastSnowTarget; d.zoneSnow = c->lastSnowMix; d.hold = c->lastHold;
+        d.painted = c->snowPainted; d.keep = c->keep; d.cap = c->lastCap;
+        d.keptShare = c->keptShare; d.goneTemperature = c->goneTemp;
+        d.temperature = c->lastTeff; d.sun = c->lastSun; d.zoneTemperature = c->lastZoneT;
+        d.heatReach = c->lastReach; d.meltWet = c->meltWet;
+        return d;
+    }
+
+    void SnowAt(float x, float y, float& fallen, float& keep)
+    {
+        const SnowMap& p = g_snowPub;
+        fallen = 0.0f; keep = 1.0f;
+        if (!p.valid) return;
+
+        // The zones' values (per terrain chunk, bilinear between chunk centres).
+        float farF = p.outsideFallen, farK = p.outsideKeep;
+        if (p.farSize > 0)
+        {
+            const float u = x / p.farCell - 0.5f, v = y / p.farCell - 0.5f;
+            const int i0 = static_cast<int>(std::floor(u)), j0 = static_cast<int>(std::floor(v));
+            const float fx = u - i0, fy = v - j0;
+            float sf = 0.0f, sk = 0.0f, sw = 0.0f;
+            for (int q = 0; q < 4; ++q)
+            {
+                const int i = i0 + (q & 1), j = j0 + (q >> 1);
+                if (i < p.farFirstI || i >= p.farFirstI + p.farSize || j < p.farFirstJ || j >= p.farFirstJ + p.farSize) continue;
+                const float w = ((q & 1) ? fx : 1.0f - fx) * ((q >> 1) ? fy : 1.0f - fy);
+                const int mi = i % p.farSize, mj = j % p.farSize;
+                const size_t k = static_cast<size_t>((mj < 0 ? mj + p.farSize : mj) * p.farSize + (mi < 0 ? mi + p.farSize : mi));
+                sf += w * p.farFallen[k]; sk += w * p.farKeep[k]; sw += w;
+            }
+            if (sw > 0.0f) { farF = (sf + (1.0f - sw) * farF); farK = (sk + (1.0f - sw) * farK); }
+        }
+        fallen = farF; keep = farK;
+
+        // The near grid (bilinear between cell centres, over the spots known), fading into the zones'
+        // values within its last yards.
+        const float u = x / kCell - 0.5f, v = y / kCell - 0.5f;
+        const int i0 = static_cast<int>(std::floor(u)), j0 = static_cast<int>(std::floor(v));
+        if (i0 + 1 < p.firstI || i0 >= p.firstI + kSize || j0 + 1 < p.firstJ || j0 >= p.firstJ + kSize) return;
+        const float fx = u - i0, fy = v - j0;
+        float sf = 0.0f, sk = 0.0f, sw = 0.0f;
+        for (int q = 0; q < 4; ++q)
+        {
+            const int i = i0 + (q & 1), j = j0 + (q >> 1);
+            if (i < p.firstI || i >= p.firstI + kSize || j < p.firstJ || j >= p.firstJ + kSize) continue;
+            const int s = SlotOf(i, j);
+            if (p.fallen[s] < 0.0f) continue;
+            const float w = ((q & 1) ? fx : 1.0f - fx) * ((q >> 1) ? fy : 1.0f - fy);
+            sf += w * p.fallen[s]; sk += w * p.keep[s]; sw += w;
+        }
+        if (sw <= 0.0f) return;
+        const float edge = std::fmin(std::fmin(x - p.firstI * kCell, (p.firstI + kSize) * kCell - x),
+                                     std::fmin(y - p.firstJ * kCell, (p.firstJ + kSize) * kCell - y));
+        const float inner = Clamp01(edge / kSnowEdgeFade) * sw;
+        fallen = farF + (sf / sw - farF) * inner;
+        keep = farK + (sk / sw - farK) * inner;
+    }
+
+    uint32_t SnowVersion() { return g_snowVersion; }
+    bool     SnowActive()  { return g_snowPub.valid && g_snowPub.active; }
 
     MoistureDetail Moisture(const float pos[3])
     {
@@ -470,7 +742,13 @@ namespace wxl_livingazeroth::fields
     }
 
     const WetGrid& Wet() { return g_wet; }
-    Stats GetStats() { Stats s = g_stats; s.rainSoak = regional::RainSoak(g_map, regional::PlayerZone()); return s; }
+    Stats GetStats()
+    {
+        Stats s = g_stats;
+        s.rainSoak = regional::RainSoak(g_map, regional::PlayerZone());
+        s.snowPublished = g_snowPublishes;
+        return s;
+    }
 
     void Refill()
     {
@@ -485,6 +763,9 @@ namespace wxl_livingazeroth::fields
         g_haveGrid = false;
         g_fillCursor = 0;
         ++g_wet.version;
+        std::fill(g_snowNow.fallen.begin(), g_snowNow.fallen.end(), -1.0f);
+        g_snowPub = SnowMap{};
+        ++g_snowVersion;
     }
 
     void Update(float dt, const world::Snapshot& snap)

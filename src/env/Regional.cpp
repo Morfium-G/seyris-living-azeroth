@@ -1,6 +1,7 @@
 #include "Regional.hpp"
 
 #include "Climate.hpp"
+#include "Snow.hpp"
 #include "TerrainHeight.hpp"
 #include "Wind.hpp"
 
@@ -100,18 +101,74 @@ namespace wxl_livingazeroth::regional
             return g_zones.back();
         }
 
-        // One zone's rain soak over dt: wetting while it rains, else drying by its own climate.
-        void Step(Zone& z, float dt, bool raining, float intensity, float wind)
+        // Entering a new or stale zone fast-forwards its snow much further than its rain: half an
+        // hour of snowfall (or melting) in the same 30 seconds.
+        constexpr float kSnowCatchUpSpeed = 60.0f;
+
+        // The air a zone's ground sees: its climate, with the weather only where it's known (the
+        // player's zone).
+        float AirTemperature(int map, uint32_t zone, bool playerZone)
         {
-            if (raining) { z.rainSoak += dt / kRainSeconds * intensity * (1.0f - z.rainSoak); }
-            else
+            const climate::Breakdown b = climate::Temperature(climate::For(zone, map));
+            return playerZone ? b.total : b.total - b.weather;
+        }
+
+        float FlatSun()
+        {
+            static const float kUp[3] = { 0.0f, 0.0f, 1.0f };
+            return climate::SunWarming(kUp, 1.0f);
+        }
+
+        // Painted snow in a zone first seen: as if the season had been running for days -- the cap at
+        // its mean temperature (between night and day, with the season), not this hour's. Melting is
+        // slow, so the hour's cap is rarely reached.
+        float StartKeep(int map, uint32_t zone)
+        {
+            const climate::Row& row = climate::For(zone, map);
+            const float mean = 0.5f * (row.dayTemp + row.nightTemp) + climate::Temperature(row).season;
+            return snow::MeltCap(mean, snow::kDefaultKeptShare, snow::kDefaultGoneTemperature);
+        }
+
+        // One zone over dt (snowDt: the snow's, faster while catching up): rain soak wetting while it
+        // rains, else drying by its own climate; fallen snow building up while it snows below 0 degC
+        // and melting into the soak above it; painted snow's kept share following its melt cap.
+        void Step(Zone& z, float dt, float snowDt, bool playerZone, const climate::Weather& w, float wind)
+        {
+            const climate::Row& row = climate::For(z.id, z.map);
+            const float air = AirTemperature(z.map, z.id, playerZone);
+            const float t = air + FlatSun();
+            z.temperature = t;
+            const bool raining = playerZone && w.type == 1 && w.intensity > 0.0f;
+            const float snowing = playerZone && w.type == 2 ? w.intensity : 0.0f;
+
+            if (raining) { z.rainSoak += dt / kRainSeconds * w.intensity * (1.0f - z.rainSoak); }
+            else if (!(snowing > 0.0f && t > 0.0f)) // wet snowfall keeps it wet (below)
             {
-                const climate::Row& row = climate::For(z.id, z.map);
-                const float t = climate::Temperature(row).total;
-                const float warmth = t <= 0.0f ? 0.2f : 1.0f + t / 15.0f;
-                const float rate = (1.0f + 2.0f * wind) * warmth * (1.0f - 0.7f * row.humidity) / kDrySeconds;
+                const float rate = DryingRate(air, row.humidity, wind);
                 z.rainSoak -= z.rainSoak * (rate * dt > 1.0f ? 1.0f : rate * dt);
             }
+
+            if (snowing > 0.0f && t <= 0.0f)
+                z.snowDepth = std::min(snow::kMaxFallen, z.snowDepth + snow::kSnowfallPerSecond * snowing * snowDt);
+            else if (snowing > 0.0f && t < snow::kEvaporateTemperature)
+            {
+                // Above 0 degC it melts on arrival: its water soaks the ground (slower than rain).
+                const float melt = snow::kSnowfallPerSecond * snowing * snowDt;
+                z.rainSoak = 1.0f - (1.0f - z.rainSoak) * std::exp(-melt * snow::kMeltToSoak);
+            }
+            if (snowing <= 0.0f && z.snowDepth > 0.0f)
+                z.snowDepth *= std::exp(-snow::SublimationRate(wind, row.humidity, climate::SunNow().daylight) * snowDt);
+            if (t > 0.0f && z.snowDepth > 0.0f)
+            {
+                const float melt = std::min(z.snowDepth, snow::kMeltPerDegreeSecond * t * snowDt);
+                z.snowDepth -= melt;
+                if (t < snow::kEvaporateTemperature) z.rainSoak = 1.0f - (1.0f - z.rainSoak) * std::exp(-melt * snow::kMeltToSoak);
+            }
+
+            const float cap = snow::MeltCap(t, snow::kDefaultKeptShare, snow::kDefaultGoneTemperature);
+            if (!z.keepStarted) { z.paintedKeep = StartKeep(z.map, z.id); z.keepStarted = true; }
+            else snow::StepKeep(z.paintedKeep, cap, t, 0.0f, snowing, snow::kTypicalPaintedDepth, snowDt);
+
             z.rainSoak = z.rainSoak < 0.0f ? 0.0f : (z.rainSoak > 1.0f ? 1.0f : z.rainSoak);
         }
     }
@@ -153,20 +210,62 @@ namespace wxl_livingazeroth::regional
         g_tickTime = 0.0f;
 
         const climate::Weather& w = climate::CurrentWeather();
-        const bool raining = w.type == 1 && w.intensity > 0.0f;
         const float wind = wind::SteadyGround();
         for (Zone& z : g_zones)
         {
             if (z.map == snap.mapId && z.id == g_playerZone)
             {
-                const float speed = z.catchUp > 0.0f ? kCatchUpSpeed : 1.0f;
-                Step(z, step * speed, raining, w.intensity, wind);
+                const bool catching = z.catchUp > 0.0f;
+                Step(z, step * (catching ? kCatchUpSpeed : 1.0f), step * (catching ? kSnowCatchUpSpeed : 1.0f), true, w, wind);
                 z.catchUp = z.catchUp > step ? z.catchUp - step : 0.0f;
                 z.lastSeen = g_now;
                 z.source = Source::Observed;
             }
-            else Step(z, step, false, 0.0f, wind); // no rain assumed where we can't see the weather
+            else Step(z, step, step, false, w, wind); // no rain or snow assumed where we can't see the weather
         }
+    }
+
+    float DryingRate(float temperature, float humidity, float wind)
+    {
+        const float warmth = temperature <= 0.0f ? 0.2f : 1.0f + temperature / 15.0f;
+        return (1.0f + 2.0f * wind) * warmth * (1.0f - 0.7f * humidity) / kDrySeconds;
+    }
+
+    float SnowDepth(int map, uint32_t zone)
+    {
+        const Zone* z = Find(map, zone);
+        return z ? z->snowDepth : 0.0f;
+    }
+
+    float ZoneTemperature(int map, uint32_t zone)
+    {
+        if (const Zone* z = Find(map, zone); z && z->keepStarted) return z->temperature;
+        return AirTemperature(map, zone, map == g_playerMap && zone == g_playerZone) + FlatSun();
+    }
+
+    float PaintedKeep(int map, uint32_t zone)
+    {
+        if (const Zone* z = Find(map, zone); z && z->keepStarted) return z->paintedKeep;
+        return StartKeep(map, zone);
+    }
+
+    void DepositSnow(float yd)
+    {
+        if (!g_playerZone) return;
+        Zone& z = Get(g_playerMap, g_playerZone);
+        z.snowDepth = std::min(snow::kMaxFallen, z.snowDepth + (yd > 0.0f ? yd : 0.0f));
+    }
+
+    void ClearSnow()
+    {
+        for (Zone& z : g_zones) { z.snowDepth = 0.0f; z.keepStarted = false; }
+    }
+
+    void SetRainSoak(float soak)
+    {
+        if (!g_playerZone) return;
+        Zone& z = Get(g_playerMap, g_playerZone);
+        z.rainSoak = soak < 0.0f ? 0.0f : (soak > 1.0f ? 1.0f : soak);
     }
 
     uint32_t PlayerZone() { return g_playerZone; }

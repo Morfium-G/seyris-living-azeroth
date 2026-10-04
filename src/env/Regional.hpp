@@ -24,8 +24,11 @@ namespace wxl_livingazeroth::regional
     {
         int      map = -1;
         uint32_t id = 0;
-        float    rainSoak = 0.0f;     // 0..1: how much rain has soaked open, absorbent ground
-        float    snowDepth = 0.0f;    // yd of fallen snow on open, flat, cold ground (reserved: fallen snow)
+        float    rainSoak = 0.0f;     // 0..1: how much rain (and melted snow) has soaked open, absorbent ground
+        float    snowDepth = 0.0f;    // yd of fallen snow on open, flat ground (env/Snow.hpp)
+        float    paintedKeep = 1.0f;  // share of painted snow left on typical open ground (default melt columns)
+        float    temperature = 0.0f;  // degC its snow saw last step: air + sun on flat open ground
+        bool     keepStarted = false;
         double   lastSeen = 0.0;      // session seconds the player was last in it
         float    catchUp = 0.0f;      // seconds of fast-forward left
         Source   source = Source::Estimated;
@@ -43,6 +46,27 @@ namespace wxl_livingazeroth::regional
 
     /// A zone's rain soak (0 for zones never seen).
     float RainSoak(int map, uint32_t zone);
+
+    /// A zone's fallen snow (yd, 0 for zones never seen) and its painted snow's kept share (zones never
+    /// seen: what their temperature allows now).
+    float SnowDepth(int map, uint32_t zone);
+    float PaintedKeep(int map, uint32_t zone);
+
+    /// The temperature a zone's snow sees (degC): its climate on flat open ground with the sun. The
+    /// weather only counts in the player's zone (the only weather the client knows).
+    float ZoneTemperature(int map, uint32_t zone);
+
+    /// Drying of a soaked surface per second, at this air temperature, humidity and steady wind (the
+    /// zones' rule; the near grid's melt water dries the same way).
+    float DryingRate(float temperature, float humidity, float wind);
+
+    // --- testing (the panels' deposit buttons; not saved) ---
+    /// Adds fallen snow to the player's zone; it then melts or stays by the zone's rules.
+    void DepositSnow(float yd);
+    /// Removes every zone's fallen snow, and lets painted snow start over from its temperature.
+    void ClearSnow();
+    /// Sets the player's zone's rain soak (0..1); the ground follows and dries from there.
+    void SetRainSoak(float soak);
 
     /// How much faster the player's zone runs right now (> 1 while it catches up), so the ground
     /// near the player can fast-forward with it.

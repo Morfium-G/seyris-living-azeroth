@@ -22,6 +22,7 @@ namespace wxl_livingazeroth::debug
         float g_weatherIntensity = 1.0f;
         int   g_timeOn = 0;
         float g_timeHours = 12.0f;
+        float g_soak = 0.8f;
 
         void __cdecl Panel(void* /*user*/)
         {
@@ -55,8 +56,9 @@ namespace wxl_livingazeroth::debug
             const climate::Breakdown t = climate::Temperature(row);
             const climate::Weather& w = climate::CurrentWeather();
             static const char* const kWeather[] = { "fine", "rain", "snow", "sand" };
-            std::snprintf(line, sizeof(line), "temperature %.1f degC = %.1f time of day %+.1f season %+.1f weather (%s %.2f)",
-                          t.total, t.daily, t.season, t.weather, kWeather[w.type >= 0 && w.type < 4 ? w.type : 0], w.intensity);
+            std::snprintf(line, sizeof(line), "temperature %.1f degC = %.1f time of day %+.1f season %+.1f weather (%s %.2f)%s",
+                          t.total, t.daily, t.season, t.weather, kWeather[w.type >= 0 && w.type < 4 ? w.type : 0], w.intensity,
+                          t.test != 0.0f ? " + test offset" : "");
             g_api->UiText(line);
             if (g_api->UiButton("Reload AreaClimate")) climate::Load(g_cdbc);
 
@@ -118,8 +120,9 @@ namespace wxl_livingazeroth::debug
                 for (const regional::Zone& z : regional::Zones())
                 {
                     const double ago = regional::Now() - z.lastSeen;
-                    std::snprintf(line, sizeof(line), "%s map %d zone %u \"%s\": rain soak %.2f, %s%s",
+                    std::snprintf(line, sizeof(line), "%s map %d zone %u \"%s\": rain soak %.2f, fallen snow %.3f yd, painted snow kept %.2f (%.1f degC), %s%s",
                                   z.map == s.mapId && z.id == zone ? ">" : " ", z.map, z.id, regional::AreaName(z.id), z.rainSoak,
+                                  z.snowDepth, z.paintedKeep, z.temperature,
                                   z.source == regional::Source::Observed ? "" : "estimated",
                                   z.catchUp > 0.0f ? ", catching up" : "");
                     const size_t len = std::strlen(line);
@@ -148,6 +151,12 @@ namespace wxl_livingazeroth::debug
             bool timeChanged = g_api->UiCheckbox("override time of day", &g_timeOn) != 0;
             timeChanged |= g_api->UiSliderFloat("hour", &g_timeHours, 0.0f, 24.0f) != 0;
             if (timeChanged) climate::SetTimeOverride(g_timeOn ? g_timeHours / 24.0f : -1.0f);
+            float offset = climate::TemperatureOffset();
+            if (g_api->UiSliderFloat("temperature offset (degC, every place)", &offset, -30.0f, 30.0f)) climate::SetTemperatureOffset(offset);
+            // Moisture deposit: the zone's soak set directly; the ground follows it and dries from there.
+            g_api->UiSliderFloat("zone soak", &g_soak, 0.0f, 1.0f);
+            g_api->UiSameLine();
+            if (g_api->UiButton("Set your zone's soak")) regional::SetRainSoak(g_soak);
         }
     }
 

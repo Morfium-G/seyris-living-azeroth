@@ -11,6 +11,13 @@
 //    ground open to the sky, scaled by Absorbency. Submerged ground takes the liquid's moisture.
 //    What a liquid does: its GroundMaterialSelector row (LiquidType ID -> material: RestMoisture,
 //    Temperature), else built in by category (water, ocean, slime: wet; magma: dry, 1000 degC).
+//  - "snow" (yd): snow lying on the spot, fallen + painted (orchestration docs/r&d/immersion/
+//    regional-layer-and-snow.md, "Fallen snow"). Fallen snow follows its zone's record (env/Regional:
+//    snowfall, degree-day melting), held back where the spot is warmer than its zone (heat nearby,
+//    a sunny slope) and absent under roofs and liquids. Painted snow (SurfaceCover rows whose
+//    CoverMaterial is snow) melts toward its cap by the spot's own effective temperature (air, hot
+//    ground and liquids, the sun on its slope), down to nothing on top of heat sources, and grows
+//    back when it's colder; its melt water wets the ground (env/Snow.hpp has the rules).
 #pragma once
 
 #include "WorldQuery.hpp"
@@ -80,7 +87,34 @@ namespace wxl_livingazeroth::fields
     };
     const WetGrid& Wet();
 
-    struct Stats { unsigned filled = 0, cells = 0, water = 0; double fillMs = 0.0, transformMs = 0.0, tickMs = 0.0; float rainSoak = 0.0f; unsigned hotGround = 0; };
+    /// Snow details at a position, for the panels.
+    struct SnowDetail
+    {
+        bool  known = false;
+        float fallen = 0.0f, target = 0.0f;       // yd now, yd it's heading to
+        float zoneSnow = 0.0f;                    // the zones' fallen snow around it (blended across borders)
+        float hold = 1.0f;                        // 0..1 how much of it this spot holds (warmer than its zone: less)
+        float painted = 0.0f;                     // yd of painted snow cover here (0 = none)
+        float keep = 1.0f, cap = 1.0f;            // its share left now, and where it's heading
+        float keptShare = 0.0f, goneTemperature = 0.0f; // the rows' melt columns
+        float temperature = 0.0f;                 // effective: ground surface + sun
+        float sun = 0.0f;                         // the sun's part of it
+        float zoneTemperature = 0.0f;             // what the zone's snow sees
+        float heatReach = 0.0f;                   // 0..1 local heat (melts pits)
+        float meltWet = 0.0f;                     // moisture its melt water adds (0..1 soak)
+    };
+    SnowDetail Snow(const float pos[3]);
+
+    /// For the cover: fallen snow (yd) and painted snow's kept share (0..1) at a world position, from
+    /// the last published values: the near grid, fading into the zones' values (per terrain chunk)
+    /// within its last yards, the player's zone's values beyond. Cheap enough to call per cover cell.
+    void SnowAt(float x, float y, float& fallen, float& keep);
+    /// Changes whenever the published snow values do (they're published when they moved by about a
+    /// centimetre, or the grid moved). Active: anything differs from "no fallen snow, everything kept".
+    uint32_t SnowVersion();
+    bool     SnowActive();
+
+    struct Stats { unsigned filled = 0, cells = 0, water = 0; double fillMs = 0.0, transformMs = 0.0, tickMs = 0.0; float rainSoak = 0.0f; unsigned hotGround = 0; unsigned snowPublished = 0; };
     Stats GetStats();
 
     /// Once per frame, after world::Refresh(), climate::Update() and wind::Update().
