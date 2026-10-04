@@ -24,7 +24,7 @@ namespace wxl_livingazeroth::moisturetex
     /// Beyond the grid: one regional value (the grid's outer ring), and the yards over which the grid
     /// fades into it inside its edge.
     float FarExcess();
-    constexpr float kEdgeFadeYards = 24.0f;
+    constexpr float kEdgeFadeYards = 64.0f;
 
     /// Drops the texture (device lost or replaced).
     void Release();

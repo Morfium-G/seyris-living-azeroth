@@ -2,6 +2,7 @@
 
 #include "../env/Climate.hpp"
 #include "../env/Fields.hpp"
+#include "../env/Regional.hpp"
 #include "../env/TerrainHeight.hpp"
 #include "../features/TerrainWetness.hpp"
 #include "../env/WorldQuery.hpp"
@@ -98,6 +99,27 @@ namespace wxl_livingazeroth::debug
             std::snprintf(line, sizeof(line), "moisture grid: %u / %u cells sampled, %u under water, %u hot ground; rain soak so far %.2f; fill %.2f ms, shore pass %.2f ms, step %.2f ms",
                           st.filled, st.cells, st.water, st.hotGround, st.rainSoak, st.fillMs, st.transformMs, st.tickMs);
             g_api->UiText(line);
+
+            // The regional layer: every zone seen this session.
+            if (g_api->UiCollapsingHeader("Zones (regional layer)"))
+            {
+                const uint32_t zone = regional::PlayerZone();
+                std::snprintf(line, sizeof(line), "you are in zone %u \"%s\" (AreaTable name; the client says \"%s\")",
+                              zone, regional::AreaName(zone), s.zoneText);
+                g_api->UiText(line);
+                for (const regional::Zone& z : regional::Zones())
+                {
+                    const double ago = regional::Now() - z.lastSeen;
+                    std::snprintf(line, sizeof(line), "%s map %d zone %u \"%s\": rain soak %.2f, %s%s",
+                                  z.map == s.mapId && z.id == zone ? ">" : " ", z.map, z.id, regional::AreaName(z.id), z.rainSoak,
+                                  z.source == regional::Source::Observed ? "" : "estimated",
+                                  z.catchUp > 0.0f ? ", catching up" : "");
+                    const size_t len = std::strlen(line);
+                    if (!(z.map == s.mapId && z.id == zone) && z.source == regional::Source::Observed)
+                        std::snprintf(line + len, sizeof(line) - len, "last here %.0f s ago", ago);
+                    g_api->UiText(line);
+                }
+            }
 
             g_api->UiSeparator();
             g_api->UiTextWrapped(terrainwet::StatusLine());

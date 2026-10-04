@@ -1,0 +1,62 @@
+// The regional layer: environment state per zone (orchestration docs/r&d/immersion/
+// regional-layer-and-snow.md). The near fields (env/Fields) hold detail around the player; this holds
+// each zone's average state, for the ground entering the near grid and (later) the far distance.
+//
+// Zone = the top of an area's chain (server weather is per zone). Rules:
+//  - the player's zone follows the live weather (the only weather the client knows);
+//  - zones the player has left keep their state and evolve by their own climate with no rain
+//    assumed (wet zones dry slowly), so looking back a rained-on zone stays wet for a while;
+//  - entering a zone that's new or stale fast-forwards it (catch-up: the same rules, many times
+//    faster for a short while) toward what its current weather implies, then it runs normally.
+// Session only: nothing survives a logout (until a server can sync it).
+#pragma once
+
+#include "WorldQuery.hpp"
+
+#include <cstdint>
+#include <vector>
+
+namespace wxl_livingazeroth::regional
+{
+    enum class Source : uint8_t { Estimated, Observed };
+
+    struct Zone
+    {
+        int      map = -1;
+        uint32_t id = 0;
+        float    rainSoak = 0.0f;     // 0..1: how much rain has soaked open, absorbent ground
+        float    snowDepth = 0.0f;    // yd of fallen snow on open, flat, cold ground (reserved: fallen snow)
+        double   lastSeen = 0.0;      // session seconds the player was last in it
+        float    catchUp = 0.0f;      // seconds of fast-forward left
+        Source   source = Source::Estimated;
+    };
+
+    /// Once per frame, after climate::Update().
+    void Update(float dt, const world::Snapshot& snap);
+
+    /// The zone an area belongs to (the top of its chain; 0 for none).
+    uint32_t ZoneOf(uint32_t area);
+
+    /// The player's zone, and a zone's record (null if never seen).
+    uint32_t    PlayerZone();
+    const Zone* Find(int map, uint32_t zone);
+
+    /// A zone's rain soak (0 for zones never seen).
+    float RainSoak(int map, uint32_t zone);
+
+    /// How much faster the player's zone runs right now (> 1 while it catches up), so the ground
+    /// near the player can fast-forward with it.
+    float PlayerZoneSpeed();
+
+    /// Every zone seen this session (for the panel).
+    const std::vector<Zone>& Zones();
+
+    /// An area's name from AreaTable ("" if unknown).
+    const char* AreaName(uint32_t area);
+
+    /// Session seconds (for "last seen").
+    double Now();
+
+    /// Forget everything (world left).
+    void Reset();
+}

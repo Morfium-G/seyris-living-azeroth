@@ -21,6 +21,7 @@
 #include "env/Actors.hpp"
 #include "env/Climate.hpp"
 #include "env/Fields.hpp"
+#include "env/Regional.hpp"
 #include "env/Wind.hpp"
 #include "env/WorldQuery.hpp"
 #include "features/GrassDensity.hpp"
@@ -90,6 +91,7 @@ namespace
         const float dt = a ? a->dt : 0.0f;
         const auto& snap = wxl_livingazeroth::world::Refresh();
         wxl_livingazeroth::climate::Update(snap);
+        wxl_livingazeroth::regional::Update(dt, snap);
         wxl_livingazeroth::wind::Update(dt, snap);
         if (snap.inWorld)
             wxl_livingazeroth::actors::Refresh(snap.playerPos, wxl_livingazeroth::grass::kActorRange);
