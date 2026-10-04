@@ -71,6 +71,8 @@ namespace wxl_livingazeroth::moisturetex
         return true;
     }
 
+    float FarExcess() { return fields::Wet().farExcess; }
+
     bool Mapping(float& inverseExtent, float box[4])
     {
         const fields::WetGrid& wet = fields::Wet();

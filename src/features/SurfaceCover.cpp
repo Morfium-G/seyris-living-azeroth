@@ -388,7 +388,7 @@ float4 specOn1 : register(c9);
 float4 specular : register(c10);
 float4 wetMap : register(c11);  // 1 / grid extent (yd), uv offset (x, y), on
 float4 wetBox : register(c12);  // the grid's valid box, camera-relative (min x, min y, max x, max y)
-float4 shadowOn : register(c13); // x = 1: the terrain's dynamic shadows apply
+float4 misc : register(c13);     // x = 1: the terrain's dynamic shadows apply; y = moisture beyond the grid, z = 1 / its edge fade (yd)
 float4 pcf[8] : register(c20);   // the terrain's PCF offsets (its PS c3..c10)
 float4 shadowM[12] : register(c30); // the terrain's shadow matrices (its VS c37..c48), from view space
 sampler2D cover0 : register(s0);
@@ -470,13 +470,15 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
     // Vertex colour (the terrain multiplies by 2 x it) and wetness: darker, and a stronger, tighter shine.
     float4 pr = tex2D(props, wuv);
     // The row's own wet look, plus how much wetter than its rest the ground is now (rain, water nearby).
-    float2 inBox = step(wetBox.xy, rel) * step(rel, wetBox.zw);
-    float wet = saturate(pr.a + wetMap.w * inBox.x * inBox.y * tex2D(wetGrid, rel * wetMap.x + wetMap.yz).a);
+    // Inside its last yards the grid fades into the one regional value used beyond it.
+    float2 fromMin = rel - wetBox.xy, toMax = wetBox.zw - rel;
+    float inner = saturate(min(min(fromMin.x, fromMin.y), min(toMax.x, toMax.y)) * misc.z);
+    float wet = saturate(pr.a + wetMap.w * lerp(misc.y, tex2D(wetGrid, rel * wetMap.x + wetMap.yz).a, inner));
     colour *= pr.rgb * 2 * (1 - 0.45 * wet);
     float3 h = normalize(l + normalize(-vpos));
     float sp = pow(saturate(dot(nn, h)), max(specular.w, 1) * (1 + 3 * wet)) * saturate(mask * (1 + 2 * wet));
     // Dynamic shadows like the terrain's: down to 70% in full shadow, no shine there.
-    float shade = shadowOn.x > 0.5 ? Shadow(vpos) : 1;
+    float shade = misc.x > 0.5 ? Shadow(vpos) : 1;
     float3 c = colour * lit * (0.7 + 0.3 * shade) + specular.rgb * sp * shade;
     return float4(lerp(fogColor.rgb, c, fog), 1);
 }
@@ -1430,7 +1432,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
 
             // The terrain's shadow maps on our free samplers s12..s15, exactly as it sampled them.
             {
-                const float c13[4] = { g_shadowUsed ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+                const float c13[4] = { g_shadowUsed ? 1.0f : 0.0f, moisturetex::FarExcess(), 1.0f / moisturetex::kEdgeFadeYards, 0.0f };
                 dev->SetPixelShaderConstantF(13, c13, 1);
                 if (g_shadowUsed)
                 {

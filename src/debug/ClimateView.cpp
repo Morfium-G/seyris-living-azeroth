@@ -88,8 +88,8 @@ namespace wxl_livingazeroth::debug
                 g_api->UiText(line);
             }
             const fields::Stats st = fields::GetStats();
-            std::snprintf(line, sizeof(line), "moisture grid: %u / %u cells sampled, %u under water; fill %.2f ms, shore pass %.2f ms, step %.2f ms",
-                          st.filled, st.cells, st.water, st.fillMs, st.transformMs, st.tickMs);
+            std::snprintf(line, sizeof(line), "moisture grid: %u / %u cells sampled, %u under water; rain soak so far %.2f; fill %.2f ms, shore pass %.2f ms, step %.2f ms",
+                          st.filled, st.cells, st.water, st.rainSoak, st.fillMs, st.transformMs, st.tickMs);
             g_api->UiText(line);
 
             g_api->UiSeparator();

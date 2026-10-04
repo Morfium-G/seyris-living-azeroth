@@ -25,6 +25,7 @@ namespace wxl_livingazeroth::fields
         constexpr int   kRecentre = 8;        // cells the player moves before the grid follows
         constexpr double kFillBudgetMs = 0.75; // static sampling per frame (a full grid: ~40 frames)
         constexpr float kTick = 0.25f;        // seconds between moisture steps (it changes over minutes)
+        constexpr int   kRing = 8;            // cells of the outer ring averaged for beyond the grid
 
         // Model numbers (rules are code; world-fields.md).
         constexpr float kShoreNear = 2.0f, kShoreFar = 6.0f;      // yd: full wetting .. none
@@ -72,6 +73,12 @@ namespace wxl_livingazeroth::fields
         float    g_tickTime = 0.0f, g_shoreTime = 0.0f;
         uint32_t g_climateGeneration = 0, g_materialGeneration = 0;
         Stats    g_stats;
+        // How much the rain has soaked the region by now: the moisture fully open, fully absorbent
+        // ground would have gained (0..1). Rises with rain, dries like the cells. Ground entering the
+        // grid starts at this (x its own absorbency and open sky), so walking on in the rain doesn't
+        // leave a dry ring where the grid only just arrived.
+        float    g_rainSoak = 0.0f;
+        uint32_t g_playerArea = 0;
 
         int Mod(int v) { const int m = v % kSize; return m < 0 ? m + kSize : m; }
         int SlotOf(int i, int j) { return Mod(j) * kSize + Mod(i); }
@@ -215,7 +222,22 @@ namespace wxl_livingazeroth::fields
             const climate::Weather& weather = climate::CurrentWeather();
             const bool raining = weather.type == 1 && weather.intensity > 0.0f;
             const float wind = wind::SteadyGround();
+            // The region's rain soak, at the player's climate.
+            {
+                const climate::Row& row = climate::For(g_playerArea, g_map);
+                const float t = climate::Temperature(row).total;
+                if (raining) g_rainSoak += dt / kRainSeconds * weather.intensity * (1.0f - g_rainSoak);
+                else
+                {
+                    const float warmth = t <= 0.0f ? 0.2f : 1.0f + t / 15.0f;
+                    const float rate = (1.0f + 2.0f * wind) * warmth * (1.0f - 0.7f * row.humidity) / kDrySeconds;
+                    g_rainSoak -= g_rainSoak * (rate * dt > 1.0f ? 1.0f : rate * dt);
+                }
+                g_rainSoak = Clamp01(g_rainSoak);
+            }
             // Temperature and humidity per area, once per tick.
+            double ringSum = 0.0;
+            unsigned ringCount = 0;
             uint32_t lastArea = 0xFFFFFFFFu;
             float temperature = 0.0f, humidity = 0.5f;
             for (int b = 0; b < kSize; ++b)
@@ -235,7 +257,11 @@ namespace wxl_livingazeroth::fields
                     // The ground's temperature: the air, warmed (or cooled) near a liquid with a temperature.
                     c.temperature = temperature + (c.nearHot ? c.heat * kHeatShare * (c.nearTemp - temperature) : 0.0f);
                     const float eq = Equilibrium(c, c.temperature, humidity);
-                    if (!c.started) { c.value = eq; c.started = true; }
+                    if (!c.started)
+                    {
+                        c.value = c.submerged ? eq : eq + (1.0f - eq) * g_rainSoak * c.absorbency * c.open;
+                        c.started = true;
+                    }
                     if (c.submerged) c.value = c.liquidMoisture;
                     else if (raining && c.open > 0.0f)
                         c.value += dt / kRainSeconds * weather.intensity * c.absorbency * c.open * (1.0f - c.value);
@@ -249,7 +275,11 @@ namespace wxl_livingazeroth::fields
                     c.value = Clamp01(c.value);
                     const float excess = c.value - c.rest;
                     g_excess[s] = static_cast<uint8_t>(Clamp01(excess) * 255.0f + 0.5f);
+                    // The outer ring (8 cells) on dry land feeds the value used beyond the grid.
+                    if (!c.submerged && (a < kRing || b < kRing || a >= kSize - kRing || b >= kSize - kRing))
+                    { ringSum += Clamp01(excess); ++ringCount; }
                 }
+            g_wet.farExcess = ringCount ? static_cast<float>(ringSum / ringCount) : Clamp01(g_rainSoak * 0.35f);
             ++g_wet.version;
             g_stats.tickMs = grassperf::Now() - t0;
         }
@@ -315,7 +345,7 @@ namespace wxl_livingazeroth::fields
     }
 
     const WetGrid& Wet() { return g_wet; }
-    Stats GetStats() { return g_stats; }
+    Stats GetStats() { Stats s = g_stats; s.rainSoak = g_rainSoak; return s; }
 
     void Reset()
     {
@@ -346,6 +376,7 @@ namespace wxl_livingazeroth::fields
             g_haveGrid = true;
             g_shoreDirty = true;
         }
+        g_playerArea = snap.areaCount > 0 ? snap.areaChain[0] : 0;
         g_wet.size = kSize; g_wet.cellSize = kCell; g_wet.firstI = g_firstI; g_wet.firstJ = g_firstJ; g_wet.excess = g_excess.data();
 
         // Static sampling within the budget: cells whose slot holds another world cell, or that

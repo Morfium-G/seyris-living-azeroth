@@ -32,8 +32,10 @@ namespace wxl_livingazeroth::terrainwet
         // paired with the VS that write it that way) -- that output is re-labelled texcoord7 and
         // carries the world XY instead. Packing a second semantic into a register's free .zw does NOT
         // work (in-client 2026-10-04: the PS read zeros, whichever components it declared).
-        // c200 = (1 / grid extent, debug: whole grid wet, 0, strength), c201 = grid box (world yd),
-        // c203 = debug (ignore the box, stripe scale, stripes on, 0); c202 is defined in the shader.
+        // c200 = (1 / grid extent, debug: whole grid wet, beyond the grid, strength), c201 = grid box
+        // (world yd), c203 = (debug: ignore the box, stripe scale, stripes on, 1 / edge fade yards);
+        // c202 is defined in the shader. Inside its last kEdgeFadeYards the grid fades into the one
+        // regional value used beyond it, so its edge doesn't show.
         constexpr int kPsConstant = 200;
 
         bool  g_enabled = true;
@@ -111,10 +113,9 @@ namespace wxl_livingazeroth::terrainwet
             const std::string block =
                 "\n    add r31.xy, v9.xy, -c201.xy"
                 "\n    add r31.zw, -v9.xyxy, c201.zwzw"
-                "\n    cmp r31, r31, c202.x, c202.y"
-                "\n    mul r31.x, r31.x, r31.y"
-                "\n    mul r31.x, r31.x, r31.z"
-                "\n    mul r31.x, r31.x, r31.w"
+                "\n    min r31.xy, r31.xy, r31.zw"
+                "\n    min r31.x, r31.x, r31.y"
+                "\n    mul_sat r31.x, r31.x, c203.w"
                 "\n    max r31.x, r31.x, c203.x"
                 "\n    mul r29.xy, v9.xy, c200.x"
                 "\n    texld r30, r29, s11"
@@ -125,7 +126,9 @@ namespace wxl_livingazeroth::terrainwet
                 "\n    cmp r28.x, r28.x, c202.y, c202.x"
                 "\n    mul r28.x, r28.x, c203.z"
                 "\n    max r30.w, r30.w, r28.x"
-                "\n    mul r30.x, r30.w, r31.x"
+                "\n    add r30.w, r30.w, -c200.z"
+                "\n    mad r30.w, r31.x, r30.w, c200.z"
+                "\n    mov r30.x, r30.w"
                 "\n    mul r30.x, r30.x, c200.w"
                 "\n    mad " + r + ".xyz, " + r + ", -r30.x, " + r;
             src.insert(static_cast<size_t>(m.position(0)), block);
@@ -166,7 +169,9 @@ namespace wxl_livingazeroth::terrainwet
         c[3] = on ? (g_debug ? 0.8f : g_strength) : 0.0f;
         for (int k = 0; k < 4; ++k) c[4 + k] = box[k];
         c[8] = 1.0f; c[9] = 1.0f; c[10] = 0.0f; c[11] = 0.0f; // c202: the shader's own def wins
+        c[2] = g_debug ? 0.0f : moisturetex::FarExcess();
         c[12] = g_debug >= 2 ? 1.0f : 0.0f;  // c203.x ignore the box
+        c[15] = 1.0f / moisturetex::kEdgeFadeYards;
         c[13] = 0.1f;                         // c203.y stripes every 10 yd (5 dark, 5 not)
         c[14] = g_debug == 3 ? 1.0f : 0.0f;   // c203.z stripes on
         if (g_debug == 3) c[1] = 0.0f;        // stripes only

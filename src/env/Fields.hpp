@@ -60,10 +60,11 @@ namespace wxl_livingazeroth::fields
         int            firstI = 0, firstJ = 0;
         const uint8_t* excess = nullptr;
         uint32_t       version = 0;
+        float          farExcess = 0.0f; // beyond the grid: the mean excess of its outer ring (rain is regional)
     };
     const WetGrid& Wet();
 
-    struct Stats { unsigned filled = 0, cells = 0, water = 0; double fillMs = 0.0, transformMs = 0.0, tickMs = 0.0; };
+    struct Stats { unsigned filled = 0, cells = 0, water = 0; double fillMs = 0.0, transformMs = 0.0, tickMs = 0.0; float rainSoak = 0.0f; };
     Stats GetStats();
 
     /// Once per frame, after world::Refresh(), climate::Update() and wind::Update().
