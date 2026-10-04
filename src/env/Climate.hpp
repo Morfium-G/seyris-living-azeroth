@@ -48,10 +48,23 @@ namespace wxl_livingazeroth::climate
         float daily = 0.0f;   // night .. day by the time of day
         float season = 0.0f;  // +- half the amplitude
         float weather = 0.0f; // rain/snow cooling, sand warming
+        float test = 0.0f;    // the panel's test offset
         float total = 0.0f;
     };
     Breakdown Temperature(const Row& row);
     float     TemperatureAt(uint32_t areaId, int mapId);
+
+    /// The sun: the direction toward it (world space, z up) and how much it shines (0 at night .. 1
+    /// by day, from the time of day). The direction is the client's active celestial light (the
+    /// day-night block the sky and model lighting use); without it, a sun computed from the time of
+    /// day (east at 06:00, south at noon).
+    struct Sun { float dir[3] = { 0.0f, 0.0f, 1.0f }; float daylight = 0.0f; bool fromClient = false; };
+    const Sun& SunNow();
+
+    /// degC the sun adds on ground with this (unit, world) normal, open to the sky by `open` (0..1):
+    /// up to kSunDegrees by day on ground facing it, nothing at night or under a roof.
+    constexpr float kSunDegrees = 4.0f;
+    float SunWarming(const float normal[3], float open);
 
     /// Weather as the climate sees it (the live weather, or the panel's override).
     struct Weather { int type = 0; float intensity = 0.0f; }; // 0 fine, 1 rain, 2 snow, 3 sand
@@ -70,6 +83,9 @@ namespace wxl_livingazeroth::climate
     void SetWeatherOverride(int type, float intensity);
     int  WeatherOverrideType();
     float WeatherOverrideIntensity();
+    /// degC added to every place's temperature (0 = off).
+    void  SetTemperatureOffset(float degrees);
+    float TemperatureOffset();
     /// Time of day: < 0 follows the client.
     void  SetTimeOverride(float dayFraction);
     float TimeOverride();

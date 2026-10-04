@@ -49,13 +49,19 @@ namespace wxl_livingazeroth::climate
         // the day has run, 0..1.
         constexpr uintptr_t kDayNightGetInfo = 0x007ECEF0;
         constexpr size_t    kInfoDayFraction = 0x04;
+        // +0x19C: vec3, the direction of the active celestial light, world space (core
+        // offsets/engine/Sky.hpp: the vector the engine hands its own model lighting). [believed:
+        // whether it points toward the light or away from it -- either is turned to point up.]
+        constexpr size_t    kInfoLightDir = 0x19C;
         using DayNightGetInfoFn = void*(__cdecl*)();
 
         Clock   g_clock;
+        Sun     g_sun;
         Weather g_weather;
         int     g_overrideType = -1;
         float   g_overrideIntensity = 1.0f;
         float   g_timeOverride = -1.0f;
+        float   g_temperatureOffset = 0.0f;
 
         template <class T> T Read(uintptr_t a) { return *reinterpret_cast<const T*>(a); }
 
@@ -140,6 +146,7 @@ namespace wxl_livingazeroth::climate
     {
         Clock c;
         c.valid = snap.inWorld;
+        const void* info = nullptr;
         if (snap.inWorld)
         {
             c.minute = Read<int32_t>(kGameMinute);
@@ -147,7 +154,7 @@ namespace wxl_livingazeroth::climate
             c.day = Read<int32_t>(kGameMonthDay) + 1;
             c.month = Read<int32_t>(kGameMonth) + 1;
             c.year = Read<int32_t>(kGameYear) + 2000;
-            const void* info = reinterpret_cast<DayNightGetInfoFn>(kDayNightGetInfo)();
+            info = reinterpret_cast<DayNightGetInfoFn>(kDayNightGetInfo)();
             c.dayFraction = info ? Read<float>(reinterpret_cast<uintptr_t>(info) + kInfoDayFraction)
                                  : (c.hour * 60 + c.minute) / 1440.0f;
             if (!(c.dayFraction >= 0.0f && c.dayFraction <= 1.0f)) c.dayFraction = (c.hour * 60 + c.minute) / 1440.0f;
@@ -156,6 +163,35 @@ namespace wxl_livingazeroth::climate
         }
         if (g_timeOverride >= 0.0f) c.dayFraction = g_timeOverride;
         g_clock = c;
+
+        // The sun. Daylight from the time of day (0 at 06:00 and 18:00, full from ~08:00 to ~16:00),
+        // so the moon (the active light at night) never warms anything.
+        constexpr float kPi = 3.14159265f;
+        Sun sun;
+        const float s = std::sin(2.0f * kPi * (c.dayFraction - 0.25f));
+        sun.daylight = s * 3.0f < 0.0f ? 0.0f : (s * 3.0f > 1.0f ? 1.0f : s * 3.0f);
+        bool fromClient = false;
+        if (info && g_timeOverride < 0.0f)
+        {
+            const float* d = reinterpret_cast<const float*>(reinterpret_cast<uintptr_t>(info) + kInfoLightDir);
+            const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            if (len > 0.5f && len < 2.0f)
+            {
+                const float flip = d[2] < 0.0f ? -1.0f : 1.0f;
+                for (int k = 0; k < 3; ++k) sun.dir[k] = flip * d[k] / len;
+                fromClient = true;
+            }
+        }
+        if (!fromClient)
+        {
+            // East (-y) at 06:00, south (-x) at noon, west (+y) at 18:00; up to ~60 degrees high.
+            const float a = 2.0f * kPi * (c.dayFraction - 0.5f);
+            const float up = 0.85f * (s > 0.0f ? s : 0.0f);
+            const float flat = std::sqrt(1.0f - up * up);
+            sun.dir[0] = -std::cos(a) * flat; sun.dir[1] = std::sin(a) * flat; sun.dir[2] = up;
+        }
+        sun.fromClient = fromClient;
+        g_sun = sun;
 
         if (g_overrideType >= 0) { g_weather.type = g_overrideType; g_weather.intensity = g_overrideIntensity; }
         else { g_weather.type = snap.weatherType; g_weather.intensity = snap.weatherIntensity; }
@@ -177,11 +213,21 @@ namespace wxl_livingazeroth::climate
             case 3: b.weather = 2.0f * g_weather.intensity;  break; // sand
             default: break;
         }
-        b.total = b.daily + b.season + b.weather;
+        b.test = g_temperatureOffset;
+        b.total = b.daily + b.season + b.weather + b.test;
         return b;
     }
 
     float TemperatureAt(uint32_t areaId, int mapId) { return Temperature(For(areaId, mapId)).total; }
+
+    const Sun& SunNow() { return g_sun; }
+
+    float SunWarming(const float normal[3], float open)
+    {
+        const float facing = normal[0] * g_sun.dir[0] + normal[1] * g_sun.dir[1] + normal[2] * g_sun.dir[2];
+        if (facing <= 0.0f || g_sun.daylight <= 0.0f || open <= 0.0f) return 0.0f;
+        return kSunDegrees * g_sun.daylight * (open > 1.0f ? 1.0f : open) * facing;
+    }
 
     const Clock&   Now()            { return g_clock; }
     const Weather& CurrentWeather() { return g_weather; }
@@ -192,5 +238,7 @@ namespace wxl_livingazeroth::climate
     int   WeatherOverrideType()      { return g_overrideType; }
     float WeatherOverrideIntensity() { return g_overrideIntensity; }
     void  SetTimeOverride(float f)   { g_timeOverride = f; }
+    void  SetTemperatureOffset(float degrees) { g_temperatureOffset = degrees; }
+    float TemperatureOffset()        { return g_temperatureOffset; }
     float TimeOverride()             { return g_timeOverride; }
 }
