@@ -49,6 +49,11 @@ namespace wxl_livingazeroth::fields
         float airTemperature = 0.0f;              // the place's climate
         float temperature = 0.0f, humidity = 0.0f; // the ground's (air + liquid heat), the air's humidity
         float equilibrium = 0.0f, value = 0.0f;
+        // Diagnostics: the zone this spot belongs to, the share of the player's zone around it (rain
+        // falls by it), the zones' soak mix it would start from, the rain it got last step, and how
+        // fast its moisture is changing now.
+        uint32_t zone = 0;
+        float zoneShare = 0.0f, zoneSoakMix = 0.0f, rainShare = 0.0f, changePerSecond = 0.0f;
     };
     MoistureDetail Moisture(const float pos[3]);
 
@@ -75,4 +80,7 @@ namespace wxl_livingazeroth::fields
 
     /// Forget everything (materials or climate reloaded: refill).
     void Reset();
+
+    /// Testing: sample every cell again (starting from its zone's state, as if just arrived).
+    void Refill();
 }

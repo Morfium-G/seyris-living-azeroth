@@ -79,6 +79,9 @@ namespace wxl_livingazeroth::debug
                                   liquid, m.waterDistance, m.heightAboveWater, m.shore);
                 else std::snprintf(line, sizeof(line), "  no liquid within the grid");
                 g_api->UiText(line);
+                std::snprintf(line, sizeof(line), "  spot's zone %u (yours %u), zone share %.2f, zone soak mix %.2f, rain now %.2f, changing %+.4f/s",
+                              m.zone, regional::PlayerZone(), m.zoneShare, m.zoneSoakMix, m.rainShare, m.changePerSecond);
+                g_api->UiText(line);
                 std::snprintf(line, sizeof(line), "  ground %.1f degC (air %.1f%s); open sky %.2f", m.temperature, m.airTemperature,
                               m.liquidHot && m.heat > 0.0f ? ", warmed by the liquid" : "", m.open);
                 if (m.liquidHot && m.heat > 0.0f)
@@ -95,6 +98,7 @@ namespace wxl_livingazeroth::debug
                     std::snprintf(line, sizeof(line), "  no hot ground within the grid");
                 g_api->UiText(line);
             }
+            if (g_api->UiButton("Refill moisture grid (test)")) fields::Refill();
             const fields::Stats st = fields::GetStats();
             std::snprintf(line, sizeof(line), "moisture grid: %u / %u cells sampled, %u under water, %u hot ground; rain soak so far %.2f; fill %.2f ms, shore pass %.2f ms, step %.2f ms",
                           st.filled, st.cells, st.water, st.hotGround, st.rainSoak, st.fillMs, st.transformMs, st.tickMs);

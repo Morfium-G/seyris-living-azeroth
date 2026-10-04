@@ -1,5 +1,7 @@
 #include "Shelter.hpp"
 
+#include "TerrainHeight.hpp"
+
 #include "game/Pick.hpp"
 
 #include <cmath>
@@ -111,9 +113,12 @@ namespace wxl_livingazeroth::shelter
         const float ux = std::cos(sectorAngle), uy = std::sin(sectorAngle);
         const float reach = g_leeParams.reach;
         const float rise  = reach * std::tan(g_leeParams.angleDeg * 3.14159265f / 180.0f);
+        // From the cell's centre column, never from below the terrain there (see Openness).
         const float x = (cx + 0.5f) * kCell, y = (cy + 0.5f) * kCell;
-        const float from[3] = { x, y, pos[2] + kLeeHeight };
-        const float to[3]   = { x + ux * reach, y + uy * reach, pos[2] + kLeeHeight + rise };
+        float ground = pos[2];
+        const float base = terrain::HeightAt(x, y, ground) && ground > pos[2] ? ground : pos[2];
+        const float from[3] = { x, y, base + kLeeHeight };
+        const float to[3]   = { x + ux * reach, y + uy * reach, base + kLeeHeight + rise };
 
         // Hit at fraction t: right behind the obstacle (t ~ 0) loses most of the wind, an obstacle
         // at the far end of the reach barely matters.
@@ -155,9 +160,14 @@ namespace wxl_livingazeroth::shelter
         ++g_rays;
 
         // Trace from the cell's centre column at the queried height, so every query in the cell
-        // shares one answer.
+        // shares one answer -- but never from below the terrain there: on a steep slope the terrain
+        // at the centre can be higher than the spot that asked, the ray would start underground and
+        // "hit a roof" (the terrain from below), and exposed cliffs read as sheltered. The terrain
+        // can't be a roof, so the ray starts above it.
         const float x = (cx + 0.5f) * kCell, y = (cy + 0.5f) * kCell;
-        const float open = Trace(x, y, pos[2]);
+        float ground = pos[2];
+        const float z = terrain::HeightAt(x, y, ground) && ground > pos[2] ? ground : pos[2];
+        const float open = Trace(x, y, z);
         g_cache[key] = Entry{ open, g_time, x, y };
         return open;
     }

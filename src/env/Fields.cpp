@@ -4,7 +4,6 @@
 #include "Regional.hpp"
 #include "Shelter.hpp"
 #include "TerrainHeight.hpp"
-#include "Wind.hpp"
 #include "../features/GrassPerf.hpp"
 #include "../features/GroundMaterialTable.hpp"
 
@@ -30,12 +29,11 @@ namespace wxl_livingazeroth::fields
         // Zone borders blend over this radius (cells, 32 yd): rain falls by the share of the player's
         // zone around a spot, and new ground starts from the mix of the zones around it.
         constexpr int   kZoneBlend = 16;
+        constexpr float kFollowSeconds = 2.0f; // a spot eases toward its value over about this long
 
         // Model numbers (rules are code; world-fields.md).
         constexpr float kShoreNear = 2.0f, kShoreFar = 6.0f;      // yd: full wetting .. none
         constexpr float kShoreLow = 0.5f, kShoreHigh = 2.0f;      // yd above the water: full .. none
-        constexpr float kRainSeconds = 90.0f;                     // full rain soaks absorbent open ground in ~this
-        constexpr float kDrySeconds = 600.0f;                     // back to equilibrium at 0..15 degC, calm, average humidity
         constexpr float kHeatDryStart = 20.0f, kHeatDryFull = 40.0f; // degC: hot dry air dries below rest...
         constexpr float kHeatDryMax = 0.6f;                       // ...by up to this share of the rest
         // Heat from a hot liquid (magma): full within 1 yd, gone by 12 yd and 4 yd above its surface;
@@ -69,6 +67,8 @@ namespace wxl_livingazeroth::fields
             float    open = 1.0f;
             float    shore = 0.0f, waterDist = -1.0f, aboveWater = 0.0f;
             float    value = 0.3f;    // current moisture
+            // Diagnostics (panel): the last step's inputs and change.
+            float    lastShare = 0.0f, lastSoak = 0.0f, lastRain = 0.0f, lastChange = 0.0f, lastDt = 0.0f;
             bool     started = false; // value initialised (to its equilibrium)
         };
         std::vector<Cell>    g_cells(kSize * kSize);
@@ -269,10 +269,8 @@ namespace wxl_livingazeroth::fields
             const double t0 = grassperf::Now();
             const climate::Weather& weather = climate::CurrentWeather();
             const bool raining = weather.type == 1 && weather.intensity > 0.0f;
-            const float wind = wind::SteadyGround();
             // The weather the client knows is the player's zone's: rain only falls there.
             const uint32_t playerZone = regional::PlayerZone();
-            const float catchUpSpeed = regional::PlayerZoneSpeed();
             // Zone borders as gradients: per cell, the share of the player's zone around it (rain falls
             // by it) and the mix of the zones' rain soak around it (new ground starts from it).
             static std::vector<float> share(kSize * kSize), soak(kSize * kSize), weight(kSize * kSize), tmpA(kSize * kSize), tmpB(kSize * kSize), tmpW(kSize * kSize);
@@ -342,30 +340,23 @@ namespace wxl_livingazeroth::fields
                     const float fromGround = c.groundHeat > 0.0f ? c.groundHeat * kHeatShare * (c.groundHeatTemp - temperature) : 0.0f;
                     c.temperature = temperature + (std::fabs(fromGround) > std::fabs(fromLiquid) ? fromGround : fromLiquid);
                     const float eq = Equilibrium(c, c.temperature, humidity);
-                    if (!c.started)
-                    {
-                        // Where rain-wetted ground would be by now: the zone's soak s is open, fully
-                        // absorbent ground's (1 - s = exp(-rain)); ground wetting at absorbency x open sky
-                        // of that rate is at 1 - (1 - eq) * (1 - s)^(absorbency * open). Same rule as the
-                        // step below, so ground arriving now matches ground that watched the rain.
-                        const float s = soak[b * kSize + a];
-                        c.value = c.submerged ? eq : 1.0f - (1.0f - eq) * std::pow(1.0f - (s < 0.999f ? s : 0.999f), c.absorbency * c.open);
-                        c.started = true;
-                    }
-                    // Rain by the share of the raining zone around this spot; drying for the rest. While
-                    // the player's zone catches up, its ground fast-forwards with it (by the same share).
+                    // The rain lives in the zone records (env/Regional: rain only in the player's zone,
+                    // catch-up, drying by each zone's climate); a spot follows the zones around it.
+                    // The zones' soak mix s is what open, fully absorbent ground would have gained
+                    // (1 - s = exp(-rain)); ground taking it at absorbency x open sky is at
+                    // 1 - (1 - eq) * (1 - s)^(absorbency * open), on top of its own equilibrium (rest,
+                    // water nearby, heat). One simulation, so the ground can't drift from its zone, and
+                    // the soak mix blends across zone borders.
+                    const float mix = soak[b * kSize + a];
                     const float rainShare = raining && c.open > 0.0f ? share[b * kSize + a] * c.open : 0.0f;
-                    const float dtCell = dt * (1.0f + (catchUpSpeed - 1.0f) * share[b * kSize + a]);
-                    if (c.submerged) c.value = c.liquidMoisture;
-                    else
-                    {
-                        const float warmth = c.temperature <= 0.0f ? 0.2f : 1.0f + c.temperature / 15.0f;
-                        const float rate = (1.0f + 2.0f * wind) * warmth * (1.0f - 0.7f * humidity) / kDrySeconds;
-                        const float k = rate * dtCell > 1.0f ? 1.0f : rate * dtCell;
-                        const float wetting = dtCell / kRainSeconds * weather.intensity * c.absorbency * (1.0f - c.value);
-                        c.value += rainShare * wetting + (1.0f - rainShare) * (eq - c.value) * k;
-                    }
+                    const float target = c.submerged ? c.liquidMoisture
+                                       : 1.0f - (1.0f - eq) * std::pow(1.0f - (mix < 0.999f ? mix : 0.999f), c.absorbency * c.open);
+                    const float before = c.value;
+                    if (!c.started) { c.value = target; c.started = true; }
+                    else c.value += (target - c.value) * (dt >= kFollowSeconds ? 1.0f : dt / kFollowSeconds); // eased, so nothing pops
                     c.value = Clamp01(c.value);
+                    c.lastShare = share[b * kSize + a]; c.lastSoak = mix; c.lastRain = rainShare;
+                    c.lastChange = c.value - before; c.lastDt = dt;
                     const float excess = c.value - c.rest;
                     g_excess[s] = static_cast<uint8_t>(Clamp01(excess) * 255.0f + 0.5f);
                     // The outer ring (8 cells) on dry land feeds the value used beyond the grid.
@@ -433,6 +424,8 @@ namespace wxl_livingazeroth::fields
         d.liquidHot = c->submerged ? c->liquidHot : c->nearHot;
         d.liquidTemperature = c->submerged ? c->liquidTemp : c->nearTemp;
         d.heat = c->heat;
+        d.zone = c->zone; d.zoneShare = c->lastShare; d.zoneSoakMix = c->lastSoak; d.rainShare = c->lastRain;
+        d.changePerSecond = c->lastDt > 0.0f ? c->lastChange / c->lastDt : 0.0f;
         d.hotShare = c->hotShare; d.hotTemperature = c->hotTemp;
         d.groundHeat = c->groundHeat; d.groundHeatTemperature = c->groundHeatTemp; d.groundHeatDistance = c->groundHeatDist;
         d.value = c->value;
@@ -441,6 +434,12 @@ namespace wxl_livingazeroth::fields
 
     const WetGrid& Wet() { return g_wet; }
     Stats GetStats() { Stats s = g_stats; s.rainSoak = regional::RainSoak(g_map, regional::PlayerZone()); return s; }
+
+    void Refill()
+    {
+        for (Cell& c : g_cells) c.filled = false;
+        g_fillCursor = 0;
+    }
 
     void Reset()
     {
