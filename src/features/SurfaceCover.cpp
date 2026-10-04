@@ -311,14 +311,31 @@ float2 Sample(float2 idx)
     return float2(tex2Dlod(baseTex, float4(uv, 0, 0)).r, tex2Dlod(coverTex, float4(uv, 0, 0)).r * Fade(idx));
 }
 
-float H(float2 idx) { float2 s = Sample(idx); return s.x + s.y; }
+float B(float2 idx) { return tex2Dlod(baseTex, float4((idx + 0.5) * grid.w, 0, 0)).r; }
+float C(float2 idx) { return tex2Dlod(coverTex, float4((idx + 0.5) * grid.w, 0, 0)).r * Fade(idx); }
+// Inside the level's filled area (its grid plus the 2-cell apron): beyond it the slots hold stale heights.
+float2 Inside(float2 idx) { return clamp(idx, lod.xy - lod.z - 2, lod.xy + lod.z + 2); }
 
-// step = neighbour distance for the normal in cells (2 = the coarser level's spacing)
+// step = neighbour distance for the normal in cells (2 = the coarser level's spacing).
+// The slope has two parts. The terrain's: the terrain is flat triangles (4 per 4.17 yd cell) and
+// shades itself with smooth vertex normals, so measured over 0.25 yd its slope jumps at every crease
+// and the lit cover shows the triangles -- it's measured over ~2.5 yd instead (the short step near
+// holes). The cover's own (drifts, trenches, rims): the fine step.
 void Vertex(float2 idx, float step, out float3 p, out float3 n, out float2 s)
 {
     s = Sample(idx);
     p = float3(idx * grid.z, s.x + s.y);
-    n = float3(H(idx - float2(step, 0)) - H(idx + float2(step, 0)), H(idx - float2(0, step)) - H(idx + float2(0, step)), 2 * step * grid.z);
+    float wide = max(step, floor(2.5 / grid.z));
+    float2 xa = Inside(idx - float2(wide, 0)), xb = Inside(idx + float2(wide, 0));
+    float2 ya = Inside(idx - float2(0, wide)), yb = Inside(idx + float2(0, wide));
+    float bxa = B(xa), bxb = B(xb), bya = B(ya), byb = B(yb);
+    float2 terrain;
+    [branch] if (min(min(bxa, bxb), min(bya, byb)) < -10000)
+        terrain = float2(B(idx - float2(step, 0)) - B(idx + float2(step, 0)), B(idx - float2(0, step)) - B(idx + float2(0, step))) / (2 * step * grid.z);
+    else
+        terrain = float2((bxa - bxb) / max(xb.x - xa.x, 1), (bya - byb) / max(yb.y - ya.y, 1)) / grid.z;
+    float2 cover = float2(C(idx - float2(step, 0)) - C(idx + float2(step, 0)), C(idx - float2(0, step)) - C(idx + float2(0, step))) / (2 * step * grid.z);
+    n = float3(terrain + cover, 1);
 }
 
 VOut main(float2 ij : POSITION)
