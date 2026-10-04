@@ -34,7 +34,7 @@ says why.
 | SurfaceCoverDepth | 1 | Your multiplier on the cover depth from `SurfaceCover.cdbc` (1 = as the table says). |
 | SurfaceCoverFillBudgetMs | 2 | Milliseconds per frame spent filling the cover around you (on login, teleports, moving). Lower = smoother, slower to appear. |
 | TerrainWetness | 1 | The terrain itself looks darker where the ground is wet (rain, water nearby). The client's own terrain shaders are patched for it when they're created. |
-| TerrainWetnessStrength | 0.45 | How much darker soaked terrain gets, 0..1. |
+| TerrainWetnessStrength | 0.45 | How much darker soaked ground gets, 0..1: the terrain and the surface cover alike. |
 | WindShelter | 1 | Roofs and overhangs shelter the ground below from wind. |
 | WindLee | 1 | Walls and cliffs cast a wind shadow on their downwind side. |
 | DebugWindArrows | 0 | Debug: draw the wind as arrows around the player. |
