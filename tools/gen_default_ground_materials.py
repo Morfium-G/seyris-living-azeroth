@@ -53,9 +53,10 @@ def selector(id, material_id, scope=GLOBAL, scope_id=0, texture="", effect=0, te
 
 
 def cover(id, material_id, cover_material=0, depth=I, max_slope=I, slope_fade=I, drift=I, breakup=I, rim=I, relax=I,
-          tint_color=0, tint_strength=I, cover_texture="", opacity=I, flatten=I, z_offset=I, wetness=I, flags=0):
+          tint_color=0, tint_strength=I, cover_texture="", opacity=I, flatten=I, z_offset=I, wetness=I, flags=0,
+          melt_kept=I, melt_gone=T):
     return (id, material_id, cover_material, depth, max_slope, slope_fade, drift, breakup, rim, relax,
-            tint_color, tint_strength, cover_texture, opacity, flatten, z_offset, wetness, flags)
+            tint_color, tint_strength, cover_texture, opacity, flatten, z_offset, wetness, flags, melt_kept, melt_gone)
 
 
 DEFAULT_MATERIALS = [

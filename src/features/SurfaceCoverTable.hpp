@@ -37,6 +37,10 @@ namespace wxl_livingazeroth::covertable
         uint32_t material = 0;         // the ground material (0 = none)
         uint32_t coverMaterial = 0;    // what lies on top: the row's CoverMaterial, else the ground material
         float    stiffness = 0.0f;     // the cover material's: 0 feet press it to the ground .. 1 rigid
+        // Painted snow melting (env/Snow.hpp): the share of the depth mild weather (up to 15 degC)
+        // melts it down to, and the degC at which it's gone completely.
+        float    meltKeptShare = 0.6f;
+        float    meltGoneTemperature = 25.0f;
     };
 
     /// Cover textures drawn at once: the slots go to the textures most present in view.
@@ -57,6 +61,17 @@ namespace wxl_livingazeroth::covertable
     /// material's row along its Parent chain. Fields no row sets keep the defaults above. Cached;
     /// Generation() changes on reload.
     Values Resolve(uint32_t areaId, int mapId, const char* texturePath, uint32_t groundEffectId, int terrainType);
+
+    // --- fallen snow (orchestration docs/r&d/immersion/regional-layer-and-snow.md, "Fallen snow") ---
+    /// Whether a cover material is snow: the fallback snow material (what the selectors give for
+    /// TerrainType 3 at this place, or globally) or a child of it.
+    bool IsSnow(uint32_t coverMaterial, uint32_t areaId, int mapId);
+
+    /// The look fallen snow takes on a terrain layer that has no painted cover: the layer's own row
+    /// if its CoverMaterial is snow (even with Depth 0), else the fallback snow's row (TerrainType 3
+    /// at this place, ignoring texture and ground effect), else built-in values. Its Depth means
+    /// nothing here; the fallen depth replaces it.
+    Values SnowLook(uint32_t areaId, int mapId, const char* texturePath, uint32_t groundEffectId, int terrainType);
 
     unsigned    RowCount();
     const char* Status();

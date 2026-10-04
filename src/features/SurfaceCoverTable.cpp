@@ -1,6 +1,7 @@
 #include "SurfaceCoverTable.hpp"
 
 #include "GroundMaterialTable.hpp"
+#include "../env/CdbcLoad.hpp"
 #include "../wxl_seyris/CdbcApi.hpp"
 
 #include <cstdio>
@@ -33,8 +34,10 @@ namespace wxl_livingazeroth::covertable
             {"ZOffset",        15, WXL_CDBC_FIELD_VALUE},
             {"Wetness",        16, WXL_CDBC_FIELD_VALUE},
             {"Flags",          17, WXL_CDBC_FIELD_VALUE},
+            {"MeltKeptShare",       18, WXL_CDBC_FIELD_VALUE}, // appended: older files without them still load
+            {"MeltGoneTemperature", 19, WXL_CDBC_FIELD_VALUE}, // appended; signed (-1000 inherits)
         };
-        constexpr WXL_SeyrisCdbcDefinition kDef = { "SurfaceCover", kFile, kFields, 18 };
+        constexpr WXL_SeyrisCdbcDefinition kDef = { "SurfaceCover", kFile, kFields, 20 };
 
         // The reader accepts files with more columns than a definition names, so an older 21-column
         // SurfaceCover.cdbc (place keys in the table itself) would load as garbage under this layout.
@@ -45,15 +48,24 @@ namespace wxl_livingazeroth::covertable
         // The float fields that inherit with -1, in Values order. TintStrength carries TintColor
         // with it: the row that decides the strength also decides the colour. Depth carries Flags
         // the same way (0 is a valid Flags value, so it can't inherit on its own).
-        enum Field { kDepth, kMaxSlope, kSlopeFade, kDrift, kBreakup, kRim, kRelax, kTint, kZOffset, kWetness, kFieldCount };
+        enum Field { kDepth, kMaxSlope, kSlopeFade, kDrift, kBreakup, kRim, kRelax, kTint, kZOffset, kWetness,
+                     kMeltKept, kMeltGone, kFieldCount };
         constexpr const char* kFloatColumns[kFieldCount] = {
             "Depth", "MaxSlope", "SlopeFade", "DriftNoise", "EdgeBreakup", "Rim", "RelaxSeconds", "TintStrength",
-            "ZOffset", "Wetness",
+            "ZOffset", "Wetness", "MeltKeptShare", "MeltGoneTemperature",
         };
+        // What a column reads as when the file is too old to have it: "not set".
+        constexpr float kMissing[kFieldCount] = { -1, -1, -1, -1, -1, -1, -1, -1, -1000, -1, -1, -1000 };
 
         // Whether a row sets field f. ZOffset is signed: -1000 and below inherit (the rule for every
         // signed column), and so does exactly -1 (what older files and the v3 converter wrote).
-        bool IsSet(int f, float v) { return f == kZOffset ? (v != -1.0f && v > -1000.0f) : v >= 0.0f; }
+        // MeltGoneTemperature is signed too.
+        bool IsSet(int f, float v)
+        {
+            if (f == kZOffset) return v != -1.0f && v > -1000.0f;
+            if (f == kMeltGone) return v > -1000.0f;
+            return v >= 0.0f;
+        }
 
         struct Row
         {
@@ -72,8 +84,6 @@ namespace wxl_livingazeroth::covertable
         std::unordered_map<uint32_t, Values> g_cache;  // by MaterialID, resolved
         std::string g_status = "not loaded yet";
         uint32_t    g_generation = 1;
-
-        float BitsToFloat(uint32_t b) { float f; std::memcpy(&f, &b, sizeof(f)); return f; }
 
         std::string Normalize(const char* path)
         {
@@ -126,6 +136,8 @@ namespace wxl_livingazeroth::covertable
             if (set[kTint])      { v.tintStrength = value[kTint]; v.tintColor = tint; }
             if (set[kZOffset])   v.zOffset = value[kZOffset];
             if (set[kWetness])   v.wetness = value[kWetness] > 1.0f ? 1.0f : value[kWetness];
+            if (set[kMeltKept])  v.meltKeptShare = value[kMeltKept] > 1.0f ? 1.0f : value[kMeltKept];
+            if (set[kMeltGone])  v.meltGoneTemperature = value[kMeltGone];
             if (cover > 0)       v.coverTexture = cover;
             // What lies on top is the cover's own material; without one it's the ground's. Its
             // stiffness decides how far feet press the cover down.
@@ -156,7 +168,7 @@ namespace wxl_livingazeroth::covertable
             return;
         }
         err[0] = 0;
-        void* table = cdbc->Load(&kDef, err, sizeof(err));
+        void* table = cdbcload::LoadAppendOnly(cdbc, kDef, err, sizeof(err));
         if (!table)
         {
             g_status = std::string("no rows (") + err + ")";
@@ -170,7 +182,7 @@ namespace wxl_livingazeroth::covertable
             const void* rec = cdbc->RowAt(table, i);
             if (!rec) continue;
             Row r;
-            for (int f = 0; f < kFieldCount; ++f) r.value[f] = BitsToFloat(cdbc->Value(table, rec, kFloatColumns[f], 0));
+            for (int f = 0; f < kFieldCount; ++f) r.value[f] = cdbcload::Float(cdbc, table, rec, kFloatColumns[f], kMissing[f]);
             r.tintColor = cdbc->Value(table, rec, "TintColor", 0);
             r.flags = cdbc->Value(table, rec, "Flags", 0);
             r.coverMaterial = cdbc->Value(table, rec, "CoverMaterial", 0);
@@ -216,5 +228,29 @@ namespace wxl_livingazeroth::covertable
         const uint32_t material = materials::Select(areaId, mapId, texturePath, groundEffectId, terrainType);
         if (!material) return Values{};
         return ForMaterial(material);
+    }
+
+    bool IsSnow(uint32_t coverMaterial, uint32_t areaId, int mapId)
+    {
+        if (!coverMaterial) return false;
+        constexpr int kSnowTerrainType = 3;
+        const uint32_t global = materials::Select(0, -1, nullptr, 0, kSnowTerrainType);
+        const uint32_t local = materials::Select(areaId, mapId, nullptr, 0, kSnowTerrainType);
+        if (!global && !local) return false;
+        bool snow = false;
+        materials::ForChain(coverMaterial, [&](uint32_t id)
+        {
+            if (id == global || id == local) { snow = true; return false; }
+            return true;
+        });
+        return snow;
+    }
+
+    Values SnowLook(uint32_t areaId, int mapId, const char* texturePath, uint32_t groundEffectId, int terrainType)
+    {
+        const Values own = Resolve(areaId, mapId, texturePath, groundEffectId, terrainType);
+        if (own.material && IsSnow(own.coverMaterial, areaId, mapId)) return own;
+        if (const uint32_t fallback = materials::Select(areaId, mapId, nullptr, 0, 3)) return ForMaterial(fallback);
+        return Values{};
     }
 }
