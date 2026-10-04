@@ -1,0 +1,6 @@
+## Interface: 30300
+## Title: Living Azeroth: Climate
+## Notes: Temperature, humidity and weather under the minimap clock (example for the wxl-seyris-living-azeroth Lua functions).
+## Author: Seyri
+## Version: 1
+LivingAzerothClimate.lua

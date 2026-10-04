@@ -31,6 +31,8 @@
 #include "features/GrassPerf.hpp"
 #include "features/SurfaceCover.hpp"
 #include "features/TerrainWetness.hpp"
+#include "lua/EnvironmentLua.hpp"
+#include "lua/LuaApi.hpp"
 #include "render/PostAA.hpp"
 #include "render/SceneDepth.hpp"
 #include "render/ShaderPatch.hpp"
@@ -131,6 +133,10 @@ int __cdecl WXL_Load(const WXL_Api* api)
 
     // Surface cover spike: draws at the end of the world scene (before anti-aliasing's pass).
     wxl_livingazeroth::cover::Install(api);
+
+    // Read-only addon functions (docs/lua-api.md): registered with every script context the client builds.
+    wxl_livingazeroth::envlua::Register();
+    wxl_livingazeroth::luaapi::Install(api);
 
     // Anti-aliasing subscribes before the debug overlays, so it runs first and they stay sharp on top.
     wxl_livingazeroth::postaa::Install(api);
