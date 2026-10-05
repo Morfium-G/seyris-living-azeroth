@@ -247,6 +247,8 @@ namespace wxl_livingazeroth::debug
             g_api->UiSliderFloat("models within (yd)", &g_range, 3.0f, 60.0f);
             const std::vector<ModelInfo> models = NearbyModels(s);
             const ModelInfo* selected = nullptr;
+            std::snprintf(line, sizeof(line), "%u different model(s) within %.0f yd", static_cast<unsigned>(models.size()), g_range);
+            g_api->UiText(line);
             if (g_api->UiCollapsingHeader("Models near you"))
             {
                 char label[64];
@@ -265,9 +267,15 @@ namespace wxl_livingazeroth::debug
                 if (models.empty()) g_api->UiText("(no placed models within range)");
             }
             for (const ModelInfo& m : models) if (lt::Normalize(m.path) == g_selected) selected = &m;
+            // Out of range (teleported, walked away): drop the selection instead of staying stuck on it.
+            if (!selected && !g_selected.empty())
+            {
+                std::snprintf(g_message, sizeof(g_message), "selection cleared: %s is no longer within %.0f yd", g_selected.c_str(), g_range);
+                g_selected.clear();
+            }
 
             g_api->UiSeparator();
-            if (!selected) g_api->UiTextWrapped(g_selected.empty() ? "Select a model above to add lights to it." : "The selected model isn't within range any more.");
+            if (!selected) g_api->UiTextWrapped("Select a model above to add lights to it.");
             else
             {
                 std::snprintf(line, sizeof(line), "Selected: %s", selected->path.c_str()); g_api->UiTextWrapped(line);
