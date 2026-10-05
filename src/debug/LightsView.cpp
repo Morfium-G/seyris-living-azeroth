@@ -3,8 +3,11 @@
 #include "../env/Lights.hpp"
 #include "../env/WorldQuery.hpp"
 #include "../features/DoodadLightTable.hpp"
+#include "../features/ModelLights.hpp"
 #include "../features/TerrainLights.hpp"
 #include "../features/TerrainWetness.hpp"
+#include "../render/M2Effects.hpp"
+#include "ShaderDump.hpp"
 
 #include "game/Doodad.hpp"
 
@@ -209,17 +212,33 @@ namespace wxl_livingazeroth::debug
             g_api->UiSliderFloat("merge lights closer than (yd)", &cfg.mergeDistance, 0.0f, 3.0f);
             g_api->UiSliderFloat("flicker (how much a flame's light dips)", &cfg.flicker, 0.0f, 0.8f);
             g_api->UiSliderFloat("flicker speed", &cfg.flickerSpeed, 0.1f, 4.0f);
+            g_api->UiCheckbox("our lights on models too (M2s, WMOs; per vertex)", &cfg.models);
+            g_api->UiCheckbox("models: replace the client's up to 4 lights (off = add ours to them)", &cfg.modelStockOff);
+            {
+                static const char* const kViews[] = { "off", "our lights only", "count check (flat red)", "world stripes (must not move)" };
+                g_api->UiCombo("models: debug view", &modellights::DebugView(), kViews, 4);
+                g_api->UiCheckbox("models: probe the light texture at every model draw", &modellights::Probe());
+                const std::string probe = modellights::ProbeLine();
+                g_api->UiTextWrapped(probe.c_str());
+                if (g_api->UiButton("Copy model-light status##mlcopy"))
+                    CopyToClipboard(std::string(modellights::StatusLine()) + "\r\n" + probe + "\r\n");
+            }
             const lights::Stats ls = lights::GetStats();
             char head[320];
             std::snprintf(head, sizeof(head), "DoodadLightProperties / DoodadLightAssignment: %s%s; in range: %u table light(s), %u model(s) with their own lights suppressed, %u attachment(s) not found (at the origin instead)",
                           lighttable::Status(), lighttable::Dirty() ? " (edited, not saved)" : "", ls.tableLights, ls.suppressedModels, ls.attachFallbacks);
             g_api->UiTextWrapped(head);
             if (g_api->UiButton("Reload light tables from disk")) lighttable::Load(g_cdbc);
+            // Research for M2 receivers: the M2 shaders the client has loaded so far.
+            std::snprintf(head, sizeof(head), "Dump M2 shaders (%u effect(s) loaded; Logs\\living-azeroth)",
+                          static_cast<unsigned>(m2effects::Effects().size()));
+            if (g_api->UiButton(head)) DumpM2Shaders(g_api);
             std::snprintf(head, sizeof(head), "our lights: %u models in the scene, %u in range (scan %.2f ms), %u model lights (%u placed by the client, %u via the world matrix, %u with the file's colour), %u in range, %u merged, %u drawn (max %d)",
                           ls.models, ls.modelsInRange, ls.scanMs, ls.modelLights, ls.fromClient, ls.fromWorldMatrix, ls.fileColor,
                           ls.inRange, ls.merged, ls.active, lights::kMaxLights);
             g_api->UiTextWrapped(head);
             g_api->UiTextWrapped(terrainlights::StatusLine());
+            g_api->UiTextWrapped(modellights::StatusLine());
             g_api->UiTextWrapped(terrainwet::StatusLine());
             g_api->UiSeparator();
 

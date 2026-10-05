@@ -40,6 +40,9 @@ namespace wxl_livingazeroth::shaderpatch
         /// Edits the disassembly in place. False = leave this shader stock (`why` says why: a variant
         /// the patch doesn't apply to is skipped, not failed).
         std::function<bool(std::string& source, std::string& why)> edit;
+        /// Instead of fixed tables: whether a wrapper belongs to this rule (tables that live in heap
+        /// objects, known only once the client builds them). Used when set.
+        std::function<bool(const void* wrapper)> contains = nullptr;
     };
 
     struct RuleStatus

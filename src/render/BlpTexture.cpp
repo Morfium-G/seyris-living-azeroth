@@ -3,6 +3,7 @@
 #include "game/Io.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -90,45 +91,70 @@ namespace wxl_livingazeroth::blp
         if (h.hasMips)
             while (mips < 16 && h.mipOffset[mips] && h.mipSize[mips]) ++mips;
 
-        IDirect3DTexture9* tex = nullptr;
-        if (FAILED(dev->CreateTexture(h.width, h.height, mips, 0, format, D3DPOOL_MANAGED, &tex, nullptr)) || !tex)
-        { error = "CreateTexture failed"; return nullptr; }
-
-        std::vector<uint32_t> expanded;
-        for (UINT m = 0; m < mips; ++m)
+        // A level that can't be locked (seen on a tester's setup, likely a D3D9 translation layer) ends
+        // the chain there: the texture is created again with only the levels before it. Level 0 failing
+        // is an error, with the details for the log.
+        for (;;)
         {
-            const uint32_t w = h.width >> m ? h.width >> m : 1, hh = h.height >> m ? h.height >> m : 1;
-            const uint32_t offset = h.mipOffset[m], size = h.mipSize[m];
-            if (!size || offset + static_cast<size_t>(size) > file.size()) { tex->Release(); error = "mip data out of range"; return nullptr; }
-            const uint8_t* src = file.data() + offset;
+            IDirect3DTexture9* tex = nullptr;
+            const HRESULT created = dev->CreateTexture(h.width, h.height, mips, 0, format, D3DPOOL_MANAGED, &tex, nullptr);
+            if (FAILED(created) || !tex)
+            {
+                char b[128];
+                std::snprintf(b, sizeof(b), "CreateTexture failed (hr 0x%08X, %ux%u, %u levels, format 0x%X)",
+                              static_cast<unsigned>(created), h.width, h.height, mips, static_cast<unsigned>(format));
+                error = b;
+                return nullptr;
+            }
 
-            D3DLOCKED_RECT lr{};
-            if (FAILED(tex->LockRect(m, &lr, nullptr, 0))) { tex->Release(); error = "LockRect failed"; return nullptr; }
-            if (block)
+            std::vector<uint32_t> expanded;
+            bool retry = false;
+            for (UINT m = 0; m < mips; ++m)
             {
-                const uint32_t rowBytes = ((w + 3) / 4) * block, rows = (hh + 3) / 4;
-                for (uint32_t r = 0; r < rows; ++r)
+                const uint32_t w = h.width >> m ? h.width >> m : 1, hh = h.height >> m ? h.height >> m : 1;
+                const uint32_t offset = h.mipOffset[m], size = h.mipSize[m];
+                if (!size || offset + static_cast<size_t>(size) > file.size()) { tex->Release(); error = "mip data out of range"; return nullptr; }
+                const uint8_t* src = file.data() + offset;
+
+                D3DLOCKED_RECT lr{};
+                const HRESULT locked = tex->LockRect(m, &lr, nullptr, 0);
+                if (FAILED(locked))
                 {
-                    const size_t from = static_cast<size_t>(r) * rowBytes;
-                    if (from + rowBytes > size) break;
-                    std::memcpy(static_cast<uint8_t*>(lr.pBits) + r * lr.Pitch, src + from, rowBytes);
+                    tex->Release();
+                    if (m > 0) { mips = m; retry = true; break; }
+                    char b[128];
+                    std::snprintf(b, sizeof(b), "LockRect failed (hr 0x%08X, level 0 of %u, %ux%u, format 0x%X)",
+                                  static_cast<unsigned>(locked), mips, h.width, h.height, static_cast<unsigned>(format));
+                    error = b;
+                    return nullptr;
                 }
-            }
-            else
-            {
-                const uint32_t* pixels = reinterpret_cast<const uint32_t*>(src);
-                if (h.compression == 1)
+                if (block)
                 {
-                    expanded.resize(static_cast<size_t>(w) * hh);
-                    ExpandPalette(h, src, size, w, hh, expanded.data());
-                    pixels = expanded.data();
+                    const uint32_t rowBytes = ((w + 3) / 4) * block, rows = (hh + 3) / 4;
+                    for (uint32_t r = 0; r < rows; ++r)
+                    {
+                        const size_t from = static_cast<size_t>(r) * rowBytes;
+                        if (from + rowBytes > size) break;
+                        std::memcpy(static_cast<uint8_t*>(lr.pBits) + r * lr.Pitch, src + from, rowBytes);
+                    }
                 }
-                else if (size < static_cast<size_t>(w) * hh * 4) { tex->UnlockRect(m); tex->Release(); error = "short BGRA mip"; return nullptr; }
-                for (uint32_t r = 0; r < hh; ++r)
-                    std::memcpy(static_cast<uint8_t*>(lr.pBits) + r * lr.Pitch, pixels + static_cast<size_t>(r) * w, w * 4);
+                else
+                {
+                    const uint32_t* pixels = reinterpret_cast<const uint32_t*>(src);
+                    if (h.compression == 1)
+                    {
+                        expanded.resize(static_cast<size_t>(w) * hh);
+                        ExpandPalette(h, src, size, w, hh, expanded.data());
+                        pixels = expanded.data();
+                    }
+                    else if (size < static_cast<size_t>(w) * hh * 4) { tex->UnlockRect(m); tex->Release(); error = "short BGRA mip"; return nullptr; }
+                    for (uint32_t r = 0; r < hh; ++r)
+                        std::memcpy(static_cast<uint8_t*>(lr.pBits) + r * lr.Pitch, pixels + static_cast<size_t>(r) * w, w * 4);
+                }
+                tex->UnlockRect(m);
             }
-            tex->UnlockRect(m);
+            if (retry) continue;
+            return tex;
         }
-        return tex;
     }
 }

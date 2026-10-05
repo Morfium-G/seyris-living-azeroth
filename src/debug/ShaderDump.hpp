@@ -14,4 +14,8 @@ namespace wxl_livingazeroth::debug
     /// Same for the terrain shaders: the "Terrain" vertex shaders and every terrain pixel-shader
     /// table (Terrain0, Terrain0_env, Terrain1/1w, Terrain2, Terrain3 and their PCF variants).
     int DumpTerrainShaders(const WXL_Api* api);
+
+    /// Same for every M2 shader effect loaded so far (render/M2Effects): "m2vs_<name>_<slot>" and
+    /// "m2ps_<name>_<slot>", plus one summary line per effect in the log.
+    int DumpM2Shaders(const WXL_Api* api);
 }

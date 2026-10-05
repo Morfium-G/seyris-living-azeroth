@@ -34,10 +34,12 @@
 #include "features/GrassInstanced.hpp"
 #include "features/GrassMotion.hpp"
 #include "features/GrassPerf.hpp"
+#include "features/ModelLights.hpp"
 #include "features/SurfaceCover.hpp"
 #include "features/TerrainWetness.hpp"
 #include "lua/EnvironmentLua.hpp"
 #include "lua/LuaApi.hpp"
+#include "render/M2Effects.hpp"
 #include "render/PostAA.hpp"
 #include "render/SceneDepth.hpp"
 #include "render/ShaderPatch.hpp"
@@ -89,6 +91,7 @@ namespace
         wxl_livingazeroth::grassperf::OnFrameEnd();
         wxl_livingazeroth::grassinst::OnFrameEnd();
         wxl_livingazeroth::depth::Update();
+        wxl_livingazeroth::modellights::EndFrame();
     }
 
     // Once per frame, main thread: refresh the world snapshot, then everything that reads it.
@@ -139,7 +142,11 @@ int __cdecl WXL_Load(const WXL_Api* api)
     // Features register their shader patches first; the single create hook goes in after.
     wxl_livingazeroth::grass::Install(api);
     wxl_livingazeroth::terrainwet::Register();
+    wxl_livingazeroth::modellights::Register();
     wxl_livingazeroth::shaderpatch::Install(api);
+    wxl_livingazeroth::modellights::InstallProbe(api);
+    // Records the M2 shader effects as the client loads them (research: dumps; later M2 patches).
+    wxl_livingazeroth::m2effects::Install(api);
 
     // Surface cover spike: draws at the end of the world scene (before anti-aliasing's pass).
     wxl_livingazeroth::cover::Install(api);

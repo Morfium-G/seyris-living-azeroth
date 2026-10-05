@@ -1,5 +1,7 @@
 #include "ShaderDump.hpp"
 
+#include "../render/M2Effects.hpp"
+
 #include "game/Shader.hpp"
 #include "offsets/game/GroundEffect.hpp"
 
@@ -7,6 +9,7 @@
 #include <d3dcompiler.h>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace wxl_livingazeroth::debug
@@ -238,5 +241,50 @@ namespace wxl_livingazeroth::debug
     int DumpTerrainShaders(const WXL_Api* api)
     {
         return DumpTables(api, kTerrainTables, sizeof(kTerrainTables) / sizeof(kTerrainTables[0]));
+    }
+
+    int DumpM2Shaders(const WXL_Api* api)
+    {
+        namespace fx = m2effects;
+        const std::vector<fx::Effect>& effects = fx::Effects();
+
+        // One summary line per effect: how many slots are filled and with which shader model.
+        for (size_t k = 0; k < effects.size(); ++k)
+        {
+            const fx::Effect& e = effects[k];
+            int filled[2] = {};
+            uint32_t token[2] = {};
+            for (int pixel = 0; pixel < 2; ++pixel)
+            {
+                const uintptr_t table = e.object + (pixel ? fx::kPixelTable : fx::kVertexTable);
+                const int entries = pixel ? fx::kPixelEntries : fx::kVertexEntries;
+                for (int i = 0; i < entries; ++i)
+                {
+                    uintptr_t wrapper = 0, ptr = 0, version = 0;
+                    if (!SafeReadPtr(reinterpret_cast<void*>(table + i * 4), wrapper) || !IsShaderWrapper(wrapper, pixel != 0)) continue;
+                    ++filled[pixel];
+                    if (!token[pixel] && SafeReadPtr(reinterpret_cast<void*>(wrapper + sh::off::kCgxShaderBytePtr), ptr)
+                        && SafeReadPtr(reinterpret_cast<void*>(ptr), version))
+                        token[pixel] = static_cast<uint32_t>(version);
+                }
+            }
+            api->Log(WXL_LOG_INFO, kTag, "m2 effect %u: %s (%d of %d vertex, first 0x%08X) + %s (%d of %d pixel, first 0x%08X)",
+                     static_cast<unsigned>(k + 1), e.vertexName.c_str(), filled[0], fx::kVertexEntries, token[0],
+                     e.pixelName.c_str(), filled[1], fx::kPixelEntries, token[1]);
+        }
+
+        // The files are named by shader name, not effect: effects sharing a set write the same files.
+        std::vector<std::string> names;
+        names.reserve(effects.size() * 2);
+        std::vector<Table> tables;
+        for (const fx::Effect& e : effects)
+        {
+            names.push_back("m2vs_" + e.vertexName);
+            tables.push_back({ names.back().c_str(), e.object + fx::kVertexTable, fx::kVertexEntries, false });
+            names.push_back("m2ps_" + e.pixelName);
+            tables.push_back({ names.back().c_str(), e.object + fx::kPixelTable, fx::kPixelEntries, true });
+        }
+        api->Log(WXL_LOG_INFO, kTag, "shader dump: %u M2 effect(s) recorded.", static_cast<unsigned>(effects.size()));
+        return tables.empty() ? 0 : DumpTables(api, tables.data(), tables.size());
     }
 }

@@ -8,6 +8,7 @@
 #include "../env/TerrainHeight.hpp"
 #include "../render/BlpTexture.hpp"
 #include "../render/MoistureTexture.hpp"
+#include "ModelLights.hpp"
 #include "TerrainLights.hpp"
 #include "TerrainWetness.hpp"
 #include "GrassPerf.hpp"
@@ -1762,6 +1763,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             if (oldDepth) oldDepth->Release();
             saved->Apply(); // includes the viewport
             saved->Release();
+            // Vertex sampler 0 holds the model lights' list for any M2/WMO drawn after us.
+            modellights::Rebind(dev);
             g_drawMs = grassperf::Now() - t0;
             g_inactive = nullptr;
         }

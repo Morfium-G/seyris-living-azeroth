@@ -48,6 +48,7 @@ namespace wxl_livingazeroth::shaderpatch
 
         bool InTables(const TableRule& r, const void* wrapper)
         {
+            if (r.contains) return r.contains(wrapper);
             for (const auto& t : r.tables)
                 for (int i = 0; i < t.second; ++i)
                     if (reinterpret_cast<void* const*>(t.first)[i] == wrapper) return true;

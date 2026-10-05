@@ -63,6 +63,8 @@ namespace wxl_livingazeroth::lights
         float mergeDistance = 1.0f;  // yd: closer lights merge
         float flicker = 0.15f;       // 0..1: how much a flame's light dips (each light its own phase)
         float flickerSpeed = 1.0f;   // x the default pace (~3 dips a second)
+        int   models = 1;            // our lights on M2s and WMOs too (per vertex, like their stock lights)
+        int   modelStockOff = 1;     // ... replacing the client's up to 4 per model (else added to them)
     };
     Settings& Config();
 

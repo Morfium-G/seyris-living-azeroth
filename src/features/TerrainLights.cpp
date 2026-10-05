@@ -1,5 +1,6 @@
 #include "TerrainLights.hpp"
 
+#include "ModelLights.hpp"
 #include "TerrainWetness.hpp"
 #include "../env/Lights.hpp"
 
@@ -220,6 +221,9 @@ namespace wxl_livingazeroth::terrainlights
         }
         c[0] = static_cast<float>(g_drawn);
         device->SetPixelShaderConstantF(kConstant, c, 1);
+        // The same list for the M2s and WMOs drawn after the terrain (their own texture, read in
+        // their vertex shaders).
+        modellights::Prepare(device);
         // Ours replace the client's 3 per chunk only while they're actually drawn.
         g_stockOff = on;
         const float stock[4] = { on ? 0.0f : 1.0f, 0.0f, 0.0f, 0.0f };
