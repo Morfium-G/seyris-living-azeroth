@@ -61,6 +61,8 @@ namespace wxl_livingazeroth::lights
         float brightness = 1.0f;     // x the client's colour
         float range = 150.0f;        // yd from the camera: no lights beyond, fading over the last third
         float mergeDistance = 1.0f;  // yd: closer lights merge
+        float flicker = 0.15f;       // 0..1: how much a flame's light dips (each light its own phase)
+        float flickerSpeed = 1.0f;   // x the default pace (~3 dips a second)
     };
     Settings& Config();
 

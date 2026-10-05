@@ -215,6 +215,18 @@ namespace wxl_livingazeroth::lights
         }
 
         struct Candidate { float pos[3]; float color[3]; float weight; };
+
+        double g_time = 0.0;
+
+        // Flame flicker, 0..1: three sines at unrelated rates (no visible repeat), each light its own
+        // phase from its position so neighbouring torches don't pulse together.
+        float Flicker(const float pos[3], double time)
+        {
+            const double phase = std::fmod(std::fabs(pos[0] * 12.9898 + pos[1] * 78.233 + pos[2] * 37.719), 1000.0);
+            const double t = time + phase;
+            const double s = 0.5 * std::sin(t * 7.13) + 0.3 * std::sin(t * 13.71 + 1.3) + 0.2 * std::sin(t * 23.17 + 2.1);
+            return static_cast<float>(0.5 + 0.5 * s);
+        }
     }
 
     Settings& Config() { return g_settings; }
@@ -230,6 +242,7 @@ namespace wxl_livingazeroth::lights
 
         g_scanTime += dt;
         if (g_scanTime >= kScanSeconds) { g_scanTime = 0.0f; ScanDoodads(eye); }
+        g_time += dt * g_settings.flickerSpeed;
 
         // This frame's lights: the client's current values where it has them.
         std::vector<Candidate> cands;
@@ -300,9 +313,10 @@ namespace wxl_livingazeroth::lights
             const Candidate& c = cands[order[n].second];
             const float d = std::sqrt(order[n].first);
             const float fade = d <= fadeStart ? 1.0f : std::max(0.0f, 1.0f - (d - fadeStart) / (range - fadeStart));
+            const float flicker = 1.0f - g_settings.flicker * Flicker(c.pos, g_time);
             ActiveLight l{};
             std::memcpy(l.pos, c.pos, sizeof(l.pos));
-            for (int k = 0; k < 3; ++k) l.color[k] = c.color[k] * g_settings.brightness * fade;
+            for (int k = 0; k < 3; ++k) l.color[k] = c.color[k] * g_settings.brightness * fade * flicker;
             l.radius = g_settings.radius;
             g_active.push_back(l);
         }
