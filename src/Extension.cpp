@@ -22,6 +22,7 @@
 #include "env/Actors.hpp"
 #include "env/Climate.hpp"
 #include "env/Fields.hpp"
+#include "env/Lights.hpp"
 #include "env/Regional.hpp"
 #include "env/Wind.hpp"
 #include "env/WorldQuery.hpp"
@@ -97,6 +98,7 @@ namespace
         if (snap.inWorld)
             wxl_livingazeroth::actors::Refresh(snap.playerPos, wxl_livingazeroth::grass::kActorRange);
         wxl_livingazeroth::fields::Update(dt, snap);
+        wxl_livingazeroth::lights::Update(dt, snap);
         wxl_livingazeroth::cover::Update(dt, snap);
     }
 

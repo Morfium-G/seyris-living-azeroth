@@ -5,6 +5,8 @@
 // Read only; nothing here changes the client's lighting.
 #pragma once
 
+#include "WorldQuery.hpp"
+
 #include <cstdint>
 #include <vector>
 
@@ -41,4 +43,41 @@ namespace wxl_livingazeroth::lights
 
     /// The distance at which 1 / (a + b d + c d^2) drops to `share` of its value at 1 yd (-1 if never).
     float Reach(const float attenuation[3], float share);
+
+    // --- our light list (point-lights-design.md) ------------------------------------------------
+    // Built from the placed doodads near the player, not from the scene grid (the grid only holds
+    // lights of models in view). Per model light: the position the client last gave it, or (never
+    // placed: the model hasn't been in view) its file position through the doodad's world matrix;
+    // its colour from the client, or the file's first diffuse colour x intensity. Lights closer than
+    // the merge distance merge (Blizzard's torch groups); the nearest kMaxLights to the camera are
+    // used, fading out toward the range.
+
+    constexpr int kMaxLights = 24;
+
+    struct Settings
+    {
+        int   enabled = 1;           // our lights on the cover (and later the terrain)
+        float radius = 16.0f;        // yd: the light is exactly 0 here (stock lights reach ~13 yd to 5%)
+        float brightness = 1.0f;     // x the client's colour
+        float range = 150.0f;        // yd from the camera: no lights beyond, fading over the last third
+        float mergeDistance = 1.0f;  // yd: closer lights merge
+    };
+    Settings& Config();
+
+    /// One light as the renderers get it: world position, colour (already x brightness x fade), radius.
+    struct ActiveLight { float pos[3]; float color[3]; float radius; };
+
+    /// Every few frames: rescan the doodads (they don't move), refresh positions and colours.
+    void Update(float dt, const world::Snapshot& snap);
+
+    /// The lights to draw this frame, nearest first (at most kMaxLights).
+    const std::vector<ActiveLight>& Active();
+
+    struct Stats
+    {
+        unsigned chunks = 0, doodads = 0, modelLights = 0, fromClient = 0, fromWorldMatrix = 0,
+                 fileColor = 0, merged = 0, inRange = 0, active = 0;
+        double   scanMs = 0.0;
+    };
+    Stats GetStats();
 }

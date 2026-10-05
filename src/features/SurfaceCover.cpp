@@ -3,6 +3,7 @@
 #include "../env/Actors.hpp"
 #include "../env/Climate.hpp"
 #include "../env/Fields.hpp"
+#include "../env/Lights.hpp"
 #include "../env/Regional.hpp"
 #include "../env/TerrainHeight.hpp"
 #include "../render/BlpTexture.hpp"
@@ -327,6 +328,8 @@ float4 look : register(c13);
 float4 farMap : register(c14);   // 1 / chunk size, map size, 1 / map size, on
 float4 farBox : register(c15);   // the far map's box, world yd (min x, min y, max x, max y)
 float4 farMisc : register(c16);  // x = the value outside that box
+float4 pointInfo : register(c17);   // x = point lights in use (env/Lights)
+float4 points[48] : register(c20);  // per light: (view-space position, 1 / radius), (colour, 0)
 sampler2D baseTex : register(s0);
 sampler2D coverTex : register(s1);
 sampler2D lookTex : register(s2);
@@ -347,7 +350,33 @@ float FarAt(float2 w)
     return lerp(farMisc.x, v, inside);
 }
 
-struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1; float2 rel : TEXCOORD2; float fog : TEXCOORD3; float4 tint : TEXCOORD4; float2 wuv : TEXCOORD5; float3 vpos : TEXCOORD6; float far : TEXCOORD7; };
+struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1; float2 rel : TEXCOORD2; float fog : TEXCOORD3; float4 tint : TEXCOORD4; float2 wuv : TEXCOORD5; float3 vpos : TEXCOORD6; float far : TEXCOORD7; float3 lamps : TEXCOORD8; };
+
+// Point lights (torches; env/Lights) at a view-space position with a view-space unit normal:
+// colour x a falloff like the client's 1 / (0.7 d + 0.03 d^2), windowed to exactly 0 at the
+// light's radius. The light has a size (~1 yd, like a flame): the falloff uses sqrt(d^2 + 1), so
+// right under it it tops out at the client's value at 1 yd instead of a hot spot with a hard edge
+// (a torch flame ends up just above deep snow). Wrapped Lambert ((N.L + 0.5) / 1.5), so a low light
+// still lights the surface around it, not just at grazing angles. Per vertex: the cover's mesh is
+// dense (0.25 yd near the player), and pixel shaders can't index constants.
+float3 Lamps(float3 vp, float3 nv)
+{
+    float3 sum = 0;
+    [loop] for (int k = 0; k < 24; ++k)
+    {
+        if (k >= pointInfo.x) break;
+        float4 p = points[k * 2], col = points[k * 2 + 1];
+        float3 dv = p.xyz - vp;
+        float d2 = dot(dv, dv);
+        float d = sqrt(d2);
+        float t = saturate(d * p.w);
+        float win = 1 - t * t;
+        float de = sqrt(d2 + 1);
+        float wrap = saturate((dot(nv, dv / max(d, 0.001)) + 0.5) / 1.5);
+        sum += col.rgb * (win * win) * wrap / (de * (0.7 + 0.03 * de));
+    }
+    return sum;
+}
 
 float4 Tint(float2 idx) { return look.x > 0.5 ? tex2Dlod(lookTex, float4((idx + 0.5) * grid.w, 0, 0)) : 0; }
 
@@ -431,6 +460,7 @@ VOut main(float2 ij : POSITION)
     o.vpos = q.x * vr0.xyz + q.y * vr1.xyz + q.z * vr2.xyz;
     float viewZ = o.vpos.z;
     o.fog = min(pow(max(viewZ * fogp.x + fogp.y, 0), fogp.z), 1);
+    o.lamps = pointInfo.x > 0 ? Lamps(o.vpos, normalize(o.n)) : 0;
     o.d = float2(s.y, s.x < -10000 ? 1 : 0);
     return o;
 }
@@ -517,7 +547,7 @@ float Shadow(float3 vp)
     return edge * (s * 0.2 - 1) + 1;
 }
 
-float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float fog : TEXCOORD3, float4 tint : TEXCOORD4, float2 wuv : TEXCOORD5, float3 vpos : TEXCOORD6, float far : TEXCOORD7) : COLOR
+float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float fog : TEXCOORD3, float4 tint : TEXCOORD4, float2 wuv : TEXCOORD5, float3 vpos : TEXCOORD6, float far : TEXCOORD7, float3 lamps : TEXCOORD8) : COLOR
 {
     clip(d.x - opts.x);
     clip(0.5 - d.y);
@@ -550,7 +580,12 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
     float sp = pow(saturate(dot(nn, h)), max(specular.w, 1) * (1 + 3 * wet)) * saturate(mask * (1 + 2 * wet));
     // Dynamic shadows like the terrain's: down to 70% in full shadow, no shine there.
     float shade = misc.x > 0.5 ? Shadow(vpos) : 1;
-    float3 c = colour * lit * (0.7 + 0.3 * shade) + specular.rgb * sp * shade;
+    // Point lights (torches, from the VS): not shadowed by the sun's shadow maps. They fill the
+    // headroom the sun leaves toward 1 softly (1 - e^-x) instead of being clamped: a hard clamp left a
+    // flat white plateau with a visible ring where the light dropped below it. Without lamps this is
+    // exactly the sun's lighting as before.
+    float3 sunLit = lit * (0.7 + 0.3 * shade);
+    float3 c = colour * (sunLit + (1 - sunLit) * (1 - exp(-lamps))) + specular.rgb * sp * shade;
     return float4(lerp(fogColor.rgb, c, fog), 1);
 }
 )";
@@ -1532,6 +1567,26 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 std::memcpy(ps0 + 24, g_seenFogColor, 3 * sizeof(float));
             }
             dev->SetVertexShaderConstantF(9, vs9, 4);
+
+            // Point lights (env/Lights) into the same space as the cover's positions: camera-relative,
+            // rotated by the rows in c9..c11. VS c17.x = how many, c20.. = 2 registers each.
+            {
+                float pl[lights::kMaxLights * 8] = {};
+                int count = 0;
+                for (const lights::ActiveLight& l : lights::Active())
+                {
+                    if (count >= lights::kMaxLights) break;
+                    const float q[3] = { l.pos[0] - eye[0], l.pos[1] - eye[1], l.pos[2] - eye[2] };
+                    float* o = pl + count * 8;
+                    for (int c = 0; c < 3; ++c) o[c] = q[0] * vs9[c] + q[1] * vs9[4 + c] + q[2] * vs9[8 + c];
+                    o[3] = l.radius > 0.0f ? 1.0f / l.radius : 0.0f;
+                    o[4] = l.color[0]; o[5] = l.color[1]; o[6] = l.color[2];
+                    ++count;
+                }
+                const float c17[4] = { static_cast<float>(count), 0.0f, 0.0f, 0.0f };
+                dev->SetVertexShaderConstantF(17, c17, 1);
+                if (count) dev->SetVertexShaderConstantF(20, pl, count * 2);
+            }
             // Specular: the terrain's colour and exponent (none when not lit like the scene, or when
             // the terrain has no exponent set).
             float ps8[12] = {};

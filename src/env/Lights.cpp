@@ -1,5 +1,10 @@
 #include "Lights.hpp"
 
+#include "../features/GrassPerf.hpp"
+
+#include "game/Camera.hpp"
+#include "game/Doodad.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -90,6 +95,218 @@ namespace wxl_livingazeroth::lights
             return d2(a) < d2(b);
         });
         return scan;
+    }
+
+    // --- our light list ----------------------------------------------------------------------------
+    namespace
+    {
+        namespace dd = wxl::game::doodad;
+
+        // M2 instance and header (confirmed in-client 2026-10-05, lighting.md): light records at
+        // instance +0x1D0 (0xD4 each, CM2Light at +0x68); header lights array at +0x108 (0x9C each:
+        // type +0, bone +2, position +4, diffuse colour track +0x38, diffuse intensity track +0x4C).
+        constexpr size_t kInstLights = 0x1D0, kLightRecord = 0xD4, kRecordLight = 0x68;
+        constexpr size_t kHdrLights = 0x108, kFileLight = 0x9C;
+        constexpr size_t kFileType = 0x00, kFilePos = 0x04, kFileDiffuse = 0x38, kFileIntensity = 0x4C;
+        constexpr float  kChunk = 100.0f / 3.0f;
+        constexpr float  kScanSeconds = 0.25f;
+
+        template <class T> bool Get(const void* base, size_t off, T& out)
+        {
+            const void* p = static_cast<const uint8_t*>(base) + off;
+            if (!base || !dd::detail::Readable(p, sizeof(T))) return false;
+            std::memcpy(&out, p, sizeof(T));
+            return true;
+        }
+
+        // The first value of an M2 track's first sequence [believed: once parsed, the nested arrays
+        // hold pointers, like the header's]. Track: interpolation u16, global sequence s16,
+        // timestamps (count, ptr) at +4, values (count, ptr -> per sequence (count, ptr)) at +0xC.
+        bool FirstTrackValue(const uint8_t* track, void* out, size_t size)
+        {
+            uint32_t sequences = 0, count = 0;
+            const uint8_t* perSequence = nullptr;
+            const uint8_t* values = nullptr;
+            if (!Get(track, 0x0C, sequences) || !Get(track, 0x10, perSequence) || !sequences || !perSequence) return false;
+            if (!Get(perSequence, 0, count) || !Get(perSequence, 4, values) || !count || !values) return false;
+            if (!dd::detail::Readable(values, size)) return false;
+            std::memcpy(out, values, size);
+            return true;
+        }
+
+        // One model light found by the scan. Position and colour are refreshed every frame from
+        // its CM2Light (the client keeps animating it while in view and keeps the last values when
+        // culled); the fallbacks were worked out at the scan.
+        struct Source
+        {
+            const uint8_t* cm2 = nullptr;
+            float worldPos[3] = {};     // file position through the doodad's world matrix (bone at rest)
+            float fileColor[3] = {};    // first diffuse colour x first intensity from the file
+            bool  haveFileColor = false;
+        };
+        std::vector<Source>      g_sources;
+        std::vector<ActiveLight> g_active;
+        Settings g_settings;
+        Stats    g_stats;
+        float    g_scanTime = kScanSeconds;
+
+        void Mul(const float v[3], const float m[16], float out[3])
+        {
+            for (int c = 0; c < 3; ++c) out[c] = v[0] * m[c] + v[1] * m[4 + c] + v[2] * m[8 + c] + m[12 + c];
+        }
+
+        void ScanDoodads(const float center[3])
+        {
+            const double t0 = grassperf::Now();
+            g_sources.clear();
+            Stats st;
+            // The terrain chunks within range, each once; their doodads, each once.
+            const int reach = static_cast<int>(std::ceil(g_settings.range / kChunk));
+            std::vector<void*> chunks, doodads;
+            void* found[1024];
+            for (int gy = -reach; gy <= reach; ++gy)
+                for (int gx = -reach; gx <= reach; ++gx)
+                {
+                    float q[3] = { center[0] + gx * kChunk, center[1] + gy * kChunk, center[2] };
+                    void* chunk = dd::ChunkAt(q);
+                    if (!dd::detail::Plausible(chunk) || std::find(chunks.begin(), chunks.end(), chunk) != chunks.end()) continue;
+                    chunks.push_back(chunk);
+                    const int n = dd::EnumerateChunk(chunk, found, 0, 1024);
+                    for (int k = 0; k < n; ++k)
+                        if (std::find(doodads.begin(), doodads.end(), found[k]) == doodads.end()) doodads.push_back(found[k]);
+                }
+            st.chunks = static_cast<unsigned>(chunks.size());
+            st.doodads = static_cast<unsigned>(doodads.size());
+
+            for (void* d : doodads)
+            {
+                void* inst = dd::Instance(d);
+                void* model = inst ? dd::detail::P(inst, dd::off::kInstModel) : nullptr;
+                const uint8_t* hdr = model ? static_cast<const uint8_t*>(dd::detail::P(model, dd::off::kModelHeader)) : nullptr;
+                uint32_t count = 0;
+                const uint8_t* fileLights = nullptr;
+                const uint8_t* records = nullptr;
+                if (!hdr || !Get(hdr, kHdrLights, count) || !count || count > 64 || !Get(hdr, kHdrLights + 4, fileLights) || !fileLights) continue;
+                Get(inst, kInstLights, records);
+                float world[16];
+                const bool haveWorld = dd::WorldMatrix(d, world);
+                for (uint32_t l = 0; l < count; ++l)
+                {
+                    const uint8_t* fl = fileLights + l * kFileLight;
+                    uint16_t type = 0;
+                    float local[3];
+                    if (!Get(fl, kFileType, type) || type != 1 || !Get(fl, kFilePos, local)) continue; // point lights only
+                    ++st.modelLights;
+                    Source s;
+                    s.cm2 = records ? records + l * kLightRecord + kRecordLight : nullptr;
+                    if (haveWorld) Mul(local, world, s.worldPos);
+                    float color[3], intensity = 1.0f;
+                    if (FirstTrackValue(fl + kFileDiffuse, color, sizeof(color)))
+                    {
+                        FirstTrackValue(fl + kFileIntensity, &intensity, sizeof(intensity));
+                        for (int c = 0; c < 3; ++c) s.fileColor[c] = color[c] * intensity;
+                        s.haveFileColor = true;
+                    }
+                    if (haveWorld || s.cm2) g_sources.push_back(s);
+                }
+            }
+            st.scanMs = grassperf::Now() - t0;
+            g_stats.chunks = st.chunks; g_stats.doodads = st.doodads; g_stats.modelLights = st.modelLights; g_stats.scanMs = st.scanMs;
+        }
+
+        struct Candidate { float pos[3]; float color[3]; float weight; };
+    }
+
+    Settings& Config() { return g_settings; }
+    const std::vector<ActiveLight>& Active() { return g_active; }
+    Stats GetStats() { return g_stats; }
+
+    void Update(float dt, const world::Snapshot& snap)
+    {
+        g_active.clear();
+        if (!snap.inWorld || !g_settings.enabled) { g_sources.clear(); return; }
+        float eye[3] = { snap.playerPos[0], snap.playerPos[1], snap.playerPos[2] };
+        wxl::game::camera::GetPosition(eye);
+
+        g_scanTime += dt;
+        if (g_scanTime >= kScanSeconds) { g_scanTime = 0.0f; ScanDoodads(eye); }
+
+        // This frame's lights: the client's current values where it has them.
+        std::vector<Candidate> cands;
+        unsigned fromClient = 0, fromWorld = 0, fileColor = 0;
+        const float range = g_settings.range;
+        for (const Source& s : g_sources)
+        {
+            Candidate c{};
+            float stored[3] = {}, color[3] = {};
+            const bool placed = s.cm2 && Get(s.cm2, 0x0C, stored) && (stored[0] != 0.0f || stored[1] != 0.0f || stored[2] != 0.0f);
+            std::memcpy(c.pos, placed ? stored : s.worldPos, sizeof(c.pos));
+            (placed ? fromClient : fromWorld)++;
+            const bool lit = s.cm2 && Get(s.cm2, 0x3C, color) && (color[0] > 0.0f || color[1] > 0.0f || color[2] > 0.0f);
+            if (!lit)
+            {
+                if (!s.haveFileColor) continue;
+                std::memcpy(color, s.fileColor, sizeof(color));
+                ++fileColor;
+            }
+            std::memcpy(c.color, color, sizeof(c.color));
+            const float dx = c.pos[0] - eye[0], dy = c.pos[1] - eye[1], dz = c.pos[2] - eye[2];
+            if (dx * dx + dy * dy + dz * dz > range * range) continue;
+            c.weight = 1.0f;
+            cands.push_back(c);
+        }
+        g_stats.fromClient = fromClient; g_stats.fromWorldMatrix = fromWorld; g_stats.fileColor = fileColor;
+        g_stats.inRange = static_cast<unsigned>(cands.size());
+
+        // Merge lights closer than the merge distance (torch groups): summed colour, position
+        // weighted by brightness.
+        unsigned merged = 0;
+        const float md2 = g_settings.mergeDistance * g_settings.mergeDistance;
+        for (size_t a = 0; a < cands.size(); ++a)
+        {
+            if (cands[a].weight <= 0.0f) continue;
+            float wa = cands[a].color[0] + cands[a].color[1] + cands[a].color[2];
+            for (size_t b = a + 1; b < cands.size(); ++b)
+            {
+                if (cands[b].weight <= 0.0f) continue;
+                const float dx = cands[a].pos[0] - cands[b].pos[0], dy = cands[a].pos[1] - cands[b].pos[1], dz = cands[a].pos[2] - cands[b].pos[2];
+                if (dx * dx + dy * dy + dz * dz > md2) continue;
+                const float wb = cands[b].color[0] + cands[b].color[1] + cands[b].color[2];
+                const float share = wa + wb > 0.0f ? wb / (wa + wb) : 0.5f;
+                for (int k = 0; k < 3; ++k)
+                {
+                    cands[a].pos[k] += (cands[b].pos[k] - cands[a].pos[k]) * share;
+                    cands[a].color[k] += cands[b].color[k];
+                }
+                wa += wb;
+                cands[b].weight = 0.0f;
+                ++merged;
+            }
+        }
+        g_stats.merged = merged;
+
+        // The nearest to the camera, fading out over the last third of the range.
+        std::vector<std::pair<float, size_t>> order;
+        for (size_t k = 0; k < cands.size(); ++k)
+            if (cands[k].weight > 0.0f)
+            {
+                const float dx = cands[k].pos[0] - eye[0], dy = cands[k].pos[1] - eye[1], dz = cands[k].pos[2] - eye[2];
+                order.push_back({ dx * dx + dy * dy + dz * dz, k });
+            }
+        std::sort(order.begin(), order.end());
+        const float fadeStart = range * (2.0f / 3.0f);
+        for (size_t n = 0; n < order.size() && n < static_cast<size_t>(kMaxLights); ++n)
+        {
+            const Candidate& c = cands[order[n].second];
+            const float d = std::sqrt(order[n].first);
+            const float fade = d <= fadeStart ? 1.0f : std::max(0.0f, 1.0f - (d - fadeStart) / (range - fadeStart));
+            ActiveLight l{};
+            std::memcpy(l.pos, c.pos, sizeof(l.pos));
+            for (int k = 0; k < 3; ++k) l.color[k] = c.color[k] * g_settings.brightness * fade;
+            l.radius = g_settings.radius;
+            g_active.push_back(l);
+        }
+        g_stats.active = static_cast<unsigned>(g_active.size());
     }
 
     float Reach(const float att[3], float share)

@@ -195,6 +195,22 @@ namespace wxl_livingazeroth::debug
         {
             const world::Snapshot& s = world::Current();
             if (!s.inWorld) { g_api->UiText("not in world"); return; }
+
+            // Our lights (step 2: on the surface cover; the terrain keeps the stock lighting for now).
+            lights::Settings& cfg = lights::Config();
+            g_api->UiCheckbox("our point lights (surface cover)", &cfg.enabled);
+            g_api->UiSliderFloat("light radius (yd)", &cfg.radius, 2.0f, 40.0f);
+            g_api->UiSliderFloat("light brightness (x the client's colour)", &cfg.brightness, 0.0f, 3.0f);
+            g_api->UiSliderFloat("light range from the camera (yd)", &cfg.range, 30.0f, 300.0f);
+            g_api->UiSliderFloat("merge lights closer than (yd)", &cfg.mergeDistance, 0.0f, 3.0f);
+            const lights::Stats ls = lights::GetStats();
+            char head[256];
+            std::snprintf(head, sizeof(head), "our lights: %u chunks, %u doodads scanned (%.2f ms), %u model lights (%u placed by the client, %u via the world matrix, %u with the file's colour), %u in range, %u merged, %u drawn (max %d)",
+                          ls.chunks, ls.doodads, ls.scanMs, ls.modelLights, ls.fromClient, ls.fromWorldMatrix, ls.fileColor,
+                          ls.inRange, ls.merged, ls.active, lights::kMaxLights);
+            g_api->UiTextWrapped(head);
+            g_api->UiSeparator();
+
             g_api->UiSliderFloat("range (yd)", &g_range, 5.0f, 300.0f);
             g_api->UiSliderInt("lights listed", &g_maxListed, 5, 200);
 
@@ -204,6 +220,18 @@ namespace wxl_livingazeroth::debug
             std::vector<std::string> lines;
             char line[384];
             auto add = [&]() { lines.emplace_back(line); };
+            {
+                const lights::Stats ls2 = lights::GetStats();
+                std::snprintf(line, sizeof(line), "our lights: %u model lights (%u placed by the client, %u via the world matrix, %u with the file's colour), %u in range, %u merged, %u drawn",
+                              ls2.modelLights, ls2.fromClient, ls2.fromWorldMatrix, ls2.fileColor, ls2.inRange, ls2.merged, ls2.active); add();
+                int shownActive = 0;
+                for (const lights::ActiveLight& a : lights::Active())
+                {
+                    if (shownActive++ >= 8) break;
+                    std::snprintf(line, sizeof(line), "  drawn: pos %.1f %.1f %.1f, colour %.2f %.2f %.2f, radius %.0f", a.pos[0], a.pos[1], a.pos[2],
+                                  a.color[0], a.color[1], a.color[2], a.radius); add();
+                }
+            }
             if (!scan.sceneFound) { std::snprintf(line, sizeof(line), "no M2 scene ([0xCD754C] is null)"); add(); }
             else
             {
