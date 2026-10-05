@@ -8,6 +8,7 @@
 #include "../env/TerrainHeight.hpp"
 #include "../render/BlpTexture.hpp"
 #include "../render/MoistureTexture.hpp"
+#include "TerrainLights.hpp"
 #include "TerrainWetness.hpp"
 #include "GrassPerf.hpp"
 #include "GroundMaterialTable.hpp"
@@ -580,12 +581,20 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
     float sp = pow(saturate(dot(nn, h)), max(specular.w, 1) * (1 + 3 * wet)) * saturate(mask * (1 + 2 * wet));
     // Dynamic shadows like the terrain's: down to 70% in full shadow, no shine there.
     float shade = misc.x > 0.5 ? Shadow(vpos) : 1;
-    // Point lights (torches, from the VS): not shadowed by the sun's shadow maps. They fill the
-    // headroom the sun leaves toward 1 softly (1 - e^-x) instead of being clamped: a hard clamp left a
-    // flat white plateau with a visible ring where the light dropped below it. Without lamps this is
-    // exactly the sun's lighting as before.
+    // Point lights (torches, from the VS): not shadowed by the sun's shadow maps. Added to the sun's
+    // light like the client's own (the same amount whichever way the ground faces the sun), then
+    // compressed smoothly above a knee instead of clamped (a hard clamp left a flat white plateau with
+    // a ring), on the brightest channel with all three scaled alike so the flame's hue stays. The knee
+    // starts at the sun's own level (at least 0.8): without lamps this is the sun's lighting as before.
     float3 sunLit = lit * (0.7 + 0.3 * shade);
-    float3 c = colour * (sunLit + (1 - sunLit) * (1 - exp(-lamps))) + specular.rgb * sp * shade;
+    float3 total = sunLit + lamps;
+    float peak = max(total.r, max(total.g, total.b));
+    float knee = max(0.8, max(sunLit.r, max(sunLit.g, sunLit.b)));
+    float over = max(peak - knee, 0);
+    float room = max(1 - knee, 0.001);
+    float shaped = peak - over + room * (1 - exp(-over / room));
+    total *= shaped / max(peak, 0.001);
+    float3 c = colour * total + specular.rgb * sp * shade;
     return float4(lerp(fogColor.rgb, c, fog), 1);
 }
 )";
@@ -1751,6 +1760,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         {
             // The patched terrain shaders read the ground moisture (features/TerrainWetness).
             terrainwet::BeforeTerrainStage(static_cast<IDirect3DDevice9*>(gx::RawDevice()));
+            terrainlights::BeforeTerrainStage(static_cast<IDirect3DDevice9*>(gx::RawDevice()));
             g_origTerrainStage();
             if (g_settings.enabled && g_settings.drawPoint == 0)
                 Draw(static_cast<IDirect3DDevice9*>(gx::RawDevice()), nullptr, true);

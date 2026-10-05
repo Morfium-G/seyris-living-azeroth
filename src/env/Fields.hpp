@@ -74,6 +74,7 @@ namespace wxl_livingazeroth::fields
         float          cellSize = 0.0f;
         int            firstI = 0, firstJ = 0;
         const uint8_t* excess = nullptr;
+        const uint8_t* normal = nullptr; // per cell 2 bytes: the ground's normal x, y as 0..255 (128 = 0; z from them)
         uint32_t       version = 0;
         float          farExcess = 0.0f; // beyond the grid where no zone is known: the player's zone's value
 

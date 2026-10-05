@@ -2,6 +2,8 @@
 
 #include "../env/Lights.hpp"
 #include "../env/WorldQuery.hpp"
+#include "../features/TerrainLights.hpp"
+#include "../features/TerrainWetness.hpp"
 
 #include "game/Doodad.hpp"
 
@@ -198,17 +200,21 @@ namespace wxl_livingazeroth::debug
 
             // Our lights (step 2: on the surface cover; the terrain keeps the stock lighting for now).
             lights::Settings& cfg = lights::Config();
-            g_api->UiCheckbox("our point lights (surface cover)", &cfg.enabled);
+            g_api->UiCheckbox("our point lights (terrain + surface cover; off = the client's own)", &cfg.enabled);
             g_api->UiSliderFloat("light radius (yd)", &cfg.radius, 2.0f, 40.0f);
             g_api->UiSliderFloat("light brightness (x the client's colour)", &cfg.brightness, 0.0f, 3.0f);
             g_api->UiSliderFloat("light range from the camera (yd)", &cfg.range, 30.0f, 300.0f);
             g_api->UiSliderFloat("merge lights closer than (yd)", &cfg.mergeDistance, 0.0f, 3.0f);
+            g_api->UiSliderFloat("flicker (how much a flame's light dips)", &cfg.flicker, 0.0f, 0.8f);
+            g_api->UiSliderFloat("flicker speed", &cfg.flickerSpeed, 0.1f, 4.0f);
             const lights::Stats ls = lights::GetStats();
             char head[256];
             std::snprintf(head, sizeof(head), "our lights: %u chunks, %u doodads scanned (%.2f ms), %u model lights (%u placed by the client, %u via the world matrix, %u with the file's colour), %u in range, %u merged, %u drawn (max %d)",
                           ls.chunks, ls.doodads, ls.scanMs, ls.modelLights, ls.fromClient, ls.fromWorldMatrix, ls.fileColor,
                           ls.inRange, ls.merged, ls.active, lights::kMaxLights);
             g_api->UiTextWrapped(head);
+            g_api->UiTextWrapped(terrainlights::StatusLine());
+            g_api->UiTextWrapped(terrainwet::StatusLine());
             g_api->UiSeparator();
 
             g_api->UiSliderFloat("range (yd)", &g_range, 5.0f, 300.0f);

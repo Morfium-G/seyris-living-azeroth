@@ -95,6 +95,7 @@ namespace wxl_livingazeroth::fields
         };
         std::vector<Cell>    g_cells(kSize * kSize);
         std::vector<uint8_t> g_excess(kSize * kSize, 0);
+        std::vector<uint8_t> g_normal(kSize * kSize * 2, 128); // the ground's normal x, y per cell (point lights on the terrain)
         std::vector<uint8_t> g_farBytes;   // per chunk of the zone map
         std::vector<float>   g_farValues;
 
@@ -474,8 +475,10 @@ namespace wxl_livingazeroth::fields
                 {
                     const int s = SlotOf(g_firstI + a, g_firstJ + b);
                     Cell* live = Live(a, b);
-                    if (!live) { g_excess[s] = 0; g_snowNow.fallen[s] = -1.0f; g_snowNow.keep[s] = 1.0f; continue; }
+                    if (!live) { g_excess[s] = 0; g_normal[s * 2] = g_normal[s * 2 + 1] = 128; g_snowNow.fallen[s] = -1.0f; g_snowNow.keep[s] = 1.0f; continue; }
                     Cell& c = *live;
+                    g_normal[s * 2] = static_cast<uint8_t>(Clamp01(c.nx * 0.5f + 0.5f) * 255.0f + 0.5f);
+                    g_normal[s * 2 + 1] = static_cast<uint8_t>(Clamp01(c.ny * 0.5f + 0.5f) * 255.0f + 0.5f);
                     if (c.area != lastArea)
                     {
                         const climate::Row& row = climate::For(c.area, g_map);
@@ -789,6 +792,7 @@ namespace wxl_livingazeroth::fields
             g_shoreDirty = true;
         }
         g_wet.size = kSize; g_wet.cellSize = kCell; g_wet.firstI = g_firstI; g_wet.firstJ = g_firstJ; g_wet.excess = g_excess.data();
+        g_wet.normal = g_normal.data();
 
         // Static sampling within the budget: cells whose slot holds another world cell, or that
         // weren't loaded yet. One pass over the grid per sweep; unloaded ones are retried next sweep.

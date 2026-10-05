@@ -1,5 +1,6 @@
 #include "TerrainWetness.hpp"
 
+#include "TerrainLights.hpp"
 #include "../render/MoistureTexture.hpp"
 #include "../render/ShaderPatch.hpp"
 
@@ -80,11 +81,13 @@ namespace wxl_livingazeroth::terrainwet
                 const int n = std::stoi((*it)[1].str());
                 highest = n > highest ? n : highest;
             }
+            // The world position: .xy for the moisture, .z too for the point lights (features/TerrainLights).
             if (declared < 11)
             {
                 const std::string o = "o" + std::to_string(highest + 1);
-                src.insert(at, "    mov " + o + ".xy, v0.xy\n");
-                src.insert(src.find('\n') + 1, "    dcl_texcoord7 " + o + ".xy\n");
+                src.insert(at, "    mov " + o + ".xyz, v0.xyz\n");
+                src.insert(src.find('\n') + 1, "    dcl_texcoord7 " + o + ".xyz\n");
+                terrainlights::EditVertex(src); // the stock point lights through a switch
                 return true;
             }
             // All outputs in use: take over the unread view-position output (texcoord3 .xyz).
@@ -95,8 +98,9 @@ namespace wxl_livingazeroth::terrainwet
             const std::regex viewWrite("\n([ \t]*)mov " + o + R"(\.xyz, r\d+[ \t]*\n)");
             std::smatch w;
             if (!std::regex_search(src, w, viewWrite)) { why = "view-position output written unexpectedly"; return false; }
-            src.replace(static_cast<size_t>(w.position(0)), static_cast<size_t>(w.length(0)), "\n" + w[1].str() + "mov " + o + ".xy, v0.xy\n");
-            src.replace(static_cast<size_t>(m.position(0)), static_cast<size_t>(m.length(0)), "dcl_texcoord7 " + o + ".xy");
+            src.replace(static_cast<size_t>(w.position(0)), static_cast<size_t>(w.length(0)), "\n" + w[1].str() + "mov " + o + ".xyz, v0.xyz\n");
+            src.replace(static_cast<size_t>(m.position(0)), static_cast<size_t>(m.length(0)), "dcl_texcoord7 " + o + ".xyz");
+            terrainlights::EditVertex(src);
             ++g_packed;
             return true;
         }
@@ -104,8 +108,9 @@ namespace wxl_livingazeroth::terrainwet
         bool EditPixel(std::string& src, std::string& why)
         {
             if (src.find("ps_3_0") == std::string::npos) { why = "not ps_3_0"; return false; }
-            if (src.find(" v9") != std::string::npos || src.find(" s11") != std::string::npos || src.find(" s12") != std::string::npos || src.find("c200") != std::string::npos)
-            { why = "v9/s11/s12/c200 in use"; return false; }
+            if (src.find(" v9") != std::string::npos || src.find(" s11") != std::string::npos || src.find(" s12") != std::string::npos ||
+                src.find(" s13") != std::string::npos || src.find("c200") != std::string::npos || src.find(" i0") != std::string::npos)
+            { why = "v9/s11/s12/s13/c200/i0 in use"; return false; }
             // The stock ending: the colour minus the fog colour, then lerped toward it by the fog.
             static const std::regex fog(R"((\n[ \t]*)add (r\d+)\.xyz, \2, -c2[ \t]*\n[ \t]*mad oC0\.xyz, v\d+\.x, \2, c2)");
             std::smatch m;
@@ -144,8 +149,11 @@ namespace wxl_livingazeroth::terrainwet
                 "\n    mov r30.x, r30.w"
                 "\n    mul r30.x, r30.x, c200.w"
                 "\n    mad " + r + ".xyz, " + r + ", -r30.x, " + r;
-            src.insert(static_cast<size_t>(m.position(0)), block);
-            src.insert(src.find('\n') + 1, "    def c202, 1, 0, 0.5, 0\n    dcl_texcoord7 v9.xy\n    dcl_2d s11\n    dcl_2d s12\n");
+            // Then the point lights (features/TerrainLights), on the wet colour.
+            std::string lightDefs;
+            const std::string lightBlock = terrainlights::PixelBlock(r, lightDefs);
+            src.insert(static_cast<size_t>(m.position(0)), block + lightBlock);
+            src.insert(src.find('\n') + 1, "    def c202, 1, 0, 0.5, 0\n" + lightDefs + "    dcl_texcoord7 v9.xyz\n    dcl_2d s11\n    dcl_2d s12\n");
             return true;
         }
 
@@ -176,7 +184,10 @@ namespace wxl_livingazeroth::terrainwet
         if (!device) return;
         float c[16] = {};
         float inverseExtent = 0.0f, box[4] = {};
-        const bool on = g_enabled && PairOk(shaderpatch::Status()) && moisturetex::Mapping(inverseExtent, box) && moisturetex::Bind(device, 11);
+        // The moisture texture also carries the ground's normal for the point lights: bound whenever
+        // the patch is active, wet look or not.
+        const bool bound = PairOk(shaderpatch::Status()) && moisturetex::Mapping(inverseExtent, box) && moisturetex::Bind(device, 11);
+        const bool on = g_enabled && bound;
         c[0] = inverseExtent;
         c[1] = g_debug >= 1 ? 1.0f : 0.0f;
         c[3] = on ? (g_debug ? 0.8f : g_strength) : 0.0f;
@@ -200,6 +211,7 @@ namespace wxl_livingazeroth::terrainwet
         device->SetPixelShaderConstantF(kPsConstant + 4, farConstants, 2);
     }
 
+    bool  PatchActive()            { return PairOk(shaderpatch::Status()); }
     void  SetEnabled(bool enabled) { g_enabled = enabled; }
     void  SetDebug(int mode)       { g_debug = mode < 0 ? 0 : (mode > 3 ? 3 : mode); }
     int   Debug()                  { return g_debug; }

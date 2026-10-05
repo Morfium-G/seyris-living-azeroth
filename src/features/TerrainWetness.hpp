@@ -1,10 +1,10 @@
 // Wet terrain: the client's own terrain shaders, patched to darken the ground where it's wetter than
 // its material's rest (env/Fields: rain, water nearby), the same way the cover's wet look does.
 //
-// Every terrain vertex shader passes its world XY on (texcoord7, packed into a free .zw); every terrain
-// pixel shader samples the shared moisture texture (render/MoistureTexture, sampler s11) there and
-// darkens its colour right before fog. Only the inserted lines are ours -- every layer count,
-// shadow variant and output of the stock shaders stays as it was.
+// Every terrain vertex shader passes its world position on (texcoord7 .xyz); every terrain pixel
+// shader samples the shared moisture texture (render/MoistureTexture, sampler s11) there and darkens
+// its colour right before fog, then adds the point lights (features/TerrainLights). Only the inserted
+// lines are ours -- every layer count, shadow variant and output of the stock shaders stays as it was.
 #pragma once
 
 #include "wxl/PluginApi.h"
@@ -19,6 +19,9 @@ namespace wxl_livingazeroth::terrainwet
     /// Binds the moisture texture and the patch's constants. Called right before the terrain stage
     /// draws (the cover's terrain-stage hook).
     void BeforeTerrainStage(IDirect3DDevice9* device);
+
+    /// Whether the patched terrain shaders are in use (every vertex variant patched).
+    bool  PatchActive();
 
     void  SetEnabled(bool enabled);
     bool  Enabled();

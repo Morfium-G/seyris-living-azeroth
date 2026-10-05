@@ -97,7 +97,12 @@ namespace wxl_livingazeroth::moisturetex
                 for (int row = 0; row < wet.size; ++row)
                 {
                     uint32_t* out = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(lr.pBits) + row * lr.Pitch);
-                    for (int col = 0; col < wet.size; ++col) out[col] = static_cast<uint32_t>(wet.excess[row * wet.size + col]) << 24;
+                    for (int col = 0; col < wet.size; ++col)
+                    {
+                        const int k = row * wet.size + col;
+                        const uint32_t nx = wet.normal ? wet.normal[k * 2] : 128u, ny = wet.normal ? wet.normal[k * 2 + 1] : 128u;
+                        out[col] = (static_cast<uint32_t>(wet.excess[k]) << 24) | (nx << 16) | (ny << 8);
+                    }
                 }
                 g_texture->UnlockRect(0);
                 g_version = wet.version;

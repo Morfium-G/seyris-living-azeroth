@@ -3,7 +3,8 @@
 // changes; recreated when the device does.
 //
 // Layout: world-aligned and toroidal. World cell i = floor(x / cellSize) is column mod(i, size), so
-// sampling at u = x / (size * cellSize) with WRAP addressing finds it; alpha = the excess (0..1).
+// sampling at u = x / (size * cellSize) with WRAP addressing finds it; alpha = the excess (0..1),
+// red/green = the ground's normal x/y (* 0.5 + 0.5; z = sqrt(1 - x^2 - y^2); point lights on the terrain).
 // Only the grid's own box (Box()) is valid -- outside it the wrap repeats other cells.
 #pragma once
 
