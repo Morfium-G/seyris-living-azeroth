@@ -330,7 +330,8 @@ float4 farMap : register(c14);   // 1 / chunk size, map size, 1 / map size, on
 float4 farBox : register(c15);   // the far map's box, world yd (min x, min y, max x, max y)
 float4 farMisc : register(c16);  // x = the value outside that box
 float4 pointInfo : register(c17);   // x = point lights in use (env/Lights)
-float4 points[48] : register(c20);  // per light: (view-space position, 1 / radius), (colour, 0)
+float4 points[96] : register(c20);  // per light: (view-space position, 1 / radius), (colour, falloff shape),
+                                    // (view-space spot direction, cos outer angle), (1 / (cos inner - cos outer))
 sampler2D baseTex : register(s0);
 sampler2D coverTex : register(s1);
 sampler2D lookTex : register(s2);
@@ -358,23 +359,29 @@ struct VOut { float4 pos : POSITION; float3 n : TEXCOORD0; float2 d : TEXCOORD1;
 // light's radius. The light has a size (~1 yd, like a flame): the falloff uses sqrt(d^2 + 1), so
 // right under it it tops out at the client's value at 1 yd instead of a hot spot with a hard edge
 // (a torch flame ends up just above deep snow). Wrapped Lambert ((N.L + 0.5) / 1.5), so a low light
-// still lights the surface around it, not just at grazing angles. Per vertex: the cover's mesh is
-// dense (0.25 yd near the player), and pixel shaders can't index constants.
+// still lights the surface around it, not just at grazing angles. Falloff shape: the window to the
+// power of the light's falloff (1 = smooth, higher = tighter). Spot lights: x saturate((cos to the
+// axis - cos outer) / (cos inner - cos outer)); point lights have cos outer -2 (always inside). Per
+// vertex: the cover's mesh is dense (0.25 yd near the player), and pixel shaders can't index constants.
 float3 Lamps(float3 vp, float3 nv)
 {
     float3 sum = 0;
     [loop] for (int k = 0; k < 24; ++k)
     {
         if (k >= pointInfo.x) break;
-        float4 p = points[k * 2], col = points[k * 2 + 1];
+        float4 p = points[k * 4], col = points[k * 4 + 1], spot = points[k * 4 + 2];
+        float spotScale = points[k * 4 + 3].x;
         float3 dv = p.xyz - vp;
         float d2 = dot(dv, dv);
         float d = sqrt(d2);
+        float3 l = dv / max(d, 0.001);
         float t = saturate(d * p.w);
         float win = 1 - t * t;
+        win = pow(win * win, col.w);
         float de = sqrt(d2 + 1);
-        float wrap = saturate((dot(nv, dv / max(d, 0.001)) + 0.5) / 1.5);
-        sum += col.rgb * (win * win) * wrap / (de * (0.7 + 0.03 * de));
+        float wrap = saturate((dot(nv, l) + 0.5) / 1.5);
+        float cone = saturate((dot(-l, spot.xyz) - spot.w) * spotScale);
+        sum += col.rgb * win * wrap * cone / (de * (0.7 + 0.03 * de));
     }
     return sum;
 }
@@ -1578,23 +1585,26 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             dev->SetVertexShaderConstantF(9, vs9, 4);
 
             // Point lights (env/Lights) into the same space as the cover's positions: camera-relative,
-            // rotated by the rows in c9..c11. VS c17.x = how many, c20.. = 2 registers each.
+            // rotated by the rows in c9..c11. VS c17.x = how many, c20.. = 4 registers each.
             {
-                float pl[lights::kMaxLights * 8] = {};
+                float pl[lights::kMaxLights * 16] = {};
                 int count = 0;
                 for (const lights::ActiveLight& l : lights::Active())
                 {
                     if (count >= lights::kMaxLights) break;
                     const float q[3] = { l.pos[0] - eye[0], l.pos[1] - eye[1], l.pos[2] - eye[2] };
-                    float* o = pl + count * 8;
+                    float* o = pl + count * 16;
                     for (int c = 0; c < 3; ++c) o[c] = q[0] * vs9[c] + q[1] * vs9[4 + c] + q[2] * vs9[8 + c];
                     o[3] = l.radius > 0.0f ? 1.0f / l.radius : 0.0f;
-                    o[4] = l.color[0]; o[5] = l.color[1]; o[6] = l.color[2];
+                    o[4] = l.color[0]; o[5] = l.color[1]; o[6] = l.color[2]; o[7] = l.falloff;
+                    for (int c = 0; c < 3; ++c) o[8 + c] = l.spotDir[0] * vs9[c] + l.spotDir[1] * vs9[4 + c] + l.spotDir[2] * vs9[8 + c];
+                    o[11] = l.cosOuter;
+                    o[12] = l.spotScale;
                     ++count;
                 }
                 const float c17[4] = { static_cast<float>(count), 0.0f, 0.0f, 0.0f };
                 dev->SetVertexShaderConstantF(17, c17, 1);
-                if (count) dev->SetVertexShaderConstantF(20, pl, count * 2);
+                if (count) dev->SetVertexShaderConstantF(20, pl, count * 4);
             }
             // Specular: the terrain's colour and exponent (none when not lit like the scene, or when
             // the terrain has no exponent set).

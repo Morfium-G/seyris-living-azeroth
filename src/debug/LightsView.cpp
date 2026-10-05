@@ -2,6 +2,7 @@
 
 #include "../env/Lights.hpp"
 #include "../env/WorldQuery.hpp"
+#include "../features/DoodadLightTable.hpp"
 #include "../features/TerrainLights.hpp"
 #include "../features/TerrainWetness.hpp"
 
@@ -22,6 +23,7 @@ namespace wxl_livingazeroth::debug
     {
         constexpr const char* kPanelTitle = "wxl-seyris-living-azeroth: lights";
         const WXL_Api* g_api = nullptr;
+        const WXL_SeyrisCdbcApi* g_cdbc = nullptr;
         float g_range = 60.0f;
         int   g_maxListed = 40;
         int   g_showDoodads = 1;
@@ -208,9 +210,13 @@ namespace wxl_livingazeroth::debug
             g_api->UiSliderFloat("flicker (how much a flame's light dips)", &cfg.flicker, 0.0f, 0.8f);
             g_api->UiSliderFloat("flicker speed", &cfg.flickerSpeed, 0.1f, 4.0f);
             const lights::Stats ls = lights::GetStats();
-            char head[256];
-            std::snprintf(head, sizeof(head), "our lights: %u chunks, %u doodads scanned (%.2f ms), %u model lights (%u placed by the client, %u via the world matrix, %u with the file's colour), %u in range, %u merged, %u drawn (max %d)",
-                          ls.chunks, ls.doodads, ls.scanMs, ls.modelLights, ls.fromClient, ls.fromWorldMatrix, ls.fileColor,
+            char head[320];
+            std::snprintf(head, sizeof(head), "DoodadLightProperties / DoodadLightAssignment: %s%s; in range: %u table light(s), %u model(s) with their own lights suppressed, %u attachment(s) not found (at the origin instead)",
+                          lighttable::Status(), lighttable::Dirty() ? " (edited, not saved)" : "", ls.tableLights, ls.suppressedModels, ls.attachFallbacks);
+            g_api->UiTextWrapped(head);
+            if (g_api->UiButton("Reload light tables from disk")) lighttable::Load(g_cdbc);
+            std::snprintf(head, sizeof(head), "our lights: %u models in the scene, %u in range (scan %.2f ms), %u model lights (%u placed by the client, %u via the world matrix, %u with the file's colour), %u in range, %u merged, %u drawn (max %d)",
+                          ls.models, ls.modelsInRange, ls.scanMs, ls.modelLights, ls.fromClient, ls.fromWorldMatrix, ls.fileColor,
                           ls.inRange, ls.merged, ls.active, lights::kMaxLights);
             g_api->UiTextWrapped(head);
             g_api->UiTextWrapped(terrainlights::StatusLine());
@@ -279,6 +285,8 @@ namespace wxl_livingazeroth::debug
             for (const std::string& t : lines) g_api->UiTextWrapped(t.c_str());
         }
     }
+
+    void SetLightsCdbc(const WXL_SeyrisCdbcApi* cdbc) { g_cdbc = cdbc; }
 
     void RegisterLightsPanel(const WXL_Api* api)
     {

@@ -66,8 +66,20 @@ namespace wxl_livingazeroth::lights
     };
     Settings& Config();
 
-    /// One light as the renderers get it: world position, colour (already x brightness x fade), radius.
-    struct ActiveLight { float pos[3]; float color[3]; float radius; };
+    /// One light as the renderers get it: world position, colour (already x brightness x fade x
+    /// flicker), radius, falloff shape (1 = smooth default, higher = tighter), and a spot cone: the
+    /// direction it points (world, unit) with cos of the outer angle and 1 / (cos inner - cos outer);
+    /// a point light has cosOuter -2 (always inside).
+    struct ActiveLight
+    {
+        float pos[3];
+        float color[3];
+        float radius;
+        float falloff = 1.0f;
+        float spotDir[3] = { 0.0f, 0.0f, -1.0f };
+        float cosOuter = -2.0f;
+        float spotScale = 1.0f;
+    };
 
     /// Every few frames: rescan the doodads (they don't move), refresh positions and colours.
     void Update(float dt, const world::Snapshot& snap);
@@ -77,9 +89,29 @@ namespace wxl_livingazeroth::lights
 
     struct Stats
     {
-        unsigned chunks = 0, doodads = 0, modelLights = 0, fromClient = 0, fromWorldMatrix = 0,
+        unsigned models = 0, modelsInRange = 0, modelLights = 0, fromClient = 0, fromWorldMatrix = 0,
                  fileColor = 0, merged = 0, inRange = 0, active = 0;
+        unsigned tableLights = 0, suppressedModels = 0, attachFallbacks = 0; // DoodadLightAssignment
         double   scanMs = 0.0;
     };
+
+    /// Every model the client's M2 scene holds near a point: map doodads, WMO doodads, game objects
+    /// (campfires, portals), creatures. The scene's model list (head at scene +0x08, next at model
+    /// +0x0C; CM2Model_AttachToScene 0x834540 links every new model in), not culled by the camera.
+    struct SceneModel
+    {
+        const void*    model = nullptr;   // the model instance (CM2Model)
+        const uint8_t* header = nullptr;  // its parsed M2 header (null while loading)
+        const char*    path = "";         // its file path as the client has it
+        float          world[16] = {};    // its world matrix (instance +0xB4)
+        float          distance = 0.0f;   // from the point
+    };
+    /// `out` gets those within `range`, nearest first; returns how many the scene holds in all.
+    unsigned SceneModels(const float center[3], float range, std::vector<SceneModel>& out);
+
+    /// Where an assignment row puts its light on a model, at rest, in the model's space (before the
+    /// doodad's world matrix). False = the attachment wasn't found (then the origin + offset).
+    /// `header` is the model's parsed M2 header.
+    bool AttachmentPosition(const void* header, uint32_t attachType, int32_t attachIndex, const float offset[3], float out[3]);
     Stats GetStats();
 }

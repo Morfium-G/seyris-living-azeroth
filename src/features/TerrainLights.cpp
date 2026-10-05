@@ -11,9 +11,11 @@ namespace wxl_livingazeroth::terrainlights
 {
     namespace
     {
-        // The light list: 2 texels per light (world position + 1 / radius; colour), A32B32G32R32F,
-        // point sampled on s13. PS c206.x = how many.
-        constexpr int   kTexels = lights::kMaxLights * 2;
+        // The light list: 4 texels per light (world position + 1 / radius; colour + falloff shape; spot
+        // direction + cos outer angle; 1 / (cos inner - cos outer)), A32B32G32R32F, point sampled on
+        // s13. PS c206.x = how many.
+        constexpr int   kTexelsPerLight = 4;
+        constexpr int   kTexels = lights::kMaxLights * kTexelsPerLight;
         constexpr DWORD kSampler = 13;
         constexpr int   kConstant = 206;
 
@@ -52,7 +54,7 @@ namespace wxl_livingazeroth::terrainlights
 
     std::string PixelBlock(const std::string& r, std::string& defs)
     {
-        // c207 = (1 / texels, 2 / texels, 0.5 / texels, 0): texel steps; c208 = (2, -1, 1 / 1.5, 0);
+        // c207 = (1 / texels, texels per light / texels, 0.5 / texels, 0): texel steps; c208 = (2, -1, 1 / 1.5, 0);
         // c209 = (0.7, 1 / ln 2, 0.05, 0.03); c210 = the light-list uv's start (u, 0.5, 0, lod 0);
         // c211 = (the knee's minimum 0.8, 0.001).
         // ps_3_0 reads at most one constant register per instruction: 0.7 and 0.03 share c209.
@@ -65,7 +67,7 @@ namespace wxl_livingazeroth::terrainlights
                       "    def c207, %.9g, %.9g, %.9g, 0\n    def c208, 2, -1, 0.666666687, 0\n"
                       "    def c209, 0.7, 1.44269502, 0.05, 0.03\n    def c210, 0, 0.5, 0, 0\n    def c211, 0.8, 0.001, 0, 0\n"
                       "    defi i0, %d, 0, 0, 0\n    dcl_2d s13\n",
-                      1.0 / kTexels, 2.0 / kTexels, 0.5 / kTexels, lights::kMaxLights);
+                      1.0 / kTexels, static_cast<double>(kTexelsPerLight) / kTexels, 0.5 / kTexels, lights::kMaxLights);
         defs = d;
         return
             // The ground's normal (moisture texture red/green), toward up near and beyond the grid's edge.
@@ -85,6 +87,10 @@ namespace wxl_livingazeroth::terrainlights
             "\n      texldl r20, r21, s13"
             "\n      add r21.x, r21.x, c207.x"
             "\n      texldl r19, r21, s13"
+            "\n      add r21.x, r21.x, c207.x"
+            "\n      texldl r11, r21, s13"
+            "\n      add r21.x, r21.x, c207.x"
+            "\n      texldl r10, r21, s13"
             "\n      add r20.xyz, r20, -v9"
             "\n      dp3 r18.x, r20, r20"
             "\n      add r18.y, r18.x, c202.x"
@@ -93,10 +99,17 @@ namespace wxl_livingazeroth::terrainlights
             "\n      mul_sat r17.x, r18.w, r20.w"
             "\n      mad r17.x, r17.x, -r17.x, c202.x"
             "\n      mul r17.x, r17.x, r17.x"
+            // The falloff shape: the window to the light's power (colour texel .w).
+            "\n      pow r17.x, r17.x, r19.w"
             "\n      mul r20.xyz, r20, r18.z"
             "\n      dp3 r17.y, r24, r20"
             "\n      add r17.y, r17.y, c202.z"
             "\n      mul_sat r17.y, r17.y, c208.z"
+            // The spot cone: saturate((cos to the axis - cos outer) x scale); point lights: cos outer -2.
+            "\n      dp3 r17.w, -r20, r11"
+            "\n      add r17.w, r17.w, -r11.w"
+            "\n      mul_sat r17.w, r17.w, r10.x"
+            "\n      mul r17.y, r17.y, r17.w"
             "\n      rsq r17.z, r18.y"
             "\n      rcp r17.w, r17.z"
             "\n      mad r16.x, r17.w, c209.w, c209.x"
@@ -187,10 +200,12 @@ namespace wxl_livingazeroth::terrainlights
                 for (const lights::ActiveLight& l : lights::Active())
                 {
                     if (g_drawn >= static_cast<unsigned>(lights::kMaxLights)) break;
-                    float* o = t + g_drawn * 8;
+                    float* o = t + g_drawn * kTexelsPerLight * 4;
                     o[0] = l.pos[0]; o[1] = l.pos[1]; o[2] = l.pos[2];
                     o[3] = l.radius > 0.0f ? 1.0f / l.radius : 0.0f;
-                    o[4] = l.color[0]; o[5] = l.color[1]; o[6] = l.color[2];
+                    o[4] = l.color[0]; o[5] = l.color[1]; o[6] = l.color[2]; o[7] = l.falloff;
+                    o[8] = l.spotDir[0]; o[9] = l.spotDir[1]; o[10] = l.spotDir[2]; o[11] = l.cosOuter;
+                    o[12] = l.spotScale;
                     ++g_drawn;
                 }
                 g_texture->UnlockRect(0);

@@ -1,0 +1,15 @@
+  <Table Name="DoodadLightAssignment" Build="12340">
+    <Field Name="ID" Type="int" IsIndex="true" />
+    <Field Name="ModelPath" Type="string" />
+    <Field Name="AttachType" Type="int" />
+    <Field Name="AttachIndex" Type="int" />
+    <Field Name="AttachName" Type="string" />
+    <Field Name="OffsetX" Type="float" />
+    <Field Name="OffsetY" Type="float" />
+    <Field Name="OffsetZ" Type="float" />
+    <Field Name="DirectionX" Type="float" />
+    <Field Name="DirectionY" Type="float" />
+    <Field Name="DirectionZ" Type="float" />
+    <Field Name="LightID" Type="int" />
+    <Field Name="Flags" Type="int" />
+  </Table>

@@ -16,6 +16,7 @@
 
 #include "debug/ClimateView.hpp"
 #include "debug/DepthView.hpp"
+#include "debug/LightEditor.hpp"
 #include "debug/LightsView.hpp"
 #include "debug/SurfaceView.hpp"
 #include "debug/WindView.hpp"
@@ -26,6 +27,7 @@
 #include "env/Regional.hpp"
 #include "env/Wind.hpp"
 #include "env/WorldQuery.hpp"
+#include "features/DoodadLightTable.hpp"
 #include "features/GrassDensity.hpp"
 #include "features/GrassDistanceCap.hpp"
 #include "features/GrassDoodads.hpp"
@@ -72,6 +74,9 @@ namespace
         wxl_livingazeroth::cover::LoadTable(cdbc);
         wxl_livingazeroth::climate::Load(cdbc);
         wxl_livingazeroth::debug::SetClimateCdbc(cdbc);
+        wxl_livingazeroth::lighttable::Load(cdbc);
+        wxl_livingazeroth::debug::SetLightsCdbc(cdbc);
+        wxl_livingazeroth::debug::SetLightEditorCdbc(cdbc);
 
         wxl_livingazeroth::config::Apply(g_api);
         wxl_livingazeroth::grassdistance::OnFirstFrame();
@@ -151,6 +156,7 @@ int __cdecl WXL_Load(const WXL_Api* api)
     wxl_livingazeroth::debug::RegisterSurfacePanel(api);
     wxl_livingazeroth::debug::RegisterClimatePanel(api);
     wxl_livingazeroth::debug::RegisterLightsPanel(api);
+    wxl_livingazeroth::debug::RegisterLightEditor(api);
 
     api->Log(WXL_LOG_INFO, "wxl-seyris-living-azeroth", "v1.1 loaded (WXL_Load reached).");
     return 1;

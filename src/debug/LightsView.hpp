@@ -5,7 +5,11 @@
 
 #include "wxl/PluginApi.h"
 
+struct WXL_SeyrisCdbcApi;
+
 namespace wxl_livingazeroth::debug
 {
     void RegisterLightsPanel(const WXL_Api* api);
+    /// For the panel's "Reload light tables" button.
+    void SetLightsCdbc(const WXL_SeyrisCdbcApi* cdbc);
 }

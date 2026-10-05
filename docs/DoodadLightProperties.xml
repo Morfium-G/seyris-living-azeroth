@@ -1,0 +1,15 @@
+  <Table Name="DoodadLightProperties" Build="12340">
+    <Field Name="ID" Type="int" IsIndex="true" />
+    <Field Name="Name" Type="string" />
+    <Field Name="Type" Type="int" />
+    <Field Name="Color" Type="uint" />
+    <Field Name="Intensity" Type="float" />
+    <Field Name="Radius" Type="float" />
+    <Field Name="Falloff" Type="float" />
+    <Field Name="InnerAngle" Type="float" />
+    <Field Name="OuterAngle" Type="float" />
+    <Field Name="FlickerMode" Type="int" />
+    <Field Name="FlickerSpeed" Type="float" />
+    <Field Name="FlickerAmount" Type="float" />
+    <Field Name="Flags" Type="int" />
+  </Table>

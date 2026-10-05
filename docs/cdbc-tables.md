@@ -235,6 +235,62 @@ panel's zone list show it). A cover is **snow** when its CoverMaterial is the fa
   with Parents set so −1 fields resolve exactly as before.
 - 19 columns (before ZOffset/Wetness): run `convert_surface_cover_v3.py` first.
 
+## Doodad lights: two tables
+
+Lights for placed models (doodads) without editing the models: add a light to a model that has
+none, or replace a model's own light entries with better ones. Never named `Light*` (those are the
+sky's). Our lights light the **terrain and the surface cover** per pixel (up to 24 at once, the
+nearest to the camera); M2s, WMOs and characters keep the client's lighting for now. The **lights
+panel** shows every placed model near you with its path, bones, attachment points and particle
+emitters, and the **light editor** edits both tables live and saves them (old files kept as `.bak`).
+
+Generator with examples: `tools/gen_doodad_lights.py` (a torch flame replacing `generaltorch01`'s
+own light at its flame, a lantern, a downlight). After editing the files by hand, press "Reload
+light tables from disk".
+
+### DoodadLightProperties.cdbc — `DoodadLightProperties.xml`
+
+What a light is. A value of **−1 takes the default** (the lights panel's settings).
+
+| Field | Meaning |
+|---|---|
+| ID | light id (what assignments refer to) |
+| Name | for the editor |
+| Type | 0 = point, 1 = spot |
+| Color | 0xRRGGBB |
+| Intensity | × the colour. The stock torches are 1.4 × 0xFF9F49 |
+| Radius | yards; the light is **exactly 0** here (the stock falloff reaches ~13 yd to 5%). Default 16 |
+| Falloff | shape: 1 = smooth (default), higher = tighter around the source |
+| InnerAngle, OuterAngle | spot: degrees from the axis at full strength / none beyond |
+| FlickerMode | −1 default (smooth), 0 off, 1 smooth (a flame), 2 noise, 3 noise steps (no easing) |
+| FlickerSpeed | × the default pace |
+| FlickerAmount | 0..1, how much the light dips |
+| Flags | reserved, 0 |
+
+### DoodadLightAssignment.cdbc — `DoodadLightAssignment.xml`
+
+Where lights go. Several rows per model are fine (a brazier with two flames).
+
+| Field | Meaning |
+|---|---|
+| ID | row id |
+| ModelPath | the model's path as the panel shows it; case and `/` vs `\` don't matter |
+| AttachType | 0 = the model's origin, 1 = attachment point (by its ID), 2 = bone (by index), 3 = particle emitter (by index: its position, e.g. a flame) |
+| AttachIndex | the attachment point ID / bone index / emitter index |
+| AttachName | **reserved** for named attachment points, empty |
+| OffsetX/Y/Z | yards from the attachment, in the model's space (scaled with the doodad) |
+| DirectionX/Y/Z | spot lights: where the cone points, in the model's space (0, 0, −1 = down) |
+| LightID | a DoodadLightProperties ID; **0 = no light** (with the flag below: only suppress) |
+| Flags | 0x1 **suppress the model's own light entries** (our lights only; the client's M2 lighting still has them) |
+
+Every model the client has in its world scene counts: map doodads, WMO doodad sets, game objects
+(campfires, portals) and creatures (a fire elemental's model path gets its light too). Positions
+are the model at rest (bones not animated): exact for static doodads like torches; a swinging
+lantern's light would stay at its rest position, and a creature's light follows the creature but
+not its animation. The **radius scales with the model's scale** (a scaled-up fire reaches further).
+An attachment the model doesn't have puts the light at the origin + offset (the lights panel
+counts these).
+
 ## AreaClimate.cdbc — `AreaClimate.xml`
 
 The air's baseline per place: temperature through the day and the year, and humidity. Read by the
