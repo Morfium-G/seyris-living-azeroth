@@ -29,7 +29,8 @@ namespace wxl_livingazeroth::modellights
 
     /// Debug view on lit models: 0 off, 1 our lights only, 2 count check (flat red = our count /
     /// 24), 3 world stripes (the vertex position taken back to world space; they must stay fixed
-    /// while the camera turns).
+    /// while the camera turns), 4 mark WMO baked-colour surfaces (the WMO variants without a sun term
+    /// turn red: research for the interior rule).
     int& DebugView();
 
     /// Probe (debug): checks at every M2 batch draw that vertex sampler 0 holds our texture.

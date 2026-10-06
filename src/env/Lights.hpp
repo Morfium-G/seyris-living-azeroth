@@ -65,6 +65,7 @@ namespace wxl_livingazeroth::lights
         float flickerSpeed = 1.0f;   // x the default pace (~3 dips a second)
         int   models = 1;            // our lights on M2s and WMOs too (per vertex, like their stock lights)
         int   modelStockOff = 1;     // ... replacing the client's up to 4 per model (else added to them)
+        float bakedAdd = 1.0f;       // WMO surfaces with baked light (interiors): x ours before filling up to it
     };
     Settings& Config();
 
@@ -81,6 +82,7 @@ namespace wxl_livingazeroth::lights
         float spotDir[3] = { 0.0f, 0.0f, -1.0f };
         float cosOuter = -2.0f;
         float spotScale = 1.0f;
+        float dip = 0.0f;   // this frame's flicker dip (0 = full, the colour is already scaled by 1 - dip)
     };
 
     /// Every few frames: rescan the doodads (they don't move), refresh positions and colours.

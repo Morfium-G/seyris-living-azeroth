@@ -8,6 +8,7 @@
 #include "../features/TerrainWetness.hpp"
 #include "../render/M2Effects.hpp"
 #include "ShaderDump.hpp"
+#include "WmoBindProbe.hpp"
 
 #include "game/Doodad.hpp"
 
@@ -214,14 +215,25 @@ namespace wxl_livingazeroth::debug
             g_api->UiSliderFloat("flicker speed", &cfg.flickerSpeed, 0.1f, 4.0f);
             g_api->UiCheckbox("our lights on models too (M2s, WMOs; per vertex)", &cfg.models);
             g_api->UiCheckbox("models: replace the client's up to 4 lights (off = add ours to them)", &cfg.modelStockOff);
+            g_api->UiSliderFloat("WMO interiors: our light x (fills up to the baked light, never stacks)", &cfg.bakedAdd, 0.0f, 3.0f);
             {
-                static const char* const kViews[] = { "off", "our lights only", "count check (flat red)", "world stripes (must not move)" };
-                g_api->UiCombo("models: debug view", &modellights::DebugView(), kViews, 4);
+                static const char* const kViews[] = { "off", "our lights only", "count check (flat red)", "world stripes (must not move)",
+                                                      "mark WMO baked-light surfaces (red)" };
+                g_api->UiCombo("models: debug view", &modellights::DebugView(), kViews, 5);
                 g_api->UiCheckbox("models: probe the light texture at every model draw", &modellights::Probe());
                 const std::string probe = modellights::ProbeLine();
                 g_api->UiTextWrapped(probe.c_str());
                 if (g_api->UiButton("Copy model-light status##mlcopy"))
                     CopyToClipboard(std::string(modellights::StatusLine()) + "\r\n" + probe + "\r\n");
+
+                // Research: which effect permutation WMO batches bind (interior lighting rule).
+                g_api->UiCheckbox("WMO bind probe: record the shader permutations WMO batches use", &WmoBindProbeEnabled());
+                if (g_api->UiButton("Clear##wmoprobe")) ClearWmoBindProbe();
+                g_api->UiSameLine();
+                const std::string report = WmoBindProbeReport();
+                if (g_api->UiButton("Copy WMO bind probe##wmoprobecopy"))
+                    CopyToClipboard(std::string(modellights::StatusLine()) + "\r\n" + report);
+                g_api->UiTextWrapped(report.c_str());
             }
             const lights::Stats ls = lights::GetStats();
             char head[320];

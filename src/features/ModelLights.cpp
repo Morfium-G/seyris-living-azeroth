@@ -34,12 +34,13 @@ namespace wxl_livingazeroth::modellights
         //  world -> view, row-vector convention, gfx::SceneMatrices)  t5  debug-view weights
         //  t6  K1 (1/W, 4/W, first light's u, 0)   t7  K2 (1, 0, 0.5, 2/3)
         //  t8  K3 (0.7, 0.03, 1/ln2, 0.05)         t9  K4 (0.8, 0.001, 0.25, 1/24)
-        //  t10.. the lights, 4 texels each (world position + 1 / radius; colour + falloff shape;
-        //        spot direction + cos outer; 1 / (cos inner - cos outer)), as the terrain's list.
+        //  t10 K5 (scale of ours on baked-light WMO surfaces, 0, 0, 0)
+        //  t11.. the lights, 4 texels each (world position + 1 / radius; colour + falloff shape;
+        //        spot direction + cos outer; 1 / (cos inner - cos outer), 0, flicker dip, 0).
         // The shaders' positions, normals and sun direction are in VIEW space (their fog reads the
         // position's z as depth; lights placed as world - camera moved with the camera's angle,
         // in-client 2026-10-06), hence the camera and the view in the header.
-        constexpr int   kHeader = 10;
+        constexpr int   kHeader = 11;
         constexpr int   kTexelsPerLight = 4;
         constexpr int   kWidth = kHeader + lights::kMaxLights * kTexelsPerLight;
         constexpr DWORD kSampler = D3DVERTEXTEXTURESAMPLER0;
@@ -51,7 +52,12 @@ namespace wxl_livingazeroth::modellights
         unsigned           g_count = 0;
         bool               g_stockOff = false;
         unsigned           g_patched = 0;
-        int                g_debug = 0;       // 0 off, 1 ours only, 2 count check, 3 world stripes
+        int                g_debug = 0;       // 0 off, 1 ours only, 2 count check, 3 world stripes, 4 mark WMO baked surfaces
+        unsigned           g_marked = 0;      // baked-colour WMO variants carrying the marker
+        // The vertex-set name of the shader being patched: the rule's membership test runs right
+        // before its edit for the same wrapper (shaderpatch::CreateWithTableRules), so the edit can
+        // tell WMO families from M2 ones that look alike in text.
+        std::string        g_family;
         std::string        g_status;
 
         // Probe (debug): at each M2 batch draw (OnM2BatchDraw, right after the native draw) check
@@ -287,7 +293,8 @@ namespace wxl_livingazeroth::modellights
             return std::string::npos;
         }
 
-        // Every line matching `re`: its start offset and first non-empty capture.
+        // Every line matching `re`: its start offset and first non-empty capture (empty when the
+        // pattern has no groups).
         struct Hit { std::string::size_type at; std::string reg; };
         std::vector<Hit> Lines(const std::string& src, const std::regex& re)
         {
@@ -300,11 +307,209 @@ namespace wxl_livingazeroth::modellights
                 const std::string line = src.substr(at, end - at);
                 std::smatch m;
                 if (std::regex_match(line, m, re))
+                {
+                    std::string reg;
                     for (size_t g = 1; g < m.size(); ++g)
-                        if (m[g].matched) { out.push_back({ at, m[g].str() }); break; }
+                        if (m[g].matched) { reg = m[g].str(); break; }
+                    out.push_back({ at, reg });
+                }
                 at = end + 1;
             }
             return out;
+        }
+
+        // WMO surfaces with baked light: the WMO variants without a sun term pass the baked vertex
+        // colour straight on (`mov oColour, vColour`, all 315 in the dumps). Interior groups draw with
+        // them (owner's bind probe + marker, Deadmines 2026-10-06). The baked colour already holds the
+        // WMO's own torches, so ours FILL UP to it instead of stacking (owner + design 2026-10-06):
+        //  - the same light loop as on lit surfaces, the normal from c31..c33 (the variants without a
+        //    normal get distance-only light);
+        //  - the baked light (the vertex colour, half scale: the pixel shader doubles it) dips with each
+        //    flame's flicker by that flame's share of the spot's brightness (its light / the baked);
+        //  - per channel, ours (x the panel's scale, halved) adds only what exceeds the baked light, so
+        //    an orange torch over its own orange glow adds ~nothing, a dark corner or another colour gets
+        //    it in full;
+        //  - the terrain's knee on the brightest channel, then debug views (ours only, the t0.z marker).
+        std::string BakedBlock(const std::string& vc, const std::string& oc, const std::string& vn)
+        {
+            std::string b = std::string() +
+                "    mov r27, c1\n"
+                "    texldl r28, r27, s0\n"
+                "    if_gt r28.w, c1.w\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    texldl r16, r27, s0\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    texldl r13, r27, s0\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    texldl r14, r27, s0\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    texldl r15, r27, s0\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    texldl r9, r27, s0\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    texldl r10, r27, s0\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    texldl r11, r27, s0\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    texldl r12, r27, s0\n"
+                "";
+            if (!vn.empty()) b += std::string() +
+                "    dp3 r30.x, c31, " + vn + "\n"
+                "    dp3 r30.y, c32, " + vn + "\n"
+                "    dp3 r30.z, c33, " + vn + "\n"
+                "    nrm r17.xyz, r30\n"
+                "    mov r30.xyz, r17\n"
+                "";
+            b += std::string() +
+                "    dp3 r30.w, " + vc + ", r10.x\n"
+                "    add r30.w, r30.w, r30.w\n"
+                "    add r30.w, r30.w, r12.y\n"
+                "    rcp r29.w, r30.w\n"
+                "    mov r31.xyz, r10.y\n"
+                "    mov r28.x, r10.y\n"
+                "    mov r28.z, r10.y\n"
+                "    mov r27, c1\n"
+                "    rep i0\n"
+                "      break_ge r28.z, r28.y\n"
+                "      mad r27.x, r28.z, r9.y, r9.z\n"
+                "      texldl r26, r27, s0\n"
+                "      add r27.x, r27.x, r9.x\n"
+                "      texldl r25, r27, s0\n"
+                "      add r27.x, r27.x, r9.x\n"
+                "      texldl r24, r27, s0\n"
+                "      add r27.x, r27.x, r9.x\n"
+                "      texldl r23, r27, s0\n"
+                "      add r19.xyz, r26, -r16\n"
+                "      mov r19.w, r10.x\n"
+                "      dp4 r18.x, r19, r13\n"
+                "      dp4 r18.y, r19, r14\n"
+                "      dp4 r18.z, r19, r15\n"
+                "      add r26.xyz, r18, -r29\n"
+                "      dp3 r17.x, r24, r13\n"
+                "      dp3 r17.y, r24, r14\n"
+                "      dp3 r17.z, r24, r15\n"
+                "      mov r24.xyz, r17\n"
+                "      dp3 r22.x, r26, r26\n"
+                "      add r22.y, r22.x, r10.x\n"
+                "      rsq r22.z, r22.x\n"
+                "      rcp r22.w, r22.z\n"
+                "      mul_sat r21.x, r22.w, r26.w\n"
+                "      mad r21.x, r21.x, -r21.x, r10.x\n"
+                "      mul r21.x, r21.x, r21.x\n"
+                "      pow r21.x, r21.x, r25.w\n"
+                "      mul r26.xyz, r26, r22.z\n"
+                "";
+            if (!vn.empty()) b += std::string() +
+                "      dp3 r21.y, r30, r26\n"
+                "      add r21.y, r21.y, r10.z\n"
+                "      mul_sat r21.y, r21.y, r10.w\n"
+                "";
+            else b += std::string() +
+                "      mov r21.y, r10.x\n"
+                "";
+            b += std::string() +
+                "      dp3 r21.w, -r26, r24\n"
+                "      add r21.w, r21.w, -r24.w\n"
+                "      mul_sat r21.w, r21.w, r23.x\n"
+                "      mul r21.y, r21.y, r21.w\n"
+                "      rsq r21.z, r22.y\n"
+                "      rcp r21.w, r21.z\n"
+                "      mad r20.x, r21.w, r11.y, r11.x\n"
+                "      mul r20.x, r20.x, r21.w\n"
+                "      rcp r20.x, r20.x\n"
+                "      mul r20.x, r20.x, r21.x\n"
+                "      mul r20.x, r20.x, r21.y\n"
+                "      mul r19.xyz, r25, r20.x\n"
+                "      add r31.xyz, r31, r19\n"
+                "      dp3 r19.w, r19, r10.x\n"
+                "      mul_sat r19.w, r19.w, r29.w\n"
+                "      mad r28.x, r23.z, r19.w, r28.x\n"
+                "      add r28.z, r28.z, r10.x\n"
+                "    endrep\n"
+                "    min r28.x, r28.x, r10.x\n"
+                "    add r28.x, r10.x, -r28.x\n"
+                "    mul r17.xyz, " + vc + ", r28.x\n"
+                "    mov r27, c1\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    texldl r22, r27, s0\n"
+                "    mul r18.xyz, r31, r22.x\n"
+                "    mul r18.xyz, r18, r10.z\n"
+                "    add r21.xyz, r18, -r17\n"
+                "    max r21.xyz, r21, r10.y\n"
+                "    add r21.xyz, r17, r21\n"
+                "    max r22.x, r21.x, r21.y\n"
+                "    max r22.x, r22.x, r21.z\n"
+                "    max r22.y, r17.x, r17.y\n"
+                "    max r22.y, r22.y, r17.z\n"
+                "    max r22.y, r22.y, r12.x\n"
+                "    add r22.z, r22.x, -r22.y\n"
+                "    max r22.z, r22.z, r10.y\n"
+                "    add r22.w, r10.x, -r22.y\n"
+                "    max r22.w, r22.w, r12.y\n"
+                "    rcp r23.x, r22.w\n"
+                "    mul r23.y, r22.z, r23.x\n"
+                "    mul r23.y, r23.y, -r11.z\n"
+                "    exp r23.y, r23.y\n"
+                "    add r23.y, r10.x, -r23.y\n"
+                "    mul r23.y, r23.y, r22.w\n"
+                "    add r23.z, r22.x, -r22.z\n"
+                "    add r23.z, r23.z, r23.y\n"
+                "    max r23.w, r22.x, r12.y\n"
+                "    rcp r23.w, r23.w\n"
+                "    mul r23.z, r23.z, r23.w\n"
+                "    mul r17.xyz, r21, r23.z\n"
+                "    mov r27, c1\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    texldl r20, r27, s0\n"
+                "    add r24.x, r10.x, -r20.x\n"
+                "    mul r17.xyz, r17, r24.x\n"
+                "    mad r17.xyz, r18, r20.x, r17\n"
+                "    mov r17.w, " + vc + ".w\n"
+                "    mov r27, c1\n"
+                "    texldl r28, r27, s0\n"
+                "    mad r17.yz, r17, -r28.z, r17\n"
+                "    else\n"
+                "    mov r17, " + vc + "\n"
+                "    endif\n"
+                "    mov " + oc + ", r17\n"
+                "";
+            return b;
+        }
+
+        bool BakedRule(std::string& src, std::string& why)
+        {
+            why = "unlit (no sun term)";
+            if (g_family.compare(0, 6, "MapObj") != 0) return false;
+            static const std::regex colourOut(R"(dcl_color (o\d+))"), colourIn(R"(dcl_color (v\d+))"), normalIn(R"(dcl_normal (v\d+))");
+            std::smatch o, v, n;
+            if (!std::regex_search(src, o, colourOut) || !std::regex_search(src, v, colourIn)) return false;
+            const std::string oc = o[1].str(), vc = v[1].str();
+            const std::string vn = std::regex_search(src, n, normalIn) ? n[1].str() : std::string();
+            const std::vector<Hit> copy = Lines(src, std::regex("^\\s*mov " + oc + ", " + vc + "\\s*$"));
+            const std::vector<Hit> pos = Lines(src, kPosition);
+            if (copy.size() != 1 || pos.size() != 1) { why = "baked: anchors"; return false; }
+            if (pos[0].at > copy[0].at) { why = "baked: position after colour"; return false; }
+            std::string::size_type end = src.find('\n', copy[0].at);
+            end = end == std::string::npos ? src.size() : end + 1;
+            src.replace(copy[0].at, end - copy[0].at, BakedBlock(vc, oc, vn));
+            src.insert(pos[0].at, "    mov r29.xyz, " + pos[0].reg + "\n");
+            src.insert(src.find('\n') + 1, Prologue());
+            ++g_marked;
+            return true;
         }
 
         bool EditVertex(std::string& src, std::string& why)
@@ -313,7 +518,7 @@ namespace wxl_livingazeroth::modellights
             static const std::regex clash(R"(\b(i0|aL|c1|r9|r1[0-9]|r2[0-9]|r3[01])\b)");
             if (std::regex_search(src, clash)) { why = "uses a register the patch needs"; return false; }
             const std::vector<Hit> sun = Lines(src, kSun);
-            if (sun.empty()) { why = "unlit (no sun term)"; return false; }
+            if (sun.empty()) return BakedRule(src, why);
             const std::vector<Hit> pos = Lines(src, kPosition), colour = Lines(src, kColour);
             if (pos.size() != 1 || sun.size() != 1 || colour.size() != 1)
             {
@@ -323,11 +528,14 @@ namespace wxl_livingazeroth::modellights
                 why = b;
                 return false;
             }
-            // From the bottom up, so the earlier offsets stay valid (position < sun < colour).
-            if (!(pos[0].at < sun[0].at && sun[0].at < colour[0].at)) { why = "anchors out of order"; return false; }
+            // Position and normal must be captured before the colour write reads our sum; their own order
+            // varies (4 M2 variants compute the sun term first). Inserted from the bottom up, so the
+            // earlier offsets stay valid.
+            if (!(pos[0].at < colour[0].at && sun[0].at < colour[0].at)) { why = "anchors out of order"; return false; }
             src.insert(colour[0].at, LampBlock(colour[0].reg));
-            src.insert(sun[0].at, "    mov r30.xyz, " + sun[0].reg + "\n");
-            src.insert(pos[0].at, "    mov r29.xyz, " + pos[0].reg + "\n");
+            const std::string savePos = "    mov r29.xyz, " + pos[0].reg + "\n", saveNormal = "    mov r30.xyz, " + sun[0].reg + "\n";
+            if (sun[0].at > pos[0].at) { src.insert(sun[0].at, saveNormal); src.insert(pos[0].at, savePos); }
+            else                       { src.insert(pos[0].at, savePos); src.insert(sun[0].at, saveNormal); }
 
             static const std::regex stockColour(R"(\bc(17|18|19|20)\b)");
             if (std::regex_search(src, stockColour))
@@ -363,7 +571,7 @@ namespace wxl_livingazeroth::modellights
                     o[3] = l.radius > 0.0f ? 1.0f / l.radius : 0.0f;
                     o[4] = l.color[0]; o[5] = l.color[1]; o[6] = l.color[2]; o[7] = l.falloff;
                     o[8] = l.spotDir[0]; o[9] = l.spotDir[1]; o[10] = l.spotDir[2]; o[11] = l.cosOuter;
-                    o[12] = l.spotScale;
+                    o[12] = l.spotScale; o[14] = l.dip;
                     ++g_count;
                 }
                 const lights::Settings& cfg = lights::Config();
@@ -373,12 +581,14 @@ namespace wxl_livingazeroth::modellights
                 for (int col = 0; col < 3; ++col)
                     for (int row = 0; row < 4; ++row) t[(2 + col) * 4 + row] = V[row * 4 + col];
                 if (g_debug >= 1 && g_debug <= 3) { t[5 * 4 + (g_debug - 1)] = 1.0f; t[5 * 4 + 3] = 1.0f; }
+                if (g_debug == 4) t[2] = 1.0f; // mark the WMO baked-colour surfaces
                 const float k[16] = {
                     1.0f / kWidth, static_cast<float>(kTexelsPerLight) / kWidth, (kHeader + 0.5f) / kWidth, 0.0f,
                     1.0f, 0.0f, 0.5f, 2.0f / 3.0f,
                     0.7f, 0.03f, 1.44269502f, 0.05f,
                     0.8f, 0.001f, 0.25f, 1.0f / 24.0f };
                 std::memcpy(t + 6 * 4, k, sizeof(k));
+                t[10 * 4] = cfg.bakedAdd;
             }
             else g_stockOff = false;
             g_active = active;
@@ -391,7 +601,12 @@ namespace wxl_livingazeroth::modellights
         shaderpatch::TableRule rule;
         rule.name = "model lights (M2/WMO vertex)";
         rule.pixel = false;
-        rule.contains = &m2effects::IsVertexWrapper;
+        rule.contains = [](const void* wrapper)
+        {
+            const m2effects::Effect* e = m2effects::FindVertexEffect(wrapper);
+            g_family = e ? e->vertexName : std::string();
+            return e != nullptr;
+        };
         rule.edit = &EditVertex;
         shaderpatch::Register(std::move(rule));
     }
@@ -420,8 +635,8 @@ namespace wxl_livingazeroth::modellights
     const char* StatusLine()
     {
         char line[256];
-        std::snprintf(line, sizeof(line), "model lights (M2/WMO): %s, %u per vertex; the client's up to 4 per model %s; %u vertex shader variant(s) patched so far%s",
-                      g_active ? "on" : "off", g_count, g_stockOff ? "switched off" : "on", g_patched,
+        std::snprintf(line, sizeof(line), "model lights (M2/WMO): %s, %u per vertex; the client's up to 4 per model %s; %u lit and %u baked-light (WMO interior) vertex shader variant(s) patched so far%s",
+                      g_active ? "on" : "off", g_count, g_stockOff ? "switched off" : "on", g_patched, g_marked,
                       g_failed ? " -- the light texture (A32B32G32R32F) couldn't be created" : "");
         g_status = line;
         return g_status.c_str();

@@ -36,4 +36,7 @@ namespace wxl_livingazeroth::m2effects
     /// their set load creates the shaders, so this already holds while they're being created (and
     /// again when a device reset recreates them).
     bool IsVertexWrapper(const void* wrapper);
+
+    /// The first recorded effect whose vertex table holds the wrapper, or null.
+    const Effect* FindVertexEffect(const void* wrapper);
 }

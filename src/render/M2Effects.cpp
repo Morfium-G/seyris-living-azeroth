@@ -46,15 +46,17 @@ namespace wxl_livingazeroth::m2effects
 
     const std::vector<Effect>& Effects() { return g_effects; }
 
-    bool IsVertexWrapper(const void* wrapper)
+    const Effect* FindVertexEffect(const void* wrapper)
     {
-        if (!wrapper) return false;
+        if (!wrapper) return nullptr;
         for (const Effect& e : g_effects)
         {
             const auto* table = reinterpret_cast<void* const*>(e.object + kVertexTable);
             for (int i = 0; i < kVertexEntries; ++i)
-                if (table[i] == wrapper) return true;
+                if (table[i] == wrapper) return &e;
         }
-        return false;
+        return nullptr;
     }
+
+    bool IsVertexWrapper(const void* wrapper) { return FindVertexEffect(wrapper) != nullptr; }
 }

@@ -488,6 +488,7 @@ namespace wxl_livingazeroth::lights
             l.falloff = c.falloff > 0.0f ? c.falloff : 1.0f;
             std::memcpy(l.spotDir, c.spotDir, sizeof(l.spotDir));
             l.cosOuter = c.cosOuter; l.spotScale = c.spotScale;
+            l.dip = 1.0f - flicker;
             g_active.push_back(l);
         }
         g_stats.active = static_cast<unsigned>(g_active.size());

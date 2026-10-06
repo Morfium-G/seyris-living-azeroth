@@ -20,6 +20,7 @@
 #include "debug/LightsView.hpp"
 #include "debug/SurfaceView.hpp"
 #include "debug/WindView.hpp"
+#include "debug/WmoBindProbe.hpp"
 #include "env/Actors.hpp"
 #include "env/Climate.hpp"
 #include "env/Fields.hpp"
@@ -145,6 +146,7 @@ int __cdecl WXL_Load(const WXL_Api* api)
     wxl_livingazeroth::modellights::Register();
     wxl_livingazeroth::shaderpatch::Install(api);
     wxl_livingazeroth::modellights::InstallProbe(api);
+    wxl_livingazeroth::debug::InstallWmoBindProbe(api);
     // Records the M2 shader effects as the client loads them (research: dumps; later M2 patches).
     wxl_livingazeroth::m2effects::Install(api);
 
