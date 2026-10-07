@@ -9,6 +9,7 @@
 #include "game/Gfx.hpp"
 #include "game/Gx.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -28,32 +29,56 @@ namespace wxl_livingazeroth::modellights
         // (the header's texture coordinates) and reads the rest from the texture. A def above c31
         // would also replace bone data for the batches that reach it.
         //
-        // One row of kWidth A32B32G32R32F texels:
-        //  t0  (stock lights off amount, our light count, 0, valid)   all zero = stock lighting only
-        //  t1  camera position                t2..t4  the scene view's columns (camera-relative
+        // kWidth A32B32G32R32F texels per row (fixed: the shaders' defs know it; the height follows
+        // the grid settings and reaches them through the header). Also bound to the terrain's PS s13
+        // (TerrainLights), which takes the grid from pixel constants instead of the header.
+        //  row 0, the header:
+        //  t0  (stock lights off amount, 0, 0, valid)   all zero = stock lighting only
+        //  t1  camera position, .w the occlusion region's first row + 0.5
+        //                                     t2..t4  the scene view's columns (camera-relative
         //  world -> view, row-vector convention, gfx::SceneMatrices)  t5  debug-view weights
-        //  t6  K1 (1/W, 4/W, first light's u, 0)   t7  K2 (1, 0, 0.5, 2/3)
-        //  t8  K3 (0.7, 0.03, 1/ln2, 0.05)         t9  K4 (0.8, 0.001, 0.25, 1/24)
+        //  t6  K1 (1/W, 1/H, lights per cell, 0)   t7  K2 (1, 0, 0.5, 2/3)
+        //  t8  K3 (0.7, 0.03, 1/ln2, 0.05)         t9  K4 (0.8, 0.001, 0.25, 1 / lights per cell)
         //  t10 K5 (scale of ours on baked-light WMO surfaces, 0, 0, 0)
-        //  t11.. the lights, 4 texels each (world position + 1 / radius; colour + falloff shape;
-        //        spot direction + cos outer; 1 / (cos inner - cos outer), 0, flicker dip, 0).
+        //  t11 the grid (world x, y of cell 0's corner, 1 / cell size, cells per side)
+        //  rows 1..: the cells' entries, row-major: cell c's k-th light at linear texel c * perCell + k,
+        //        each (u, v of the light's first texel, 1, 0); (0, 0, 0, 0) ends a cell's list.
+        //  then the light pool (lights::Active()), 4 texels each, never split across rows (world
+        //        position + 1 / radius; colour + falloff shape; spot direction + cos outer;
+        //        1 / (cos inner - cos outer), 0, flicker dip, 1 = indoor: not on the terrain).
         // The shaders' positions, normals and sun direction are in VIEW space (their fog reads the
         // position's z as depth; lights placed as world - camera moved with the camera's angle,
-        // in-client 2026-10-06), hence the camera and the view in the header.
-        constexpr int   kHeader = 11;
+        // in-client 2026-10-06), hence the camera and the view in the header; each vertex goes back to
+        // world space to find its cell.
+        constexpr int   kHeader = 12;
         constexpr int   kTexelsPerLight = 4;
-        constexpr int   kWidth = kHeader + lights::kMaxLights * kTexelsPerLight;
+        constexpr int   kWidth = 1024;
+        constexpr int   kPoolRows = (lights::kMaxPool * kTexelsPerLight + kWidth - 1) / kWidth;
+        static_assert(kWidth % kTexelsPerLight == 0, "a light's texels must share a row");
+        // Baked occlusion, after the pool: light p's tile (lights::kOccCells distances, 4 per texel) at
+        // linear texel p x kOccTexels of this region; its 4th texel .y = p / kTilesPerRow, so the
+        // shaders take the row from the whole part and the tile's u from the fraction (or -1: none).
+        constexpr int   kOccTexels = lights::kOccCells / 4;
+        constexpr int   kTilesPerRow = kWidth / kOccTexels;
+        constexpr int   kOccRows = (lights::kMaxPool + kTilesPerRow - 1) / kTilesPerRow;
+        static_assert(kWidth % kOccTexels == 0, "a tile must not split across rows");
+        std::vector<const float*> g_occWritten; // per pool light, the occlusion its tile holds
         constexpr DWORD kSampler = D3DVERTEXTEXTURESAMPLER0;
 
         IDirect3DDevice9*  g_device = nullptr;
         IDirect3DTexture9* g_texture = nullptr;
+        int                g_height = 0;      // rows of the texture as created
+        int                g_entryRows = 0;   // of those, the cells' entries (after the header row)
+        unsigned           g_gridWritten = ~0u; // the grid generation the entry rows hold
         bool               g_failed = false;
         bool               g_active = false;  // header valid this frame
-        unsigned           g_count = 0;
+        bool               g_gridOn = false;  // entries and pool filled this frame
+        unsigned           g_count = 0;       // lights in the pool
         bool               g_stockOff = false;
         unsigned           g_patched = 0;
         int                g_debug = 0;       // 0 off, 1 ours only, 2 count check, 3 world stripes, 4 mark WMO baked surfaces
         unsigned           g_marked = 0;      // baked-colour WMO variants carrying the marker
+        unsigned           g_normalsGiven = 0; // of those, shadow-tier-0 variants given a normal input
         // The vertex-set name of the shader being patched: the rule's membership test runs right
         // before its edit for the same wrapper (shaderpatch::CreateWithTableRules), so the edit can
         // tell WMO families from M2 ones that look alike in text.
@@ -85,19 +110,34 @@ namespace wxl_livingazeroth::modellights
             if (g_texture) g_texture->Release();
             g_texture = nullptr;
             g_device = nullptr;
+            g_height = 0;
         }
 
+        int EntryRows(const lights::Grid& g)
+        {
+            const int entries = g.cells * g.cells * g.perCell;
+            return (entries + kWidth - 1) / kWidth;
+        }
+
+        // Sized for the current grid settings; recreated when they change.
         bool EnsureTexture(IDirect3DDevice9* device)
         {
             if (device != g_device) { Release(); g_failed = false; g_device = device; }
-            if (g_texture) return true;
+            const int entryRows = EntryRows(lights::CellGrid());
+            const int height = 1 + entryRows + kPoolRows + kOccRows;
+            if (g_texture && height == g_height) return true;
+            if (g_texture) { g_texture->Release(); g_texture = nullptr; g_failed = false; }
             if (g_failed) return false;
-            if (FAILED(device->CreateTexture(kWidth, 1, 1, 0, D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED, &g_texture, nullptr)))
+            if (FAILED(device->CreateTexture(kWidth, height, 1, 0, D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED, &g_texture, nullptr)))
             {
                 g_texture = nullptr;
                 g_failed = true;
                 return false;
             }
+            g_height = height;
+            g_entryRows = entryRows;
+            g_gridWritten = ~0u;
+            g_occWritten.clear();
             return true;
         }
 
@@ -124,12 +164,127 @@ namespace wxl_livingazeroth::modellights
         const std::regex kSun(R"(^\s*dp3_sat r\d+\.[xyzw], -c12, (r\d+)\s*$)");
         const std::regex kColour(R"(^\s*(?:mad_sat o\d+(?:\.xyz)?, [rv]\d+, (r\d+), c29|add_sat o\d+(?:\.xyz)?, (r\d+), c29)\s*$)");
 
+        // c1 = (header u of t0, v of row 0, 1 / W: one texel along the row, 0).
         std::string Prologue()
         {
             char d[160];
-            std::snprintf(d, sizeof(d), "    def c1, %.9g, 0.5, %.9g, 0\n    defi i0, %d, 0, 0, 0\n    dcl_2d s0\n",
-                          0.5 / kWidth, 1.0 / kWidth, lights::kMaxLights);
+            std::snprintf(d, sizeof(d), "    def c1, %.9g, 0, %.9g, 0\n    defi i0, %d, 0, 0, 0\n    dcl_2d s0\n",
+                          0.5 / kWidth, 1.0 / kWidth, lights::kMaxPerCellCap);
             return d;
+        }
+
+        // Before the loop: the vertex's cell. Position r29 (view) -> camera-relative -> world (the
+        // world-stripes debug view's transform, confirmed in-client), minus the grid's corner (t11 in
+        // r20), in cells, floored, clamped to the grid (a light past its radius adds 0, so a clamped
+        // cell is only wasted work); r28.y = its first entry (cell x lights per cell).
+        std::string CellSetup()
+        {
+            return
+                "    mov r17.x, r13.w\n"
+                "    mov r17.y, r14.w\n"
+                "    mov r17.z, r15.w\n"
+                "    add r17.xyz, r29, -r17\n"
+                "    mul r18.xyz, r17.x, r13\n"
+                "    mad r18.xyz, r17.y, r14, r18\n"
+                "    mad r18.xyz, r17.z, r15, r18\n"
+                "    add r18.xy, r18, r16\n"
+                "    add r18.xy, r18, -r20\n"
+                "    mul r18.xy, r18, r20.z\n"
+                "    frc r19.xy, r18\n"
+                "    add r18.xy, r18, -r19\n"
+                "    max r18.xy, r18, r10.y\n"
+                "    add r19.x, r20.w, -r10.x\n"
+                "    min r18.xy, r18, r19.x\n"
+                "    mad r18.x, r18.y, r20.w, r18.x\n"
+                "    mul r28.y, r18.x, r9.z\n";
+        }
+
+        // Baked occlusion (lights::Bake), inside the loop once the light's strength r20.x is known: the
+        // direction from the light to this vertex, back to world space (view columns r13..r15, the
+        // world-stripes transform), on the octahedral map (n = d / |d|1, lower half folded), its cell
+        // of 8 x 8, the tile's texel (4 cells each) and component; a vertex farther than the stored
+        // reach (+ 0.5 yd, soft over 0.5 yd) gets none of this light. 4th texel r23.y = tile / tiles
+        // per row (-1 = none), r16.w = the region's first row + 0.5.
+        std::string OcclusionVS()
+        {
+            return
+                "      if_ge r23.y, c1.w\n"
+                "      mul r17.xyz, r26.x, r13\n"
+                "      mad r17.xyz, r26.y, r14, r17\n"
+                "      mad r17.xyz, r26.z, r15, r17\n"
+                "      add r18.x, r17_abs.x, r17_abs.y\n"
+                "      add r18.x, r18.x, r17_abs.z\n"
+                "      rcp r18.x, r18.x\n"
+                "      mul r18.xyz, -r17, r18.x\n"
+                "      sge r19.xy, r18, c1.w\n"
+                "      add r19.xy, r19, r19\n"
+                "      add r19.xy, r19, -r10.x\n"
+                "      add r19.zw, r10.x, -r18_abs.xxyx\n"
+                "      mul r19.xy, r19, r19.zw\n"
+                "      add r19.xy, r19, -r18\n"
+                "      slt r19.z, r18.z, c1.w\n"
+                "      mad r18.xy, r19, r19.z, r18\n"
+                "      rcp r19.w, r12.z\n"
+                "      add r18.xy, r18, r10.x\n"
+                "      mul r18.xy, r18, r19.w\n"
+                "      add r19.z, r19.w, r19.w\n"
+                "      add r19.z, r19.z, -r12.y\n"
+                "      min r18.xy, r18, r19.z\n"
+                "      frc r19.xy, r18\n"
+                "      add r18.xy, r18, -r19\n"
+                "      mul r19.x, r18.x, r12.z\n"
+                "      frc r19.y, r19.x\n"
+                "      add r19.x, r19.x, -r19.y\n"
+                "      mul r19.y, r19.y, r19.w\n"
+                "      add r18.y, r18.y, r18.y\n"
+                "      add r19.x, r19.x, r18.y\n"
+                "      frc r18.z, r23.y\n"
+                "      add r18.w, r23.y, -r18.z\n"
+                "      add r19.x, r19.x, r10.z\n"
+                "      mad r27.x, r19.x, r9.x, r18.z\n"
+                "      add r18.w, r18.w, r16.w\n"
+                "      mul r27.y, r18.w, r9.y\n"
+                "      texldl r18, r27, s0\n"
+                "      add r17.x, r19.y, -r10.y\n"
+                "      add r17.y, r19.y, -r10.x\n"
+                "      add r17.z, r17.y, -r10.x\n"
+                "      add r17.w, r17.z, -r10.x\n"
+                "      slt r17, r17_abs, r10.z\n"
+                "      dp4 r17.x, r18, r17\n"
+                "      add r17.x, r17.x, -r22.w\n"
+                "      add r17.x, r17.x, r17.x\n"
+                "      add_sat r17.x, r17.x, r10.x\n"
+                "      mul r20.x, r20.x, r17.x\n"
+                "      endif\n";
+        }
+
+        // Lit WMO surfaces are exteriors (interiors draw with the baked-light variants): a light inside
+        // an indoor group (4th texel r23.w = 1, set only while the panel's switch is on) stays off them,
+        // like off the terrain, so a chimney or cellar torch doesn't light the outside walls.
+        std::string IndoorSkip()
+        {
+            return
+                "      add r23.w, r10.x, -r23.w\n"
+                "      mul r20.x, r20.x, r23.w\n";
+        }
+
+        // At the top of the loop (counter r28.z): this cell's entry r28.y + r28.z at texel (column,
+        // 1 + row) of the W-wide rows; an empty entry ends the list; r27.xy = the light's first texel.
+        std::string EntryFetch()
+        {
+            return
+                "      break_ge r28.z, r9.z\n"
+                "      add r17.x, r28.y, r28.z\n"
+                "      mul r17.x, r17.x, r9.x\n"
+                "      frc r17.y, r17.x\n"
+                "      add r17.z, r17.x, -r17.y\n"
+                "      add r27.x, r17.y, c1.x\n"
+                "      add r17.z, r17.z, r10.x\n"
+                "      add r17.z, r17.z, r10.z\n"
+                "      mul r27.y, r17.z, r9.y\n"
+                "      texldl r26, r27, s0\n"
+                "      break_lt r26.z, r10.z\n"
+                "      mov r27.xy, r26\n";
         }
 
         // Before the colour write, inside `if valid`: the header, then our lights summed into r31
@@ -138,12 +293,14 @@ namespace wxl_livingazeroth::modellights
         // spot cone), each moved world -> camera-relative -> view first. Then folded into the stock
         // light sum `l` like on the terrain: t = l + ours; above a knee (max(0.8, brightest channel
         // of l)) the brightest channel of t is compressed smoothly and all three scaled alike, so
-        // the hue stays. Last, the debug views (weights from t5): ours only, count / 24 in red,
-        // world stripes frac(xy / 4). Temps r9..r31 are free here (stock uses up to r8; r9..r12
-        // held the switched stock colours, read before this point).
-        std::string LampBlock(const std::string& l)
+        // the hue stays. Last, the debug views (weights from t5): ours only, this cell's count / its
+        // capacity in red, world stripes frac(xy / 4). Temps r9..r31 are free here (stock uses up to
+        // r8; r9..r12 held the switched stock colours, read before this point).
+        // `extra` goes in the loop right after the light's strength (r20.x) is known: IndoorSkip() on
+        // WMO surfaces, else empty.
+        std::string LampBlock(const std::string& l, const std::string& extra)
         {
-            return
+            return std::string() +
                 "    mov r27, c1\n"
                 "    texldl r28, r27, s0\n"
                 "    if_gt r28.w, c1.w\n"
@@ -164,12 +321,15 @@ namespace wxl_livingazeroth::modellights
                 "    texldl r11, r27, s0\n"
                 "    add r27.x, r27.x, r27.z\n"
                 "    texldl r12, r27, s0\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    texldl r20, r27, s0\n"
+                + CellSetup() +
                 "    mov r31.xyz, r10.y\n"
                 "    mov r28.z, r10.y\n"
                 "    mov r27, c1\n"
                 "    rep i0\n"
-                "      break_ge r28.z, r28.y\n"
-                "      mad r27.x, r28.z, r9.y, r9.z\n"
+                + EntryFetch() +
                 "      texldl r26, r27, s0\n"
                 "      add r27.x, r27.x, r9.x\n"
                 "      texldl r25, r27, s0\n"
@@ -210,6 +370,7 @@ namespace wxl_livingazeroth::modellights
                 "      rcp r20.x, r20.x\n"
                 "      mul r20.x, r20.x, r21.x\n"
                 "      mul r20.x, r20.x, r21.y\n"
+                + OcclusionVS() + extra +
                 "      mad r31.xyz, r25, r20.x, r31\n"
                 "      add r28.z, r28.z, r10.x\n"
                 "    endrep\n"
@@ -224,7 +385,7 @@ namespace wxl_livingazeroth::modellights
                 "    mul r18.xy, r18, r12.z\n"
                 "    frc r18.xy, r18\n"
                 "    mov r18.z, r10.y\n"
-                "    mul r19.x, r28.y, r12.w\n"
+                "    mul r19.x, r28.z, r12.w\n"
                 "    mov r19.yz, r10.y\n"
                 "    mov r27, c1\n"
                 "    add r27.x, r27.x, r27.z\n"
@@ -329,8 +490,13 @@ namespace wxl_livingazeroth::modellights
         //  - per channel, ours (x the panel's scale, halved) adds only what exceeds the baked light, so
         //    an orange torch over its own orange glow adds ~nothing, a dark corner or another colour gets
         //    it in full;
-        //  - the terrain's knee on the brightest channel, then debug views (ours only, the t0.z marker).
-        std::string BakedBlock(const std::string& vc, const std::string& oc, const std::string& vn)
+        //  - the terrain's knee on the brightest channel, then debug views (ours only, the t0.z marker,
+        //    the t0.y normal check).
+        // Normals: the shadow-tier-0 variants (indices 0..28 of each family) declare none, while the same
+        // families at tiers 1/2 read one from the same WMO geometry, so the vertex data has it: those
+        // get it declared (`injected`). A normal that reads as zero (data without one after all) leaves
+        // that surface on distance-only light: r9.w = 1 when the normal is usable.
+        std::string BakedBlock(const std::string& vc, const std::string& oc, const std::string& vn, bool injected)
         {
             std::string b = std::string() +
                 "    mov r27, c1\n"
@@ -353,26 +519,32 @@ namespace wxl_livingazeroth::modellights
                 "    texldl r11, r27, s0\n"
                 "    add r27.x, r27.x, r27.z\n"
                 "    texldl r12, r27, s0\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    add r27.x, r27.x, r27.z\n"
+                "    texldl r20, r27, s0\n"
                 "";
             if (!vn.empty()) b += std::string() +
                 "    dp3 r30.x, c31, " + vn + "\n"
                 "    dp3 r30.y, c32, " + vn + "\n"
                 "    dp3 r30.z, c33, " + vn + "\n"
-                "    nrm r17.xyz, r30\n"
-                "    mov r30.xyz, r17\n"
+                "    dp3 r17.w, r30, r30\n"
+                "    slt r9.w, r12.y, r17.w\n"
+                "    max r17.w, r17.w, r12.y\n"
+                "    rsq r17.w, r17.w\n"
+                "    mul r30.xyz, r30, r17.w\n"
                 "";
             b += std::string() +
                 "    dp3 r30.w, " + vc + ", r10.x\n"
                 "    add r30.w, r30.w, r30.w\n"
                 "    add r30.w, r30.w, r12.y\n"
                 "    rcp r29.w, r30.w\n"
+                + CellSetup() +
                 "    mov r31.xyz, r10.y\n"
                 "    mov r28.x, r10.y\n"
                 "    mov r28.z, r10.y\n"
                 "    mov r27, c1\n"
                 "    rep i0\n"
-                "      break_ge r28.z, r28.y\n"
-                "      mad r27.x, r28.z, r9.y, r9.z\n"
+                + EntryFetch() +
                 "      texldl r26, r27, s0\n"
                 "      add r27.x, r27.x, r9.x\n"
                 "      texldl r25, r27, s0\n"
@@ -404,6 +576,8 @@ namespace wxl_livingazeroth::modellights
                 "      dp3 r21.y, r30, r26\n"
                 "      add r21.y, r21.y, r10.z\n"
                 "      mul_sat r21.y, r21.y, r10.w\n"
+                "      add r21.y, r21.y, -r10.x\n"
+                "      mad r21.y, r21.y, r9.w, r10.x\n"
                 "";
             else b += std::string() +
                 "      mov r21.y, r10.x\n"
@@ -420,6 +594,7 @@ namespace wxl_livingazeroth::modellights
                 "      rcp r20.x, r20.x\n"
                 "      mul r20.x, r20.x, r21.x\n"
                 "      mul r20.x, r20.x, r21.y\n"
+                + OcclusionVS() +
                 "      mul r19.xyz, r25, r20.x\n"
                 "      add r31.xyz, r31, r19\n"
                 "      dp3 r19.w, r19, r10.x\n"
@@ -482,6 +657,26 @@ namespace wxl_livingazeroth::modellights
                 "    mov r27, c1\n"
                 "    texldl r28, r27, s0\n"
                 "    mad r17.yz, r17, -r28.z, r17\n"
+                "    if_gt r28.y, c1.w\n"
+                "";
+            // Normal check (debug view): blue = its own normal, green = given one (injected), red = none
+            // usable (distance-only light). Half scale, like the baked colour.
+            if (vn.empty()) b += std::string() +
+                "    mov r17.x, r10.x\n"
+                "    mov r17.yz, r10.y\n"
+                "";
+            else if (injected) b += std::string() +
+                "    add r17.x, r10.x, -r9.w\n"
+                "    mov r17.y, r9.w\n"
+                "    mov r17.z, r10.y\n"
+                "";
+            else b += std::string() +
+                "    mov r17.xy, r10.y\n"
+                "    mov r17.z, r10.x\n"
+                "";
+            b += std::string() +
+                "    mul r17.xyz, r17, r10.z\n"
+                "    endif\n"
                 "    else\n"
                 "    mov r17, " + vc + "\n"
                 "    endif\n"
@@ -498,16 +693,33 @@ namespace wxl_livingazeroth::modellights
             std::smatch o, v, n;
             if (!std::regex_search(src, o, colourOut) || !std::regex_search(src, v, colourIn)) return false;
             const std::string oc = o[1].str(), vc = v[1].str();
-            const std::string vn = std::regex_search(src, n, normalIn) ? n[1].str() : std::string();
+            std::string vn = std::regex_search(src, n, normalIn) ? n[1].str() : std::string();
             const std::vector<Hit> copy = Lines(src, std::regex("^\\s*mov " + oc + ", " + vc + "\\s*$"));
             const std::vector<Hit> pos = Lines(src, kPosition);
             if (copy.size() != 1 || pos.size() != 1) { why = "baked: anchors"; return false; }
             if (pos[0].at > copy[0].at) { why = "baked: position after colour"; return false; }
+            // No normal declared (shadow tier 0): declare one on the next free input register.
+            bool injected = false;
+            std::string declareNormal;
+            if (vn.empty())
+            {
+                static const std::regex input(R"(dcl_\w+ v(\d+))");
+                int highest = -1;
+                for (std::sregex_iterator it(src.begin(), src.end(), input), stop; it != stop; ++it)
+                    highest = std::max(highest, std::stoi((*it)[1].str()));
+                if (highest + 1 <= 15)
+                {
+                    vn = "v" + std::to_string(highest + 1);
+                    declareNormal = "    dcl_normal " + vn + "\n";
+                    injected = true;
+                    ++g_normalsGiven;
+                }
+            }
             std::string::size_type end = src.find('\n', copy[0].at);
             end = end == std::string::npos ? src.size() : end + 1;
-            src.replace(copy[0].at, end - copy[0].at, BakedBlock(vc, oc, vn));
+            src.replace(copy[0].at, end - copy[0].at, BakedBlock(vc, oc, vn, injected));
             src.insert(pos[0].at, "    mov r29.xyz, " + pos[0].reg + "\n");
-            src.insert(src.find('\n') + 1, Prologue());
+            src.insert(src.find('\n') + 1, Prologue() + declareNormal);
             ++g_marked;
             return true;
         }
@@ -532,7 +744,8 @@ namespace wxl_livingazeroth::modellights
             // varies (4 M2 variants compute the sun term first). Inserted from the bottom up, so the
             // earlier offsets stay valid.
             if (!(pos[0].at < colour[0].at && sun[0].at < colour[0].at)) { why = "anchors out of order"; return false; }
-            src.insert(colour[0].at, LampBlock(colour[0].reg));
+            const bool wmo = g_family.compare(0, 6, "MapObj") == 0;
+            src.insert(colour[0].at, LampBlock(colour[0].reg, wmo ? IndoorSkip() : std::string()));
             const std::string savePos = "    mov r29.xyz, " + pos[0].reg + "\n", saveNormal = "    mov r30.xyz, " + sun[0].reg + "\n";
             if (sun[0].at > pos[0].at) { src.insert(sun[0].at, saveNormal); src.insert(pos[0].at, savePos); }
             else                       { src.insert(pos[0].at, savePos); src.insert(sun[0].at, saveNormal); }
@@ -551,44 +764,123 @@ namespace wxl_livingazeroth::modellights
             return true;
         }
 
-        // Writes the header (and, when active, the lights) into the texture.
-        void Fill(bool active)
+        // Rows [first, first + count) locked; nullptr on failure. Managed textures upload only the
+        // locked rectangle, so the cell entries go up only when the grid changed.
+        float* LockRows(int first, int count, int& pitchFloats)
         {
             D3DLOCKED_RECT lr{};
-            if (!g_texture || FAILED(g_texture->LockRect(0, &lr, nullptr, 0))) return;
-            float* t = static_cast<float*>(lr.pBits);
-            std::memset(t, 0, kWidth * 4 * sizeof(float));
-            g_count = 0;
-            float V[16], P[16];
-            if (active && !wxl::game::gfx::SceneMatrices(V, P)) active = false;
-            if (active)
+            const RECT r{ 0, first, kWidth, first + count };
+            if (!g_texture || count <= 0 || FAILED(g_texture->LockRect(0, &lr, &r, 0))) return nullptr;
+            pitchFloats = lr.Pitch / static_cast<int>(sizeof(float));
+            return static_cast<float*>(lr.pBits);
+        }
+
+        int OccRow() { return 1 + g_entryRows + kPoolRows; }
+
+        // The cells' entries and the light pool (shared with the terrain), every frame while our lights
+        // are on; the entries only when the grid changed.
+        void FillGrid(bool on)
+        {
+            const lights::Grid& grid = lights::CellGrid();
+            const std::vector<lights::ActiveLight>& pool = lights::Active();
+            if (!on) { g_count = 0; g_gridOn = false; return; }
+            const int poolRow = 1 + g_entryRows;
+            int pitch = 0;
+            if (g_gridWritten != grid.generation || !g_gridOn)
             {
-                for (const lights::ActiveLight& l : lights::Active())
+                if (float* t = LockRows(1, g_entryRows, pitch))
                 {
-                    if (g_count >= static_cast<unsigned>(lights::kMaxLights)) break;
-                    float* o = t + (kHeader + g_count * kTexelsPerLight) * 4;
+                    for (int row = 0; row < g_entryRows; ++row) std::memset(t + row * pitch, 0, kWidth * 4 * sizeof(float));
+                    const size_t cellCount = static_cast<size_t>(grid.cells) * grid.cells;
+                    for (size_t c = 0; c < cellCount; ++c)
+                        for (int k = 0; k < grid.count[c]; ++k)
+                        {
+                            const size_t entry = c * grid.perCell + k;
+                            const unsigned light = grid.index[entry];
+                            float* o = t + (entry / kWidth) * pitch + (entry % kWidth) * 4;
+                            const unsigned texel = light * kTexelsPerLight;
+                            o[0] = (static_cast<float>(texel % kWidth) + 0.5f) / kWidth;
+                            o[1] = (static_cast<float>(poolRow + texel / kWidth) + 0.5f) / g_height;
+                            o[2] = 1.0f;
+                        }
+                    g_texture->UnlockRect(0);
+                    g_gridWritten = grid.generation;
+                }
+            }
+            g_count = 0;
+            if (float* t = LockRows(poolRow, kPoolRows, pitch))
+            {
+                for (int row = 0; row < kPoolRows; ++row) std::memset(t + row * pitch, 0, kWidth * 4 * sizeof(float));
+                for (const lights::ActiveLight& l : pool)
+                {
+                    if (g_count >= static_cast<unsigned>(lights::kMaxPool)) break;
+                    const unsigned texel = g_count * kTexelsPerLight;
+                    float* o = t + (texel / kWidth) * pitch + (texel % kWidth) * 4;
                     o[0] = l.pos[0]; o[1] = l.pos[1]; o[2] = l.pos[2];
                     o[3] = l.radius > 0.0f ? 1.0f / l.radius : 0.0f;
                     o[4] = l.color[0]; o[5] = l.color[1]; o[6] = l.color[2]; o[7] = l.falloff;
                     o[8] = l.spotDir[0]; o[9] = l.spotDir[1]; o[10] = l.spotDir[2]; o[11] = l.cosOuter;
                     o[12] = l.spotScale; o[14] = l.dip;
+                    o[13] = l.occlusion ? static_cast<float>(g_count) / kTilesPerRow : -1.0f;
+                    o[15] = l.indoor ? 1.0f : 0.0f; // read by the terrain and lit WMO surfaces (indoor lights stay off them)
                     ++g_count;
                 }
+                g_texture->UnlockRect(0);
+            }
+            // The tiles: only when a light gained, lost or changed its occlusion.
+            bool occChanged = g_occWritten.size() != g_count;
+            for (unsigned p = 0; p < g_count && !occChanged; ++p) occChanged = g_occWritten[p] != pool[p].occlusion;
+            if (occChanged)
+                if (float* t = LockRows(OccRow(), kOccRows, pitch))
+                {
+                    for (int row = 0; row < kOccRows; ++row) std::memset(t + row * pitch, 0, kWidth * 4 * sizeof(float));
+                    g_occWritten.assign(g_count, nullptr);
+                    for (unsigned p = 0; p < g_count; ++p)
+                    {
+                        const float* occ = pool[p].occlusion;
+                        g_occWritten[p] = occ;
+                        if (!occ) continue;
+                        const unsigned first = p * kOccTexels;
+                        float* o = t + (first / kWidth) * pitch + (first % kWidth) * 4;
+                        std::memcpy(o, occ, lights::kOccCells * sizeof(float));
+                    }
+                    g_texture->UnlockRect(0);
+                }
+            g_gridOn = true;
+        }
+
+        // Writes the header (row 0): valid when the model lights are on, else all zero (stock).
+        void Fill(bool active)
+        {
+            int pitch = 0;
+            float* t = LockRows(0, 1, pitch);
+            if (!t) return;
+            std::memset(t, 0, kWidth * 4 * sizeof(float));
+            float V[16], P[16];
+            if (active && (!g_gridOn || !wxl::game::gfx::SceneMatrices(V, P))) active = false;
+            if (active)
+            {
+                const lights::Grid& grid = lights::CellGrid();
                 const lights::Settings& cfg = lights::Config();
                 g_stockOff = cfg.modelStockOff != 0;
-                t[0] = g_stockOff ? 1.0f : 0.0f; t[1] = static_cast<float>(g_count); t[3] = 1.0f;
+                t[0] = g_stockOff ? 1.0f : 0.0f; t[3] = 1.0f;
                 wxl::game::camera::GetPosition(&t[4]);
+                t[7] = OccRow() + 0.5f; // t1.w: the occlusion region's first row (+ texel centre)
                 for (int col = 0; col < 3; ++col)
                     for (int row = 0; row < 4; ++row) t[(2 + col) * 4 + row] = V[row * 4 + col];
                 if (g_debug >= 1 && g_debug <= 3) { t[5 * 4 + (g_debug - 1)] = 1.0f; t[5 * 4 + 3] = 1.0f; }
                 if (g_debug == 4) t[2] = 1.0f; // mark the WMO baked-colour surfaces
+                if (g_debug == 5) t[1] = 1.0f; // WMO interiors: which normal they light with
+                const float perCell = static_cast<float>(grid.perCell);
                 const float k[16] = {
-                    1.0f / kWidth, static_cast<float>(kTexelsPerLight) / kWidth, (kHeader + 0.5f) / kWidth, 0.0f,
+                    1.0f / kWidth, 1.0f / g_height, perCell, 0.0f,
                     1.0f, 0.0f, 0.5f, 2.0f / 3.0f,
                     0.7f, 0.03f, 1.44269502f, 0.05f,
-                    0.8f, 0.001f, 0.25f, 1.0f / 24.0f };
+                    0.8f, 0.001f, 0.25f, grid.perCell > 0 ? 1.0f / perCell : 0.0f };
                 std::memcpy(t + 6 * 4, k, sizeof(k));
                 t[10 * 4] = cfg.bakedAdd;
+                const float g[4] = { grid.originX, grid.originY, 1.0f / grid.cellSize, static_cast<float>(grid.cells) };
+                std::memcpy(t + 11 * 4, g, sizeof(g));
             }
             else g_stockOff = false;
             g_active = active;
@@ -611,13 +903,31 @@ namespace wxl_livingazeroth::modellights
         shaderpatch::Register(std::move(rule));
     }
 
-    void Prepare(IDirect3DDevice9* device)
+    bool Prepare(IDirect3DDevice9* device, bool gridOn)
     {
-        if (!device || !EnsureTexture(device)) return;
+        if (!device || !EnsureTexture(device)) { g_gridOn = false; g_active = false; return false; }
         const lights::Settings& cfg = lights::Config();
+        FillGrid(gridOn && cfg.enabled && lights::CellGrid().cells > 0);
         Fill(cfg.enabled && cfg.models);
         Bind(device);
+        return g_gridOn;
     }
+
+    IDirect3DTexture9* Texture() { return g_texture; }
+
+    void GridConstants(float c206[4], float c212[4])
+    {
+        const lights::Grid& grid = lights::CellGrid();
+        const bool on = g_gridOn && grid.cells > 0;
+        c206[0] = grid.originX; c206[1] = grid.originY;
+        c206[2] = 1.0f / grid.cellSize; c206[3] = on ? static_cast<float>(grid.cells) : 0.0f;
+        c212[0] = g_height > 0 ? 1.0f / g_height : 0.0f;
+        c212[1] = on ? static_cast<float>(grid.perCell) : 0.0f;
+        c212[2] = on ? static_cast<float>(grid.cells - 1) : 0.0f;
+        c212[3] = OccRow() + 0.5f;
+    }
+
+    unsigned TextureBytes() { return g_texture ? static_cast<unsigned>(kWidth) * g_height * 16u : 0u; }
 
     void Rebind(IDirect3DDevice9* device)
     {
@@ -634,9 +944,10 @@ namespace wxl_livingazeroth::modellights
 
     const char* StatusLine()
     {
-        char line[256];
-        std::snprintf(line, sizeof(line), "model lights (M2/WMO): %s, %u per vertex; the client's up to 4 per model %s; %u lit and %u baked-light (WMO interior) vertex shader variant(s) patched so far%s",
-                      g_active ? "on" : "off", g_count, g_stockOff ? "switched off" : "on", g_patched, g_marked,
+        char line[512];
+        std::snprintf(line, sizeof(line), "model lights (M2/WMO): %s, %u lights in the shared texture (%u x %d texels, %.0f KB); the client's up to 4 per model %s; %u lit and %u baked-light (WMO interior) vertex shader variant(s) patched so far (%u of those given a normal input)%s",
+                      g_active ? "on" : "off", g_count, static_cast<unsigned>(kWidth), g_height, TextureBytes() / 1024.0,
+                      g_stockOff ? "switched off" : "on", g_patched, g_marked, g_normalsGiven,
                       g_failed ? " -- the light texture (A32B32G32R32F) couldn't be created" : "");
         g_status = line;
         return g_status.c_str();

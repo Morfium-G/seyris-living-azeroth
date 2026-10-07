@@ -203,6 +203,45 @@ namespace wxl_livingazeroth::cover
         bool               g_hereMccvValid = false, g_hereLiquidValid = false;
         bool               g_tintSupported = false;
 
+        // Point lights per patch: each light's 4 registers (camera-relative view space, built once a
+        // frame), then per patch the ones that reach it.
+        std::vector<float> g_lampRegs;
+        unsigned           g_patchLightsMost = 0, g_patchLightsFull = 0; // this frame: the busiest patch; patches over kMaxLights
+
+        // The lights whose radius reaches the patch (world box x0, y0, x1, y1), minus those wholly
+        // inside the finer level's box (that ground is drawn by the finer level). Over kMaxLights, the
+        // nearest to the camera win (the patch's ground closest to the camera matters most).
+        void PatchLights(IDirect3DDevice9* dev, const float patch[4], const float inner[4], const float eye[3])
+        {
+            static std::vector<std::pair<float, unsigned>> hits;
+            hits.clear();
+            const std::vector<lights::ActiveLight>& all = lights::Active();
+            for (unsigned n = 0; n < all.size(); ++n)
+            {
+                const lights::ActiveLight& l = all[n];
+                if (l.indoor) continue; // the cover lies on the terrain: indoor lights stay off it too
+                const float r = l.radius, x = l.pos[0], y = l.pos[1];
+                const float nx = std::max(patch[0], std::min(x, patch[2])) - x, ny = std::max(patch[1], std::min(y, patch[3])) - y;
+                if (nx * nx + ny * ny > r * r) continue;
+                if (x - r >= inner[0] && x + r <= inner[2] && y - r >= inner[1] && y + r <= inner[3]) continue;
+                const float dx = x - eye[0], dy = y - eye[1], dz = l.pos[2] - eye[2];
+                hits.push_back({ dx * dx + dy * dy + dz * dz, n });
+            }
+            g_patchLightsMost = std::max(g_patchLightsMost, static_cast<unsigned>(hits.size()));
+            if (hits.size() > static_cast<size_t>(lights::kMaxLights))
+            {
+                ++g_patchLightsFull;
+                std::nth_element(hits.begin(), hits.begin() + lights::kMaxLights, hits.end());
+                hits.resize(lights::kMaxLights);
+            }
+            float pl[lights::kMaxLights * 16];
+            int count = 0;
+            for (const auto& h : hits) std::memcpy(pl + 16 * count++, g_lampRegs.data() + 16 * h.second, 16 * sizeof(float));
+            const float c17[4] = { static_cast<float>(count), 0.0f, 0.0f, 0.0f };
+            dev->SetVertexShaderConstantF(17, c17, 1);
+            if (count) dev->SetVertexShaderConstantF(20, pl, count * 4);
+        }
+
         // CoverTexture slots from the table, loaded from the client's archives into textures of
         // our own; reloaded when the table is.
         IDirect3DTexture9* g_coverTextures[covertable::kMaxCoverTextures] = {}; // per slot (owned by the cache)
@@ -1586,26 +1625,26 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             dev->SetVertexShaderConstantF(9, vs9, 4);
 
             // Point lights (env/Lights) into the same space as the cover's positions: camera-relative,
-            // rotated by the rows in c9..c11. VS c17.x = how many, c20.. = 4 registers each.
+            // rotated by the rows in c9..c11. Each patch gets the lights that reach it (PatchLights,
+            // before its draw): VS c17.x = how many, c20.. = 4 registers each.
             {
-                float pl[lights::kMaxLights * 16] = {};
-                int count = 0;
-                for (const lights::ActiveLight& l : lights::Active())
+                const std::vector<lights::ActiveLight>& all = lights::Active();
+                g_lampRegs.resize(all.size() * 16);
+                for (size_t n = 0; n < all.size(); ++n)
                 {
-                    if (count >= lights::kMaxLights) break;
+                    const lights::ActiveLight& l = all[n];
                     const float q[3] = { l.pos[0] - eye[0], l.pos[1] - eye[1], l.pos[2] - eye[2] };
-                    float* o = pl + count * 16;
+                    float* o = g_lampRegs.data() + n * 16;
                     for (int c = 0; c < 3; ++c) o[c] = q[0] * vs9[c] + q[1] * vs9[4 + c] + q[2] * vs9[8 + c];
                     o[3] = l.radius > 0.0f ? 1.0f / l.radius : 0.0f;
                     o[4] = l.color[0]; o[5] = l.color[1]; o[6] = l.color[2]; o[7] = l.falloff;
                     for (int c = 0; c < 3; ++c) o[8 + c] = l.spotDir[0] * vs9[c] + l.spotDir[1] * vs9[4 + c] + l.spotDir[2] * vs9[8 + c];
                     o[11] = l.cosOuter;
                     o[12] = l.spotScale;
-                    ++count;
+                    o[13] = o[14] = o[15] = 0.0f;
                 }
-                const float c17[4] = { static_cast<float>(count), 0.0f, 0.0f, 0.0f };
-                dev->SetVertexShaderConstantF(17, c17, 1);
-                if (count) dev->SetVertexShaderConstantF(20, pl, count * 4);
+                g_patchLightsMost = 0;
+                g_patchLightsFull = 0;
             }
             // Specular: the terrain's colour and exponent (none when not lit like the scene, or when
             // the terrain has no exponent set).
@@ -1743,6 +1782,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                     inner[3] = static_cast<float>(static_cast<double>(F.gridJ + kGridCells) * F.cell - e - eye[1]);
                 }
                 dev->SetPixelShaderConstantF(3, inner, 1);
+                const float innerWorld[4] = { inner[0] + eye[0], inner[1] + eye[1], inner[2] + eye[0], inner[3] + eye[1] };
 
                 for (int pj = 0; pj < kPatches; ++pj)
                     for (int pi = 0; pi < kPatches; ++pi)
@@ -1750,6 +1790,12 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                         const float c4[4] = { static_cast<float>(L.gridI + pi * kPatchCells), static_cast<float>(L.gridJ + pj * kPatchCells),
                                               L.cell, 1.0f / kTex };
                         dev->SetVertexShaderConstantF(4, c4, 1);
+                        const float patch[4] = {
+                            static_cast<float>(static_cast<double>(L.gridI + pi * kPatchCells) * L.cell),
+                            static_cast<float>(static_cast<double>(L.gridJ + pj * kPatchCells) * L.cell),
+                            static_cast<float>(static_cast<double>(L.gridI + (pi + 1) * kPatchCells) * L.cell),
+                            static_cast<float>(static_cast<double>(L.gridJ + (pj + 1) * kPatchCells) * L.cell) };
+                        PatchLights(dev, patch, innerWorld, eye);
                         dev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, kPatchVerts * kPatchVerts, 0, kPatchCells * kPatchCells * 2);
                     }
             }
@@ -2010,6 +2056,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         }
         api->UiAddPanel(kPanelTitle, &Panel, nullptr);
     }
+
+    void PatchLightStats(unsigned& most, unsigned& full) { most = g_patchLightsMost; full = g_patchLightsFull; }
 
     void Update(float dt, const world::Snapshot& snap)
     {

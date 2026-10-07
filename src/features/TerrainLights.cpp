@@ -4,6 +4,9 @@
 #include "TerrainWetness.hpp"
 #include "../env/Lights.hpp"
 
+#include "game/Camera.hpp"
+#include "game/Gfx.hpp"
+
 #include <cstdio>
 #include <cstring>
 #include <regex>
@@ -12,63 +15,44 @@ namespace wxl_livingazeroth::terrainlights
 {
     namespace
     {
-        // The light list: 4 texels per light (world position + 1 / radius; colour + falloff shape; spot
-        // direction + cos outer angle; 1 / (cos inner - cos outer)), A32B32G32R32F, point sampled on
-        // s13. PS c206.x = how many.
-        constexpr int   kTexelsPerLight = 4;
-        constexpr int   kTexels = lights::kMaxLights * kTexelsPerLight;
+        // The cells and lights: the model lights' texture (modellights::Texture, layout in
+        // ModelLights.cpp: rows of 1024 texels, row 0 its header, then the cells' entries, then the
+        // lights at 4 texels each), point sampled on s13. The grid in PS c206 (corner x, y, 1 / cell
+        // size, cells) and c212 (1 / height, lights per cell, cells - 1, 0).
+        constexpr int   kWidth = 1024;          // = ModelLights.cpp kWidth
         constexpr DWORD kSampler = 13;
-        constexpr int   kConstant = 206;
+        constexpr int   kGridConstant = 206, kGridConstant2 = 212;
 
         // VS c250.x: the stock point lights' share (1 = as the client lights the chunk, 0 = off).
         constexpr int kStockSwitch = 250;
 
-        IDirect3DDevice9*  g_device = nullptr;
-        IDirect3DTexture9* g_texture = nullptr;
-        bool               g_failed = false;
-        unsigned           g_drawn = 0;
+        bool               g_on = false;
         bool               g_stockOff = false;
         unsigned           g_switchedVariants = 0;
         std::string        g_status;
-
-        void Release()
-        {
-            if (g_texture) g_texture->Release();
-            g_texture = nullptr;
-            g_device = nullptr;
-        }
-
-        bool EnsureTexture(IDirect3DDevice9* device)
-        {
-            if (device != g_device) { Release(); g_failed = false; g_device = device; }
-            if (g_texture) return true;
-            if (g_failed) return false;
-            if (FAILED(device->CreateTexture(kTexels, 1, 1, 0, D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED, &g_texture, nullptr)))
-            {
-                g_texture = nullptr;
-                g_failed = true;
-                return false;
-            }
-            return true;
-        }
     }
 
     std::string PixelBlock(const std::string& r, std::string& defs)
     {
-        // c207 = (1 / texels, texels per light / texels, 0.5 / texels, 0): texel steps; c208 = (2, -1, 1 / 1.5, 0);
-        // c209 = (0.7, 1 / ln 2, 0.05, 0.03); c210 = the light-list uv's start (u, 0.5, 0, lod 0);
+        // c207 = (1 / W, 0, 0.5 / W, 0): texel steps along a row; c208 = (2, -1, 1 / 1.5, 0);
+        // c209 = (0.7, 1 / ln 2, 0.05, 0.03); c210 = (1.5: header row + texel centre, 0, 0, 0);
         // c211 = (the knee's minimum 0.8, 0.001).
         // ps_3_0 reads at most one constant register per instruction: 0.7 and 0.03 share c209.
         // Same light as the surface cover's (SurfaceCover.cpp, Lamps): size ~1 yd (falloff on
         // sqrt(d^2 + 1)), like the client's 1 / (0.7 d + 0.03 d^2), windowed to 0 at the radius,
         // wrapped Lambert. The stock lighting is the vertex colour v0 (x 2 in the stock PS); ours fills
         // the headroom it leaves softly: l' = l + (1 - l)(1 - e^-lamps), applied as colour x l' / l.
-        char d[320];
+        // Only the pixel's grid cell's lights: its cell from the world position v9 (clamped to the
+        // grid: a light past its radius adds 0), entries from cell x lights per cell, each pointing
+        // at its light's first texel; an empty entry or the cell's capacity ends the loop.
+        // c213 = (4, 7.999, 2, 0.25), c214 = (0, 1, 2, 3): the occlusion lookup's steps.
+        char d[448];
         std::snprintf(d, sizeof(d),
-                      "    def c207, %.9g, %.9g, %.9g, 0\n    def c208, 2, -1, 0.666666687, 0\n"
-                      "    def c209, 0.7, 1.44269502, 0.05, 0.03\n    def c210, 0, 0.5, 0, 0\n    def c211, 0.8, 0.001, 0, 0\n"
+                      "    def c207, %.9g, 0, %.9g, 0\n    def c208, 2, -1, 0.666666687, 0\n"
+                      "    def c209, 0.7, 1.44269502, 0.05, 0.03\n    def c210, 1.5, 0, 0, 0\n    def c211, 0.8, 0.001, 0, 0\n"
+                      "    def c213, 4, 7.99900007, 2, 0.25\n    def c214, 0, 1, 2, 3\n"
                       "    defi i0, %d, 0, 0, 0\n    dcl_2d s13\n",
-                      1.0 / kTexels, static_cast<double>(kTexelsPerLight) / kTexels, 0.5 / kTexels, lights::kMaxLights);
+                      1.0 / kWidth, 0.5 / kWidth, lights::kMaxPerCellCap);
         defs = d;
         return
             // The ground's normal (moisture texture red/green), toward up near and beyond the grid's edge.
@@ -79,12 +63,31 @@ namespace wxl_livingazeroth::terrainlights
             "\n    max r24.w, r24.w, c202.y"
             "\n    rsq r24.w, r24.w"
             "\n    rcp r24.z, r24.w"
+            // The cell: r22.y = its first entry.
+            "\n    add r22.xy, v9, -c206"
+            "\n    mul r22.xy, r22, c206.z"
+            "\n    frc r22.zw, r22.xyxy"
+            "\n    add r22.xy, r22, -r22.zwzw"
+            "\n    max r22.xy, r22, c202.y"
+            "\n    min r22.xy, r22, c212.z"
+            "\n    mad r22.x, r22.y, c206.w, r22.x"
+            "\n    mul r22.y, r22.x, c212.y"
             "\n    mov r23.xyz, c202.y"
             "\n    mov r22.x, c202.y"
-            "\n    mov r21, c210"
+            "\n    mov r21, c202.y"
             "\n    rep i0"
-            "\n      break_ge r22.x, c206.x"
-            "\n      mad r21.x, r22.x, c207.y, c207.z"
+            "\n      break_ge r22.x, c212.y"
+            // Entry e = first + i at (column, 1 + row) of the W-wide rows.
+            "\n      add r18.x, r22.y, r22.x"
+            "\n      mul r18.x, r18.x, c207.x"
+            "\n      frc r18.y, r18.x"
+            "\n      add r18.z, r18.x, -r18.y"
+            "\n      add r21.x, r18.y, c207.z"
+            "\n      add r18.z, r18.z, c210.x"
+            "\n      mul r21.y, r18.z, c212.x"
+            "\n      texldl r20, r21, s13"
+            "\n      break_lt r20.z, c202.z"
+            "\n      mov r21.xy, r20"
             "\n      texldl r20, r21, s13"
             "\n      add r21.x, r21.x, c207.x"
             "\n      texldl r19, r21, s13"
@@ -118,6 +121,50 @@ namespace wxl_livingazeroth::terrainlights
             "\n      rcp r16.x, r16.x"
             "\n      mul r16.x, r16.x, r17.x"
             "\n      mul r16.x, r16.x, r17.y"
+            // Baked occlusion (lights::Bake; ModelLights.cpp OcclusionVS has the same steps): direction
+            // light -> pixel on the 8 x 8 octahedral map, the tile's texel and component (4th texel
+            // .y = tile / tiles per row, -1 = none; c212.w = the region's first row + 0.5), and no light
+            // past the stored reach (+ 0.5 yd, soft over 0.5 yd).
+            "\n      if_ge r10.y, c202.y"
+            "\n      add r11.x, r20_abs.x, r20_abs.y"
+            "\n      add r11.x, r11.x, r20_abs.z"
+            "\n      rcp r11.x, r11.x"
+            "\n      mul r11.xyz, -r20, r11.x"
+            "\n      cmp r12.xy, r11, c202.x, -c202.x"
+            "\n      add r12.zw, c202.x, -r11_abs.xxyx"
+            "\n      mul r12.xy, r12, r12.zw"
+            "\n      add r12.xy, r12, -r11"
+            "\n      cmp r12.z, r11.z, c202.y, c202.x"
+            "\n      mad r11.xy, r12, r12.z, r11"
+            "\n      add r11.xy, r11, c202.x"
+            "\n      mul r11.xy, r11, c213.x"
+            "\n      min r11.xy, r11, c213.y"
+            "\n      frc r12.xy, r11"
+            "\n      add r11.xy, r11, -r12"
+            "\n      mul r12.x, r11.x, c213.w"
+            "\n      frc r12.y, r12.x"
+            "\n      add r12.x, r12.x, -r12.y"
+            "\n      mul r12.y, r12.y, c213.x"
+            "\n      mad r12.x, r11.y, c213.z, r12.x"
+            "\n      frc r11.z, r10.y"
+            "\n      add r11.w, r10.y, -r11.z"
+            "\n      add r12.x, r12.x, c202.z"
+            "\n      mad r21.x, r12.x, c207.x, r11.z"
+            "\n      add r11.w, r11.w, c212.w"
+            "\n      mul r21.y, r11.w, c212.x"
+            "\n      texldl r13, r21, s13"
+            "\n      add r14, r12.y, -c214"
+            "\n      add r14, -r14_abs, c202.z"
+            "\n      cmp r14, r14, c202.x, c202.y"
+            "\n      dp4 r13.x, r13, r14"
+            "\n      add r13.x, r13.x, -r18.w"
+            "\n      add r13.x, r13.x, r13.x"
+            "\n      add_sat r13.x, r13.x, c202.x"
+            "\n      mul r16.x, r16.x, r13.x"
+            "\n      endif"
+            // Indoor lights (4th texel .w = 1, only while the panel's switch is on) stay off the terrain.
+            "\n      add r10.w, c202.x, -r10.w"
+            "\n      mul r16.x, r16.x, r10.w"
             "\n      mad r23.xyz, r19, r16.x, r23"
             "\n      add r22.x, r22.x, c202.x"
             "\n    endrep"
@@ -188,30 +235,24 @@ namespace wxl_livingazeroth::terrainlights
     void BeforeTerrainStage(IDirect3DDevice9* device)
     {
         if (!device) return;
-        const bool on = lights::Config().enabled && terrainwet::PatchActive() && EnsureTexture(device);
-        float c[4] = {};
-        g_drawn = 0;
+        // The view the world draws with, for attached models' positions (lights::AttachedWorld).
+        {
+            float V[16], P[16], cam[3];
+            if (wxl::game::gfx::SceneMatrices(V, P))
+            {
+                wxl::game::camera::GetPosition(cam);
+                lights::NoteSceneView(V, cam);
+            }
+        }
+        // The shared texture: filled (and bound for the M2s and WMOs drawn after the terrain, in their
+        // vertex shaders) by the model lights.
+        const bool gridOn = modellights::Prepare(device, true);
+        const bool on = lights::Config().enabled && terrainwet::PatchActive() && gridOn && modellights::Texture();
+        float c206[4] = {}, c212[4] = {};
         if (on)
         {
-            D3DLOCKED_RECT lr{};
-            if (SUCCEEDED(g_texture->LockRect(0, &lr, nullptr, 0)))
-            {
-                float* t = static_cast<float*>(lr.pBits);
-                std::memset(t, 0, kTexels * 4 * sizeof(float));
-                for (const lights::ActiveLight& l : lights::Active())
-                {
-                    if (g_drawn >= static_cast<unsigned>(lights::kMaxLights)) break;
-                    float* o = t + g_drawn * kTexelsPerLight * 4;
-                    o[0] = l.pos[0]; o[1] = l.pos[1]; o[2] = l.pos[2];
-                    o[3] = l.radius > 0.0f ? 1.0f / l.radius : 0.0f;
-                    o[4] = l.color[0]; o[5] = l.color[1]; o[6] = l.color[2]; o[7] = l.falloff;
-                    o[8] = l.spotDir[0]; o[9] = l.spotDir[1]; o[10] = l.spotDir[2]; o[11] = l.cosOuter;
-                    o[12] = l.spotScale;
-                    ++g_drawn;
-                }
-                g_texture->UnlockRect(0);
-            }
-            device->SetTexture(kSampler, g_texture);
+            modellights::GridConstants(c206, c212);
+            device->SetTexture(kSampler, modellights::Texture());
             device->SetSamplerState(kSampler, D3DSAMP_MINFILTER, D3DTEXF_POINT);
             device->SetSamplerState(kSampler, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
             device->SetSamplerState(kSampler, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
@@ -219,11 +260,10 @@ namespace wxl_livingazeroth::terrainlights
             device->SetSamplerState(kSampler, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
             device->SetSamplerState(kSampler, D3DSAMP_SRGBTEXTURE, FALSE);
         }
-        c[0] = static_cast<float>(g_drawn);
-        device->SetPixelShaderConstantF(kConstant, c, 1);
-        // The same list for the M2s and WMOs drawn after the terrain (their own texture, read in
-        // their vertex shaders).
-        modellights::Prepare(device);
+        // Zero lights per cell (c212.y) while off: the loop ends at once.
+        device->SetPixelShaderConstantF(kGridConstant, c206, 1);
+        device->SetPixelShaderConstantF(kGridConstant2, c212, 1);
+        g_on = on;
         // Ours replace the client's 3 per chunk only while they're actually drawn.
         g_stockOff = on;
         const float stock[4] = { on ? 0.0f : 1.0f, 0.0f, 0.0f, 0.0f };
@@ -233,9 +273,10 @@ namespace wxl_livingazeroth::terrainlights
     const char* StatusLine()
     {
         char line[256];
-        std::snprintf(line, sizeof(line), "terrain lights: %s, %u drawn per pixel; the client's 3 per chunk %s (switchable in %u vertex variants with point lights, of those created so far)%s",
-                      g_stockOff ? "on" : "off", g_drawn, g_stockOff ? "switched off" : "on", g_switchedVariants,
-                      g_failed ? " -- the light texture (A32B32G32R32F) couldn't be created" : "");
+        const lights::Grid& grid = lights::CellGrid();
+        std::snprintf(line, sizeof(line), "terrain lights: %s, each pixel loops over its cell's lights (%d x %d cells of %.0f yd, up to %d each); the client's 3 per chunk %s (switchable in %u vertex variants with point lights, of those created so far)",
+                      g_on ? "on" : "off", grid.cells, grid.cells, grid.cellSize, grid.perCell,
+                      g_stockOff ? "switched off" : "on", g_switchedVariants);
         g_status = line;
         return g_status.c_str();
     }

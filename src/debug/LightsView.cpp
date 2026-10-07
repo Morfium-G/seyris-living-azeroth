@@ -4,6 +4,7 @@
 #include "../env/WorldQuery.hpp"
 #include "../features/DoodadLightTable.hpp"
 #include "../features/ModelLights.hpp"
+#include "../features/SurfaceCover.hpp"
 #include "../features/TerrainLights.hpp"
 #include "../features/TerrainWetness.hpp"
 #include "../render/M2Effects.hpp"
@@ -209,7 +210,20 @@ namespace wxl_livingazeroth::debug
             g_api->UiCheckbox("our point lights (terrain + surface cover; off = the client's own)", &cfg.enabled);
             g_api->UiSliderFloat("light radius (yd)", &cfg.radius, 2.0f, 40.0f);
             g_api->UiSliderFloat("light brightness (x the client's colour)", &cfg.brightness, 0.0f, 3.0f);
-            g_api->UiSliderFloat("light range from the camera (yd)", &cfg.range, 30.0f, 300.0f);
+            g_api->UiSliderFloat("light range from the camera (yd)", &cfg.range, 30.0f, 512.0f);
+            g_api->UiSliderFloat("light grid: cell size (yd)", &cfg.cellSize, 8.0f, 64.0f);
+            g_api->UiSliderInt("light grid: lights per cell", &cfg.maxPerCell, 4, lights::kMaxPerCellCap);
+            g_api->UiCheckbox("interior lights don't light the outside: terrain, cover, WMO exteriors (indoor WMO groups; door-frame torches lose the entrance)", &cfg.indoorSkipsTerrain);
+            g_api->UiCheckbox("baked occlusion: walls and floors block lights that have it (light editor: \"bake occlusion\")", &cfg.bakeEnabled);
+            g_api->UiCheckbox("debug: bake EVERY light (not only flagged ones; attached/moving lights never)", &cfg.bakeAll);
+            g_api->UiSliderInt("baking: rays per frame", &cfg.bakeRaysPerFrame, 0, 20000);
+            {
+                const lights::Stats bs = lights::GetStats();
+                char bakeLine[256];
+                std::snprintf(bakeLine, sizeof(bakeLine), "baking: %u drawn light(s) want occlusion, %u ready; %u rays this frame (%.2f ms); %u light(s) cached (%d rays x 5 per light)",
+                              bs.bakeWanted, bs.bakeDone, bs.bakeRays, bs.bakeMs, bs.bakeCached, lights::kOccCells);
+                g_api->UiTextWrapped(bakeLine);
+            }
             g_api->UiSliderFloat("merge lights closer than (yd)", &cfg.mergeDistance, 0.0f, 3.0f);
             g_api->UiSliderFloat("flicker (how much a flame's light dips)", &cfg.flicker, 0.0f, 0.8f);
             g_api->UiSliderFloat("flicker speed", &cfg.flickerSpeed, 0.1f, 4.0f);
@@ -218,8 +232,9 @@ namespace wxl_livingazeroth::debug
             g_api->UiSliderFloat("WMO interiors: our light x (fills up to the baked light, never stacks)", &cfg.bakedAdd, 0.0f, 3.0f);
             {
                 static const char* const kViews[] = { "off", "our lights only", "count check (flat red)", "world stripes (must not move)",
-                                                      "mark WMO baked-light surfaces (red)" };
-                g_api->UiCombo("models: debug view", &modellights::DebugView(), kViews, 5);
+                                                      "mark WMO baked-light surfaces (red)",
+                                                      "WMO interiors: normal check (blue own, green given, red none: distance-only)" };
+                g_api->UiCombo("models: debug view", &modellights::DebugView(), kViews, 6);
                 g_api->UiCheckbox("models: probe the light texture at every model draw", &modellights::Probe());
                 const std::string probe = modellights::ProbeLine();
                 g_api->UiTextWrapped(probe.c_str());
@@ -245,10 +260,23 @@ namespace wxl_livingazeroth::debug
             std::snprintf(head, sizeof(head), "Dump M2 shaders (%u effect(s) loaded; Logs\\living-azeroth)",
                           static_cast<unsigned>(m2effects::Effects().size()));
             if (g_api->UiButton(head)) DumpM2Shaders(g_api);
-            std::snprintf(head, sizeof(head), "our lights: %u models in the scene, %u in range (scan %.2f ms), %u model lights (%u placed by the client, %u via the world matrix, %u with the file's colour), %u in range, %u merged, %u drawn (max %d)",
-                          ls.models, ls.modelsInRange, ls.scanMs, ls.modelLights, ls.fromClient, ls.fromWorldMatrix, ls.fileColor,
-                          ls.inRange, ls.merged, ls.active, lights::kMaxLights);
+            std::snprintf(head, sizeof(head), "attached models in range (items in hands, ...): %u, of those %u at the parent's rest pose (not animated now); indoor lights (kept off the terrain): %u (%u locate call(s) this frame)",
+                          ls.attachedModels, ls.attachedAtRest, ls.indoor, ls.indoorTests);
             g_api->UiTextWrapped(head);
+            std::snprintf(head, sizeof(head), "our lights: %u models in the scene, %u in range (scan %.2f ms), %u model lights (%u placed by the client, %u via the world matrix, %u with the file's colour), %u in range, %u merged, %u drawn (max %d%s)",
+                          ls.models, ls.modelsInRange, ls.scanMs, ls.modelLights, ls.fromClient, ls.fromWorldMatrix, ls.fileColor,
+                          ls.inRange, ls.merged, ls.active, lights::kMaxPool, ls.poolDropped ? ", the farthest dropped" : "");
+            g_api->UiTextWrapped(head);
+            {
+                const lights::Grid& grid = lights::CellGrid();
+                unsigned patchMost = 0, patchFull = 0;
+                cover::PatchLightStats(patchMost, patchFull);
+                char gridLine[384];
+                std::snprintf(gridLine, sizeof(gridLine), "light grid: %d x %d cells of %.0f yd (%.0f yd across), up to %d lights each; busiest cell %u lights; %u cell(s) over the limit (%u light entries left out: raise \"lights per cell\" if this stays above 0 where it matters). Surface cover: busiest patch %u lights, %u patch(es) over %d",
+                              grid.cells, grid.cells, grid.cellSize, grid.cells * grid.cellSize, grid.perCell, ls.busiestCell, ls.fullCells, ls.droppedFromCells,
+                              patchMost, patchFull, lights::kMaxLights);
+                g_api->UiTextWrapped(gridLine);
+            }
             g_api->UiTextWrapped(terrainlights::StatusLine());
             g_api->UiTextWrapped(modellights::StatusLine());
             g_api->UiTextWrapped(terrainwet::StatusLine());

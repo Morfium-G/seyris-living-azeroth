@@ -5,10 +5,15 @@
 
 #include "game/Camera.hpp"
 #include "game/Doodad.hpp"
+#include "game/Pick.hpp"
+#include "offsets/game/WMO.hpp"
+
+#include <windows.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <unordered_map>
 
 namespace wxl_livingazeroth::lights
 {
@@ -153,6 +158,12 @@ namespace wxl_livingazeroth::lights
             int   flickerMode = lighttable::kFlickerDefault;
             float flickerSpeed = -1.0f, flickerAmount = -1.0f;
             float scale = 1.0f;         // the model's: the radius scales with it
+            // Attached models (a torch in a hand): the model, and the light in its own space, so the
+            // light follows it every frame instead of only at the scan.
+            const void* follow = nullptr;
+            float localPos[3] = {}, localDir[3] = { 0.0f, 0.0f, -1.0f };
+            const void* model = nullptr;  // the instance it belongs to
+            bool  bake = false;           // its DoodadLightProperties ask for baked occlusion
         };
         std::vector<Source>      g_sources;
         std::vector<ActiveLight> g_active;
@@ -175,8 +186,8 @@ namespace wxl_livingazeroth::lights
 
         float MatrixScale(const float m[16]) { return std::sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]); }
 
-        // A table light on one placed doodad.
-        void AddTableLight(const lighttable::Assignment& a, const uint8_t* hdr, const float world[16], Stats& st)
+        // A table light on one placed doodad (or attached model: `follow`).
+        void AddTableLight(const lighttable::Assignment& a, const uint8_t* hdr, const float world[16], const void* model, const void* follow, Stats& st)
         {
             const lighttable::Properties* p = lighttable::FindProperties(a.lightId);
             if (!p) return;
@@ -184,6 +195,11 @@ namespace wxl_livingazeroth::lights
             if (!AttachmentPosition(hdr, a.attachType, a.attachIndex, a.offset, local)) ++st.attachFallbacks;
             Source s;
             s.table = true;
+            s.follow = follow;
+            s.model = model;
+            s.bake = (p->flags & lighttable::kBakeOcclusion) != 0;
+            std::memcpy(s.localPos, local, sizeof(local));
+            std::memcpy(s.localDir, a.direction, sizeof(s.localDir));
             s.scale = MatrixScale(world);
             Mul(local, world, s.worldPos);
             const float inten = p->intensity;
@@ -225,7 +241,7 @@ namespace wxl_livingazeroth::lights
                     for (const lighttable::Assignment* a : lighttable::ForModel(lighttable::Normalize(m.path)))
                     {
                         if (a->flags & lighttable::kSuppressModelLights) suppress = true;
-                        if (a->lightId) AddTableLight(*a, hdr, m.world, st);
+                        if (a->lightId) AddTableLight(*a, hdr, m.world, m.model, m.parent ? m.model : nullptr, st);
                     }
                 if (suppress) { ++st.suppressedModels; continue; }
 
@@ -244,6 +260,9 @@ namespace wxl_livingazeroth::lights
                     ++st.modelLights;
                     Source s;
                     s.cm2 = records ? records + l * kLightRecord + kRecordLight : nullptr;
+                    s.follow = m.parent ? m.model : nullptr;
+                    s.model = m.model;
+                    std::memcpy(s.localPos, local, sizeof(local));
                     Mul(local, m.world, s.worldPos);
                     s.scale = MatrixScale(m.world);
                     float color[3], intensity = 1.0f;
@@ -259,6 +278,9 @@ namespace wxl_livingazeroth::lights
             st.scanMs = grassperf::Now() - t0;
             g_stats.models = st.models; g_stats.modelsInRange = st.modelsInRange; g_stats.modelLights = st.modelLights; g_stats.scanMs = st.scanMs;
             g_stats.tableLights = st.tableLights; g_stats.suppressedModels = st.suppressedModels; g_stats.attachFallbacks = st.attachFallbacks;
+            unsigned attached = 0, atRest = 0;
+            for (const SceneModel& m : models) if (m.parent) { ++attached; atRest += m.animated ? 0 : 1; }
+            g_stats.attachedModels = attached; g_stats.attachedAtRest = atRest;
         }
 
         // A light this frame, before merging and choosing.
@@ -269,6 +291,9 @@ namespace wxl_livingazeroth::lights
             float spotDir[3]; float cosOuter, spotScale;
             int   flickerMode; float flickerSpeed, flickerAmount;
             float scale;
+            const void* model;
+            bool  bake;     // wants baked occlusion
+            bool  moving;   // attached (follows a model): never baked
         };
 
         double g_time = 0.0;
@@ -297,6 +322,76 @@ namespace wxl_livingazeroth::lights
             }
             const double s = 0.5 * std::sin(t * 7.13) + 0.3 * std::sin(t * 13.71 + 1.3) + 0.2 * std::sin(t * 23.17 + 2.1);
             return static_cast<float>(0.5 + 0.5 * s);
+        }
+
+        // --- the cell grid (clustered list) ---------------------------------------------------------
+        Grid g_grid;
+        std::vector<float> g_baseLum;   // per active light: its brightness before fade and flicker (ranks it in full cells)
+
+        struct CellEntry { uint32_t cell; float score; uint16_t light; };
+
+        // The grid snaps to whole cells around the camera, so a cell only changes when lights do.
+        // A light goes into every cell its radius reaches (circle vs square). A cell holding more than
+        // perCell keeps the strongest at its centre: brightness x (1 - d / reach)^2 with the light's
+        // base brightness (no flicker or fade, so the choice doesn't flip from frame to frame).
+        void BuildGrid(const float eye[3])
+        {
+            Grid next;
+            next.cellSize = std::max(4.0f, g_settings.cellSize);
+            next.perCell = std::max(1, std::min(g_settings.maxPerCell, kMaxPerCellCap));
+            const int half = std::min(static_cast<int>(std::ceil(g_settings.range / next.cellSize)), kMaxCells / 2);
+            next.cells = std::max(1, half * 2);
+            next.originX = (std::floor(eye[0] / next.cellSize) - half) * next.cellSize;
+            next.originY = (std::floor(eye[1] / next.cellSize) - half) * next.cellSize;
+            const size_t cellCount = static_cast<size_t>(next.cells) * next.cells;
+            next.count.assign(cellCount, 0);
+            next.index.assign(cellCount * next.perCell, 0);
+
+            static std::vector<CellEntry> entries;
+            entries.clear();
+            const float cs = next.cellSize, halfDiag = cs * 0.70710678f;
+            for (size_t i = 0; i < g_active.size(); ++i)
+            {
+                const ActiveLight& l = g_active[i];
+                const float r = l.radius;
+                if (r <= 0.0f) continue;
+                const float lx = l.pos[0] - next.originX, ly = l.pos[1] - next.originY;
+                const int x0 = std::max(0, static_cast<int>(std::floor((lx - r) / cs)));
+                const int y0 = std::max(0, static_cast<int>(std::floor((ly - r) / cs)));
+                const int x1 = std::min(next.cells - 1, static_cast<int>(std::floor((lx + r) / cs)));
+                const int y1 = std::min(next.cells - 1, static_cast<int>(std::floor((ly + r) / cs)));
+                for (int y = y0; y <= y1; ++y)
+                    for (int x = x0; x <= x1; ++x)
+                    {
+                        const float nx = std::max(x * cs, std::min(lx, (x + 1) * cs)) - lx;
+                        const float ny = std::max(y * cs, std::min(ly, (y + 1) * cs)) - ly;
+                        if (nx * nx + ny * ny > r * r) continue;
+                        const float cx = (x + 0.5f) * cs - lx, cy = (y + 0.5f) * cs - ly;
+                        const float t = 1.0f - std::min(std::sqrt(cx * cx + cy * cy) / (r + halfDiag), 1.0f);
+                        entries.push_back({ static_cast<uint32_t>(y * next.cells + x), g_baseLum[i] * t * t, static_cast<uint16_t>(i) });
+                    }
+            }
+            std::sort(entries.begin(), entries.end(), [](const CellEntry& a, const CellEntry& b)
+                      { return a.cell != b.cell ? a.cell < b.cell : (a.score != b.score ? a.score > b.score : a.light < b.light); });
+
+            unsigned busiest = 0, full = 0, dropped = 0;
+            for (size_t e = 0; e < entries.size();)
+            {
+                const uint32_t c = entries[e].cell;
+                unsigned n = 0;
+                for (; e < entries.size() && entries[e].cell == c; ++e, ++n)
+                    if (n < static_cast<unsigned>(next.perCell)) next.index[c * next.perCell + n] = entries[e].light;
+                busiest = std::max(busiest, n);
+                if (n > static_cast<unsigned>(next.perCell)) { ++full; dropped += n - next.perCell; }
+                next.count[c] = static_cast<uint8_t>(std::min(n, static_cast<unsigned>(next.perCell)));
+            }
+            g_stats.busiestCell = busiest; g_stats.fullCells = full; g_stats.droppedFromCells = dropped;
+
+            const bool same = next.cells == g_grid.cells && next.perCell == g_grid.perCell && next.originX == g_grid.originX &&
+                              next.originY == g_grid.originY && next.cellSize == g_grid.cellSize &&
+                              next.count == g_grid.count && next.index == g_grid.index;
+            next.generation = same ? g_grid.generation : g_grid.generation + 1;
+            g_grid = std::move(next);
         }
     }
 
@@ -331,54 +426,369 @@ namespace wxl_livingazeroth::lights
         return true;
     }
 
+    namespace
+    {
+        // Instance fields (core offsets/game/M2.hpp): parent +0x48, the attachment it hangs on +0x54
+        // (an index into the parent's attachments, 0xFFFF = none), first attached child +0x58, next
+        // sibling +0x60, scene +0x28, last animated scene frame +0x3C, placement (model -> world, roots)
+        // +0xB4, model -> view root +0xF4. Scene: current frame +0x14.
+        constexpr size_t kInstScene = 0x28, kInstLastAnim = 0x3C, kInstParent = 0x48, kInstAttachSlot = 0x54;
+        constexpr size_t kInstChildHead = 0x58, kInstChildNext = 0x60, kInstPlacement = 0xB4, kInstViewRoot = 0xF4;
+        constexpr size_t kSceneFrame = 0x14;
+        constexpr int    kMaxDepth = 4;          // weapon on a mount's rider is about as deep as it goes
+        constexpr unsigned kMaxChildren = 64;    // per parent: a broken chain stops here
+
+        // view -> camera-relative world (the inverse of the captured view), and the camera then.
+        float g_viewInv[16] = {};
+        float g_viewCamera[3] = {};
+        bool  g_viewValid = false;
+
+        void Mul4(const float a[16], const float b[16], float out[16])
+        {
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c)
+                    out[r * 4 + c] = a[r * 4] * b[c] + a[r * 4 + 1] * b[4 + c] + a[r * 4 + 2] * b[8 + c] + a[r * 4 + 3] * b[12 + c];
+        }
+
+        bool ParentWorldAtRest(const uint8_t* inst, float out[16], int depth);
+
+        bool WorldOf(const uint8_t* inst, float out[16], bool& animated, int depth)
+        {
+            const uint8_t* parent = nullptr;
+            if (!Get(inst, kInstParent, parent)) return false;
+            if (!parent) { animated = true; return Get(inst, kInstPlacement, *reinterpret_cast<float(*)[16]>(out)); }
+            if (depth > kMaxDepth) return false;
+            // Animated lately: its own view root, back to world.
+            const uint8_t* scene = nullptr;
+            uint32_t frame = 0, last = 0;
+            float root[16];
+            if (g_viewValid && Get(inst, kInstScene, scene) && scene && Get(scene, kSceneFrame, frame) && Get(inst, kInstLastAnim, last) &&
+                frame - last <= 2u && Get(inst, kInstViewRoot, root))
+            {
+                Mul4(root, g_viewInv, out);
+                for (int c = 0; c < 3; ++c) out[12 + c] += g_viewCamera[c];
+                animated = true;
+                return true;
+            }
+            animated = false;
+            return ParentWorldAtRest(inst, out, depth);
+        }
+
+        // The parent's world matrix moved to the attachment the instance hangs on (rest position; the
+        // attachment's bone isn't animated here).
+        bool ParentWorldAtRest(const uint8_t* inst, float out[16], int depth)
+        {
+            const uint8_t* parent = nullptr;
+            uint32_t slot = 0xFFFF;
+            bool parentAnimated = false;
+            if (!Get(inst, kInstParent, parent) || !parent || !WorldOf(parent, out, parentAnimated, depth + 1)) return false;
+            Get(inst, kInstAttachSlot, slot);
+            const uint8_t* shared = nullptr;
+            const uint8_t* hdr = nullptr;
+            uint32_t count = 0;
+            const uint8_t* items = nullptr;
+            float at[3];
+            if (slot != 0xFFFF && Get(parent, dd::off::kInstModel, shared) && shared && Get(shared, dd::off::kModelHeader, hdr) && hdr &&
+                Get(hdr, 0xF0, count) && slot < count && Get(hdr, 0xF4, items) && items && Get(items + slot * 0x28, 8, at))
+            {
+                float moved[3];
+                Mul(at, out, moved);
+                for (int c = 0; c < 3; ++c) out[12 + c] = moved[c];
+            }
+            return true;
+        }
+
+        void Describe(const uint8_t* m, SceneModel& sm)
+        {
+            const uint8_t* shared = nullptr;
+            if (Get(m, dd::off::kInstModel, shared) && shared)
+            {
+                Get(shared, dd::off::kModelHeader, sm.header);
+                const char* path = static_cast<const dd::off::M2ModelCache*>(static_cast<const void*>(shared))->fullPath;
+                if (dd::detail::Readable(path, 1)) sm.path = path;
+            }
+        }
+
+        void AddChildren(const uint8_t* parent, const float center[3], float range, std::vector<SceneModel>& out, int depth, unsigned& attached)
+        {
+            if (depth > kMaxDepth) return;
+            const uint8_t* c = nullptr;
+            if (!Get(parent, kInstChildHead, c)) return;
+            for (unsigned n = 0; c && n < kMaxChildren; ++n)
+            {
+                SceneModel sm;
+                sm.model = c;
+                sm.parent = parent;
+                if (WorldOf(c, sm.world, sm.animated, depth))
+                {
+                    const float dx = sm.world[12] - center[0], dy = sm.world[13] - center[1], dz = sm.world[14] - center[2];
+                    sm.distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (sm.distance <= range) { Describe(c, sm); out.push_back(sm); ++attached; }
+                }
+                AddChildren(c, center, range, out, depth + 1, attached);
+                const uint8_t* next = nullptr;
+                if (!Get(c, kInstChildNext, next)) break;
+                c = next;
+            }
+        }
+
+        unsigned g_lastAttached = 0;
+    }
+
+    void NoteSceneView(const float view[16], const float camera[3])
+    {
+        // Affine, row-vector: view = rel * R + T, so rel = (view - T) * R^-1.
+        const float* v = view;
+        const float a = v[0], b = v[1], c = v[2], d = v[4], e = v[5], f = v[6], g = v[8], h = v[9], i = v[10];
+        const float A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+        const float det = a * A + b * B + c * C;
+        if (std::fabs(det) < 1e-12f) { g_viewValid = false; return; }
+        const float k = 1.0f / det;
+        float* o = g_viewInv;
+        o[0] = A * k;                 o[1] = -(b * i - c * h) * k;  o[2] = (b * f - c * e) * k;   o[3] = 0.0f;
+        o[4] = B * k;                 o[5] = (a * i - c * g) * k;   o[6] = -(a * f - c * d) * k;  o[7] = 0.0f;
+        o[8] = C * k;                 o[9] = -(a * h - b * g) * k;  o[10] = (a * e - b * d) * k;  o[11] = 0.0f;
+        for (int col = 0; col < 3; ++col) o[12 + col] = -(v[12] * o[col] + v[13] * o[4 + col] + v[14] * o[8 + col]);
+        o[15] = 1.0f;
+        std::memcpy(g_viewCamera, camera, sizeof(g_viewCamera));
+        g_viewValid = true;
+    }
+
+    bool AttachedWorld(const void* instance, float out[16], bool& animated)
+    {
+        return WorldOf(static_cast<const uint8_t*>(instance), out, animated, 0);
+    }
+
+    namespace
+    {
+        std::unordered_map<uint64_t, bool> g_indoorCache;
+        unsigned g_indoorTests = 0;
+
+        bool LocateIndoor(const float pos[3])
+        {
+            namespace wo = wxl::offsets::game::wmo;
+            using LocateFn = char(__cdecl*)(const float* a, const float* b, float fraction, void** instanceOut, uint32_t* groupOut);
+            using GroupFlagsFn = uint32_t(__fastcall*)(const void* wmo, void* edx, uint32_t group);
+            constexpr uintptr_t kGroupFlags = 0x007AE7B0;
+            constexpr size_t kInstanceWmo = 0xF4;
+            constexpr float kDown = 2.0f;   // yd: the caller probes down from the camera; a light only needs its own spot
+            const float b[3] = { pos[0], pos[1], pos[2] - kDown };
+            void* instances[2] = {};
+            uint32_t groups[4] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };
+            __try
+            {
+                if (!reinterpret_cast<LocateFn>(wo::kLocateViewerMapObjs)(pos, b, 1.0f, instances, groups) || !instances[0] || groups[0] == 0xFFFF) return false;
+                const void* wmo = nullptr;
+                if (!Get(instances[0], kInstanceWmo, wmo) || !wmo) return false;
+                uint32_t flags = reinterpret_cast<GroupFlagsFn>(kGroupFlags)(wmo, nullptr, groups[0]);
+                if (groups[1] != 0xFFFF) flags |= reinterpret_cast<GroupFlagsFn>(kGroupFlags)(wmo, nullptr, groups[1]);
+                return (flags & wo::kGroupFlagIndoor) != 0;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+    }
+
+    bool IsIndoor(const float pos[3])
+    {
+        const auto q = [](float v) { return static_cast<uint64_t>(static_cast<int64_t>(std::floor(v * 2.0f)) & 0x1FFFFF); };
+        const uint64_t key = q(pos[0]) | (q(pos[1]) << 21) | (q(pos[2]) << 42);
+        // A WMO still loading reads as outdoor, so the cache starts over every few seconds (and when
+        // it gets large) rather than keeping that answer.
+        static uint64_t started = 0;
+        const uint64_t now = GetTickCount64();
+        if (now - started > 5000 || g_indoorCache.size() > 16384) { g_indoorCache.clear(); started = now; }
+        const auto it = g_indoorCache.find(key);
+        if (it != g_indoorCache.end()) return it->second;
+        ++g_indoorTests;
+        const bool indoor = LocateIndoor(pos);
+        g_indoorCache[key] = indoor;
+        return indoor;
+    }
+
+    namespace
+    {
+        // --- baked occlusion ----------------------------------------------------------------------
+        // Per light (by position + radius, so it survives rescans and merges): for each of kOccCells
+        // directions on an octahedral map, how far the light reaches before terrain or a WMO
+        // (pick::TraceLine: models don't block, so a light's own torch or firewood never does). Each
+        // cell keeps the FARTHEST of 5 rays (its centre and 4 points near its corners): a surface the
+        // light faces at a grazing angle stays lit across the whole cell, and only what lies behind
+        // the nearest wall in every sub-ray goes dark. A hit in the first kEmbedded yards counts as the
+        // light sitting inside that surface (a torch half in a wall): the ray carries on past it.
+        // Baked incrementally under a ray budget, nearest lights first; only lights that stayed in
+        // place for kSettleFrames (moving ones never finish, so they're never queued).
+        constexpr float    kEmbedded = 0.3f;
+        constexpr unsigned kSettleFrames = 15;
+        constexpr int      kSubRays = 5;
+        constexpr size_t   kMaxEntries = 4096;
+
+        struct OccEntry
+        {
+            float    dist[kOccCells];
+            int      cellsDone = 0;
+            unsigned settled = 0;      // consecutive frames requested
+            uint64_t lastFrame = 0;
+            float    pos[3] = {};
+            float    reach = 0.0f;
+        };
+        std::unordered_map<uint64_t, OccEntry> g_occ;
+        uint64_t g_frame = 0;
+        std::vector<char> g_wantBake;  // per active light, this frame
+
+        uint64_t OccKey(const float p[3], float radius)
+        {
+            const auto q = [](float v) { return static_cast<uint64_t>((static_cast<int64_t>(std::floor(v * 4.0f)) + 131072) & 0x3FFFF); };
+            const uint64_t r = static_cast<uint64_t>(std::min(1023.0f, std::max(0.0f, radius * 8.0f)));
+            return q(p[0]) | (q(p[1]) << 18) | (q(p[2]) << 36) | (r << 54);
+        }
+
+        // Octahedral map: (u, v) in [-1, 1] -> unit direction. The shaders encode the other way:
+        // n = d / (|x| + |y| + |z|), lower half folded with (1 - |n.yx|) * sign(n.xy).
+        void OctDecode(float u, float v, float out[3])
+        {
+            float x = u, y = v, z = 1.0f - std::fabs(u) - std::fabs(v);
+            const float t = std::max(-z, 0.0f);
+            x += x >= 0.0f ? -t : t;
+            y += y >= 0.0f ? -t : t;
+            const float len = std::sqrt(x * x + y * y + z * z);
+            out[0] = x / len; out[1] = y / len; out[2] = z / len;
+        }
+
+        float CastRay(const float from[3], const float dir[3], float reach, unsigned& rays)
+        {
+            float start = 0.0f;
+            for (int tries = 0; tries < 3; ++tries)
+            {
+                const float a[3] = { from[0] + dir[0] * start, from[1] + dir[1] * start, from[2] + dir[2] * start };
+                const float b[3] = { from[0] + dir[0] * reach, from[1] + dir[1] * reach, from[2] + dir[2] * reach };
+                wxl::game::world::WorldHit hit;
+                ++rays;
+                if (!wxl::game::world::TraceLine(a, b, hit)) return reach;
+                const float d = start + (reach - start) * hit.t;
+                if (d > kEmbedded) return d;
+                start = d + 0.05f;
+                if (start >= reach) return reach;
+            }
+            return reach;
+        }
+
+        void BakeCell(OccEntry& e, int cell, unsigned& rays)
+        {
+            const int ix = cell % kOccSide, iy = cell / kOccSide;
+            static const float kSub[kSubRays][2] = { { 0.5f, 0.5f }, { 0.15f, 0.15f }, { 0.85f, 0.15f }, { 0.15f, 0.85f }, { 0.85f, 0.85f } };
+            float best = 0.0f;
+            for (const auto& s : kSub)
+            {
+                float dir[3];
+                OctDecode((ix + s[0]) / kOccSide * 2.0f - 1.0f, (iy + s[1]) / kOccSide * 2.0f - 1.0f, dir);
+                best = std::max(best, CastRay(e.pos, dir, e.reach, rays));
+            }
+            e.dist[cell] = best;
+        }
+
+        void Bake(const float eye[3])
+        {
+            ++g_frame;
+            const double t0 = grassperf::Now();
+            unsigned wanted = 0, done = 0, rays = 0;
+            std::vector<std::pair<float, OccEntry*>> work;
+            for (size_t i = 0; i < g_active.size(); ++i)
+            {
+                ActiveLight& l = g_active[i];
+                l.occlusion = nullptr;
+                if (!g_settings.bakeEnabled || !g_wantBake[i] || l.radius <= 0.0f) continue;
+                ++wanted;
+                const uint64_t key = OccKey(l.pos, l.radius);
+                auto it = g_occ.find(key);
+                if (it == g_occ.end())
+                {
+                    if (g_occ.size() >= kMaxEntries) continue;
+                    it = g_occ.emplace(key, OccEntry{}).first;
+                    std::memcpy(it->second.pos, l.pos, sizeof(it->second.pos));
+                    it->second.reach = l.radius + 0.5f;
+                }
+                OccEntry& e = it->second;
+                e.settled = e.lastFrame + 1 == g_frame ? e.settled + 1 : 1;
+                e.lastFrame = g_frame;
+                if (e.cellsDone == kOccCells) { l.occlusion = e.dist; ++done; continue; }
+                if (e.settled < kSettleFrames) continue;
+                const float dx = l.pos[0] - eye[0], dy = l.pos[1] - eye[1], dz = l.pos[2] - eye[2];
+                work.push_back({ dx * dx + dy * dy + dz * dz, &e });
+            }
+            std::sort(work.begin(), work.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            const unsigned budget = static_cast<unsigned>(std::max(0, g_settings.bakeRaysPerFrame));
+            for (auto& w : work)
+            {
+                OccEntry& e = *w.second;
+                while (e.cellsDone < kOccCells && rays + kSubRays * 3 <= budget) BakeCell(e, e.cellsDone++, rays);
+                if (rays + kSubRays * 3 > budget) break;
+            }
+            // Forget lights not seen for a while (left the area, or moved: a new position is a new entry).
+            if (g_frame % 300 == 0)
+                for (auto it = g_occ.begin(); it != g_occ.end();)
+                    it = it->second.lastFrame + 600 < g_frame ? g_occ.erase(it) : std::next(it);
+            g_stats.bakeWanted = wanted; g_stats.bakeDone = done; g_stats.bakeRays = rays;
+            g_stats.bakeCached = static_cast<unsigned>(g_occ.size());
+            g_stats.bakeMs = grassperf::Now() - t0;
+        }
+    }
+
+    const char* ModelPath(const void* instance)
+    {
+        SceneModel sm;
+        if (instance) Describe(static_cast<const uint8_t*>(instance), sm);
+        return sm.path;
+    }
+
     unsigned SceneModels(const float center[3], float range, std::vector<SceneModel>& out)
     {
         // The M2 scene's model list (CM2Model_AttachToScene 0x834540): head at scene +0x08, next at
         // model +0x0C. Model: shared model at +0x2C (path +0x3C, header +0x150; core's doodad SDK),
-        // world matrix at +0xB4.
-        constexpr size_t kSceneModelHead = 0x08, kModelNext = 0x0C, kModelWorld = 0xB4;
+        // world matrix at +0xB4. Attached models are walked from their roots (AddChildren); one that
+        // also shows up in the list itself is skipped there, so it's listed once.
+        constexpr size_t kSceneModelHead = 0x08, kModelNext = 0x0C;
         constexpr unsigned kMaxModels = 100000; // a broken (cyclic) list stops here
+        constexpr float kChildReach = 30.0f;    // a root this much past the range can still hold an item inside it
         out.clear();
         const void* scene = *reinterpret_cast<const void* const*>(kScene);
         const uint8_t* m = nullptr;
         if (!scene || !Get(scene, kSceneModelHead, m)) return 0;
-        unsigned total = 0;
+        unsigned total = 0, attached = 0;
         for (; m && total < kMaxModels; ++total)
         {
             SceneModel sm;
             sm.model = m;
-            if (Get(m, kModelWorld, sm.world))
+            const uint8_t* parent = nullptr;
+            if (Get(m, kInstParent, parent) && !parent && Get(m, kInstPlacement, sm.world))
             {
                 const float dx = sm.world[12] - center[0], dy = sm.world[13] - center[1], dz = sm.world[14] - center[2];
                 sm.distance = std::sqrt(dx * dx + dy * dy + dz * dz);
-                if (sm.distance <= range)
-                {
-                    const uint8_t* shared = nullptr;
-                    if (Get(m, dd::off::kInstModel, shared) && shared)
-                    {
-                        Get(shared, dd::off::kModelHeader, sm.header);
-                        const char* path = static_cast<const dd::off::M2ModelCache*>(static_cast<const void*>(shared))->fullPath;
-                        if (dd::detail::Readable(path, 1)) sm.path = path;
-                    }
-                    out.push_back(sm);
-                }
+                if (sm.distance <= range) { Describe(m, sm); out.push_back(sm); }
+                if (sm.distance <= range + kChildReach) AddChildren(m, center, range, out, 1, attached);
             }
             const uint8_t* next = nullptr;
             if (!Get(m, kModelNext, next)) break;
             m = next;
         }
+        g_lastAttached = attached;
         std::sort(out.begin(), out.end(), [](const SceneModel& a, const SceneModel& b) { return a.distance < b.distance; });
         return total;
     }
 
     Settings& Config() { return g_settings; }
     const std::vector<ActiveLight>& Active() { return g_active; }
+    const Grid& CellGrid() { return g_grid; }
     Stats GetStats() { return g_stats; }
 
     void Update(float dt, const world::Snapshot& snap)
     {
         g_active.clear();
-        if (!snap.inWorld || !g_settings.enabled) { g_sources.clear(); return; }
+        if (!snap.inWorld || !g_settings.enabled)
+        {
+            g_sources.clear();
+            if (g_grid.cells) { g_grid = Grid{ 0.0f, 0.0f, 16.0f, 0, 0, {}, {}, g_grid.generation + 1 }; }
+            return;
+        }
         float eye[3] = { snap.playerPos[0], snap.playerPos[1], snap.playerPos[2] };
         wxl::game::camera::GetPosition(eye);
 
@@ -404,16 +814,31 @@ namespace wxl_livingazeroth::lights
             c.cosOuter = s.cosOuter; c.spotScale = s.spotScale;
             c.flickerMode = s.flickerMode; c.flickerSpeed = s.flickerSpeed; c.flickerAmount = s.flickerAmount;
             c.scale = s.scale > 0.0f ? s.scale : 1.0f;
+            c.model = s.model;
+            c.bake = s.bake;
+            c.moving = s.follow != nullptr;
+            // Attached models move: their matrix again this frame (gone, e.g. unequipped: skip it).
+            float worldPos[3];
+            std::memcpy(worldPos, s.worldPos, sizeof(worldPos));
+            if (s.follow)
+            {
+                float w[16];
+                bool animated = false;
+                if (!AttachedWorld(s.follow, w, animated)) continue;
+                Mul(s.localPos, w, worldPos);
+                if (s.cosOuter > -1.5f) MulDir(s.localDir, w, c.spotDir);
+                c.scale = MatrixScale(w) > 0.0f ? MatrixScale(w) : 1.0f;
+            }
             if (s.table)
             {
-                std::memcpy(c.pos, s.worldPos, sizeof(c.pos));
+                std::memcpy(c.pos, worldPos, sizeof(c.pos));
                 std::memcpy(c.color, s.color, sizeof(c.color));
             }
             else
             {
                 float stored[3] = {}, color[3] = {};
                 const bool placed = s.cm2 && Get(s.cm2, 0x0C, stored) && (stored[0] != 0.0f || stored[1] != 0.0f || stored[2] != 0.0f);
-                std::memcpy(c.pos, placed ? stored : s.worldPos, sizeof(c.pos));
+                std::memcpy(c.pos, placed ? stored : worldPos, sizeof(c.pos));
                 (placed ? fromClient : fromWorld)++;
                 const bool lit = s.cm2 && Get(s.cm2, 0x3C, color) && (color[0] > 0.0f || color[1] > 0.0f || color[2] > 0.0f);
                 if (!lit)
@@ -454,6 +879,8 @@ namespace wxl_livingazeroth::lights
                 }
                 cands[a].radius = std::max(cands[a].radius, cands[b].radius);
                 cands[a].scale = std::max(cands[a].scale, cands[b].scale);
+                cands[a].bake = cands[a].bake || cands[b].bake;
+                cands[a].moving = cands[a].moving || cands[b].moving;
                 wa += wb;
                 cands[b].weight = 0.0f;
                 ++merged;
@@ -461,7 +888,9 @@ namespace wxl_livingazeroth::lights
         }
         g_stats.merged = merged;
 
-        // The nearest to the camera, fading out over the last third of the range.
+        // Every light in range, fading out over the last third of the range. They stay in the scan's
+        // order (stable between scans, so the grid doesn't reshuffle every frame); only past kMaxPool
+        // do the farthest from the camera drop out.
         std::vector<std::pair<float, size_t>> order;
         for (size_t k = 0; k < cands.size(); ++k)
             if (cands[k].weight > 0.0f)
@@ -469,9 +898,20 @@ namespace wxl_livingazeroth::lights
                 const float dx = cands[k].pos[0] - eye[0], dy = cands[k].pos[1] - eye[1], dz = cands[k].pos[2] - eye[2];
                 order.push_back({ dx * dx + dy * dy + dz * dz, k });
             }
-        std::sort(order.begin(), order.end());
+        g_stats.poolDropped = 0;
+        if (order.size() > static_cast<size_t>(kMaxPool))
+        {
+            g_stats.poolDropped = static_cast<unsigned>(order.size() - kMaxPool);
+            std::nth_element(order.begin(), order.begin() + kMaxPool, order.end());
+            order.resize(kMaxPool);
+            std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+        }
+        g_baseLum.clear();
+        g_wantBake.clear();
+        unsigned indoorCount = 0;
+        g_indoorTests = 0;
         const float fadeStart = range * (2.0f / 3.0f);
-        for (size_t n = 0; n < order.size() && n < static_cast<size_t>(kMaxLights); ++n)
+        for (size_t n = 0; n < order.size(); ++n)
         {
             const Candidate& c = cands[order[n].second];
             const float d = std::sqrt(order[n].first);
@@ -489,9 +929,18 @@ namespace wxl_livingazeroth::lights
             std::memcpy(l.spotDir, c.spotDir, sizeof(l.spotDir));
             l.cosOuter = c.cosOuter; l.spotScale = c.spotScale;
             l.dip = 1.0f - flicker;
+            l.model = c.model;
+            l.indoor = g_settings.indoorSkipsTerrain && IsIndoor(l.pos);
+            indoorCount += l.indoor ? 1 : 0;
             g_active.push_back(l);
+            g_baseLum.push_back((c.color[0] + c.color[1] + c.color[2]) * g_settings.brightness);
+            g_wantBake.push_back(!c.moving && (c.bake || g_settings.bakeAll) ? 1 : 0);
         }
         g_stats.active = static_cast<unsigned>(g_active.size());
+        g_stats.indoor = indoorCount;
+        g_stats.indoorTests = g_indoorTests;
+        Bake(eye);
+        BuildGrid(eye);
     }
 
     float Reach(const float att[3], float share)
