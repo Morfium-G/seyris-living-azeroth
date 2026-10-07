@@ -116,12 +116,25 @@ namespace wxl_livingazeroth::lights
         constexpr size_t kFileType = 0x00, kFilePos = 0x04, kFileDiffuse = 0x38, kFileIntensity = 0x4C;
         constexpr float  kScanSeconds = 0.25f;
 
+        // Guarded by an exception handler instead of a VirtualQuery per read: the scan walks every model
+        // the scene holds (tens of thousands in a city), and dd::detail::Readable's small region cache
+        // (4 regions, reset every millisecond) turned most reads into a kernel call there: the
+        // owner's profiler showed one scan at 222 ms in Dalaran (2026-10-08). The pointers come from
+        // the client's own lists; a bad one still fails cleanly.
+        bool ReadGuarded(const void* p, void* out, size_t n)
+        {
+            if (reinterpret_cast<uintptr_t>(p) < 0x10000) return false;
+            __try
+            {
+                std::memcpy(out, p, n);
+                return true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+
         template <class T> bool Get(const void* base, size_t off, T& out)
         {
-            const void* p = static_cast<const uint8_t*>(base) + off;
-            if (!base || !dd::detail::Readable(p, sizeof(T))) return false;
-            std::memcpy(&out, p, sizeof(T));
-            return true;
+            return base && ReadGuarded(static_cast<const uint8_t*>(base) + off, &out, sizeof(T));
         }
 
         // The first value of an M2 track's first sequence [believed: once parsed, the nested arrays
@@ -134,9 +147,7 @@ namespace wxl_livingazeroth::lights
             const uint8_t* values = nullptr;
             if (!Get(track, 0x0C, sequences) || !Get(track, 0x10, perSequence) || !sequences || !perSequence) return false;
             if (!Get(perSequence, 0, count) || !Get(perSequence, 4, values) || !count || !values) return false;
-            if (!dd::detail::Readable(values, size)) return false;
-            std::memcpy(out, values, size);
-            return true;
+            return ReadGuarded(values, out, size);
         }
 
         // One light found by the scan. A model's own light (cm2 set): position and colour refreshed every
@@ -220,6 +231,26 @@ namespace wxl_livingazeroth::lights
             ++st.tableLights;
         }
 
+        // DoodadLightAssignment rows per model file, keyed by the file's path pointer (shared by every
+        // instance of that file, so a city's hundreds of identical lamps look it up once); the path's
+        // text is kept to notice a pointer reused by another file. Rebuilt when the tables change.
+        struct RowCache { std::string path; uint32_t generation = 0; std::vector<const lighttable::Assignment*> rows; };
+        std::unordered_map<const char*, RowCache> g_rowCache;
+
+        const std::vector<const lighttable::Assignment*>& RowsFor(const char* path)
+        {
+            if (g_rowCache.size() > 8192) g_rowCache.clear();
+            const uint32_t generation = lighttable::Generation();
+            RowCache& rc = g_rowCache[path];
+            if (rc.generation != generation || rc.path != path)
+            {
+                rc.path = path;
+                rc.generation = generation;
+                rc.rows = lighttable::ForModel(lighttable::Normalize(rc.path));
+            }
+            return rc.rows;
+        }
+
         void ScanModels(const float center[3])
         {
             const double t0 = grassperf::Now();
@@ -237,8 +268,8 @@ namespace wxl_livingazeroth::lights
 
                 // Table rows for this model: its lights, and whether its own are suppressed.
                 bool suppress = false;
-                if (haveTable)
-                    for (const lighttable::Assignment* a : lighttable::ForModel(lighttable::Normalize(m.path)))
+                if (haveTable && m.path[0])
+                    for (const lighttable::Assignment* a : RowsFor(m.path))
                     {
                         if (a->flags & lighttable::kSuppressModelLights) suppress = true;
                         if (a->lightId) AddTableLight(*a, hdr, m.world, m.model, m.parent ? m.model : nullptr, st);
@@ -505,7 +536,8 @@ namespace wxl_livingazeroth::lights
             {
                 Get(shared, dd::off::kModelHeader, sm.header);
                 const char* path = static_cast<const dd::off::M2ModelCache*>(static_cast<const void*>(shared))->fullPath;
-                if (dd::detail::Readable(path, 1)) sm.path = path;
+                char first = 0;
+                if (ReadGuarded(path, &first, 1)) sm.path = path;
             }
         }
 
@@ -561,8 +593,10 @@ namespace wxl_livingazeroth::lights
 
     namespace
     {
-        std::unordered_map<uint64_t, bool> g_indoorCache;
+        struct IndoorEntry { bool indoor; uint64_t expires; };
+        std::unordered_map<uint64_t, IndoorEntry> g_indoorCache;
         unsigned g_indoorTests = 0;
+        constexpr unsigned kIndoorTestsPerFrame = 48;
 
         bool LocateIndoor(const float pos[3])
         {
@@ -592,16 +626,17 @@ namespace wxl_livingazeroth::lights
     {
         const auto q = [](float v) { return static_cast<uint64_t>(static_cast<int64_t>(std::floor(v * 2.0f)) & 0x1FFFFF); };
         const uint64_t key = q(pos[0]) | (q(pos[1]) << 21) | (q(pos[2]) << 42);
-        // A WMO still loading reads as outdoor, so the cache starts over every few seconds (and when
-        // it gets large) rather than keeping that answer.
-        static uint64_t started = 0;
+        // A WMO still loading reads as outdoor, so every answer expires after 5-7 s (spread by key, so
+        // a city's lights don't all expire in the same frame) and is asked again, at most
+        // kIndoorTestsPerFrame a frame: past that, the old answer (or outdoor, if none yet) stands.
         const uint64_t now = GetTickCount64();
-        if (now - started > 5000 || g_indoorCache.size() > 16384) { g_indoorCache.clear(); started = now; }
-        const auto it = g_indoorCache.find(key);
-        if (it != g_indoorCache.end()) return it->second;
+        if (g_indoorCache.size() > 16384) g_indoorCache.clear();
+        auto it = g_indoorCache.find(key);
+        if (it != g_indoorCache.end() && now < it->second.expires) return it->second.indoor;
+        if (g_indoorTests >= kIndoorTestsPerFrame) return it != g_indoorCache.end() && it->second.indoor;
         ++g_indoorTests;
         const bool indoor = LocateIndoor(pos);
-        g_indoorCache[key] = indoor;
+        g_indoorCache[key] = IndoorEntry{ indoor, now + 5000 + key % 2000 };
         return indoor;
     }
 
@@ -803,6 +838,7 @@ namespace wxl_livingazeroth::lights
         g_time += dt;
 
         // This frame's lights: the client's current values where it has them.
+        const double t0 = grassperf::Now();
         std::vector<Candidate> cands;
         unsigned fromClient = 0, fromWorld = 0, fileColor = 0;
         const float range = g_settings.range;
@@ -857,18 +893,59 @@ namespace wxl_livingazeroth::lights
         g_stats.fromClient = fromClient; g_stats.fromWorldMatrix = fromWorld; g_stats.fileColor = fileColor;
         g_stats.inRange = static_cast<unsigned>(cands.size());
 
+        const double tCand = grassperf::Now();
+        g_stats.candMs = tCand - t0;
+
         // Merge point lights closer than the merge distance (torch groups): summed colour, position
         // weighted by brightness, the larger radius. Spot lights never merge (their cones differ).
+        // Neighbours are found through a grid of merge-distance cells (sorted keys), compared at their
+        // positions before merging: a city holds thousands of lights, and comparing every pair cost
+        // hundreds of milliseconds there (Dalaran, owner's profiler 2026-10-08).
         unsigned merged = 0;
-        const float md2 = g_settings.mergeDistance * g_settings.mergeDistance;
-        for (size_t a = 0; a < cands.size(); ++a)
+        const float md = g_settings.mergeDistance;
+        const float md2 = md * md;
+        static std::vector<std::pair<uint64_t, uint32_t>> cells;
+        static std::vector<float> original;
+        cells.clear();
+        original.resize(cands.size() * 3);
+        const float inv = md > 1e-3f ? 1.0f / md : 0.0f;
+        const auto cellOf = [&](const float p[3], int out[3]) { for (int k = 0; k < 3; ++k) out[k] = static_cast<int>(std::floor(p[k] * inv)); };
+        const auto keyOf = [](int x, int y, int z)
+        {
+            return (static_cast<uint64_t>(x + 1048576) & 0x1FFFFF) | ((static_cast<uint64_t>(y + 1048576) & 0x1FFFFF) << 21) |
+                   ((static_cast<uint64_t>(z + 1048576) & 0x1FFFFF) << 42);
+        };
+        if (inv > 0.0f)
+        {
+            for (size_t k = 0; k < cands.size(); ++k)
+            {
+                std::memcpy(&original[k * 3], cands[k].pos, 3 * sizeof(float));
+                if (cands[k].cosOuter > -1.5f) continue;
+                int c[3];
+                cellOf(cands[k].pos, c);
+                cells.push_back({ keyOf(c[0], c[1], c[2]), static_cast<uint32_t>(k) });
+            }
+            std::sort(cells.begin(), cells.end());
+        }
+        for (size_t a = 0; a < cands.size() && inv > 0.0f; ++a)
         {
             if (cands[a].weight <= 0.0f || cands[a].cosOuter > -1.5f) continue;
             float wa = cands[a].color[0] + cands[a].color[1] + cands[a].color[2];
-            for (size_t b = a + 1; b < cands.size(); ++b)
+            int ca[3];
+            cellOf(&original[a * 3], ca);
+            for (int nz = -1; nz <= 1; ++nz)
+            for (int ny = -1; ny <= 1; ++ny)
+            for (int nx = -1; nx <= 1; ++nx)
             {
-                if (cands[b].weight <= 0.0f || cands[b].cosOuter > -1.5f) continue;
-                const float dx = cands[a].pos[0] - cands[b].pos[0], dy = cands[a].pos[1] - cands[b].pos[1], dz = cands[a].pos[2] - cands[b].pos[2];
+                const uint64_t key = keyOf(ca[0] + nx, ca[1] + ny, ca[2] + nz);
+                auto it = std::lower_bound(cells.begin(), cells.end(), std::make_pair(key, 0u));
+                for (; it != cells.end() && it->first == key; ++it)
+            {
+                const size_t b = it->second;
+                if (b <= a || cands[b].weight <= 0.0f) continue;
+                const float* pa = &original[a * 3];
+                const float* pb = &original[b * 3];
+                const float dx = pa[0] - pb[0], dy = pa[1] - pb[1], dz = pa[2] - pb[2];
                 if (dx * dx + dy * dy + dz * dz > md2) continue;
                 const float wb = cands[b].color[0] + cands[b].color[1] + cands[b].color[2];
                 const float share = wa + wb > 0.0f ? wb / (wa + wb) : 0.5f;
@@ -885,8 +962,11 @@ namespace wxl_livingazeroth::lights
                 cands[b].weight = 0.0f;
                 ++merged;
             }
+            }
         }
         g_stats.merged = merged;
+        const double tMerge = grassperf::Now();
+        g_stats.mergeMs = tMerge - tCand;
 
         // Every light in range, fading out over the last third of the range. They stay in the scan's
         // order (stable between scans, so the grid doesn't reshuffle every frame); only past kMaxPool
@@ -939,8 +1019,12 @@ namespace wxl_livingazeroth::lights
         g_stats.active = static_cast<unsigned>(g_active.size());
         g_stats.indoor = indoorCount;
         g_stats.indoorTests = g_indoorTests;
+        const double tActive = grassperf::Now();
+        g_stats.activeMs = tActive - tMerge;
         Bake(eye);
+        const double tGrid = grassperf::Now();
         BuildGrid(eye);
+        g_stats.gridMs = grassperf::Now() - tGrid;
     }
 
     float Reach(const float att[3], float share)

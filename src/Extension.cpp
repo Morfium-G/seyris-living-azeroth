@@ -18,6 +18,7 @@
 #include "debug/DepthView.hpp"
 #include "debug/LightEditor.hpp"
 #include "debug/LightsView.hpp"
+#include "debug/Profiler.hpp"
 #include "debug/SurfaceView.hpp"
 #include "debug/WindView.hpp"
 #include "debug/WmoBindProbe.hpp"
@@ -100,15 +101,25 @@ namespace
     {
         const auto* a = static_cast<const ev::UpdateArgs*>(args);
         const float dt = a ? a->dt : 0.0f;
+        namespace prof = wxl_livingazeroth::prof;
         const auto& snap = wxl_livingazeroth::world::Refresh();
-        wxl_livingazeroth::climate::Update(snap);
-        wxl_livingazeroth::regional::Update(dt, snap);
-        wxl_livingazeroth::wind::Update(dt, snap);
-        if (snap.inWorld)
-            wxl_livingazeroth::actors::Refresh(snap.playerPos, wxl_livingazeroth::grass::kActorRange);
-        wxl_livingazeroth::fields::Update(dt, snap);
-        wxl_livingazeroth::lights::Update(dt, snap);
-        wxl_livingazeroth::cover::Update(dt, snap);
+        {
+            prof::Scope scope(prof::kOursEnv);
+            wxl_livingazeroth::climate::Update(snap);
+            wxl_livingazeroth::regional::Update(dt, snap);
+            wxl_livingazeroth::wind::Update(dt, snap);
+            if (snap.inWorld)
+                wxl_livingazeroth::actors::Refresh(snap.playerPos, wxl_livingazeroth::grass::kActorRange);
+            wxl_livingazeroth::fields::Update(dt, snap);
+        }
+        {
+            prof::Scope scope(prof::kOursLights);
+            wxl_livingazeroth::lights::Update(dt, snap);
+        }
+        {
+            prof::Scope scope(prof::kOursCoverFill);
+            wxl_livingazeroth::cover::Update(dt, snap);
+        }
     }
 
     void __cdecl OnDeviceLost(void* /*user*/, const void* /*args*/)
@@ -116,6 +127,7 @@ namespace
         wxl_livingazeroth::depth::OnDeviceLost();
         wxl_livingazeroth::grassinst::OnDeviceLost();
         wxl_livingazeroth::postaa::OnDeviceLost();
+        wxl_livingazeroth::prof::OnDeviceLost();
     }
 }
 
@@ -128,6 +140,10 @@ int __cdecl WXL_Load(const WXL_Api* api)
 {
     if (!api) return 0;
     g_api = api;
+
+    // The frame profiler first: its hooks go first in every chain, and its UI scope opens at the
+    // world -> UI boundary before the anti-aliasing (subscribed below) runs there.
+    wxl_livingazeroth::prof::Install(api);
 
     wxl_livingazeroth::depth::Init(api);
     api->Subscribe(static_cast<uint32_t>(ev::Event::OnFrame), &OnFrame, nullptr);

@@ -1,5 +1,6 @@
 #include "PostAA.hpp"
 
+#include "../debug/Profiler.hpp"
 #include "../features/GrassPerf.hpp"
 
 #include "engine/events/Event.hpp"
@@ -149,6 +150,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
 
         void __cdecl OnWorldRenderEnd(void* /*user*/, const void* args)
         {
+            prof::Scope scope(prof::kOursPost);
             if (g_settings.mode == Mode::Off) { g_inactive = "switched off"; return; }
             const auto* a = static_cast<const ev::WorldRenderEndArgs*>(args);
             auto* dev = static_cast<IDirect3DDevice9*>(a && a->device ? a->device : gx::RawDevice());

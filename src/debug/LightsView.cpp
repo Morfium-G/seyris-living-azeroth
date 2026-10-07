@@ -267,6 +267,9 @@ namespace wxl_livingazeroth::debug
                           ls.models, ls.modelsInRange, ls.scanMs, ls.modelLights, ls.fromClient, ls.fromWorldMatrix, ls.fileColor,
                           ls.inRange, ls.merged, ls.active, lights::kMaxPool, ls.poolDropped ? ", the farthest dropped" : "");
             g_api->UiTextWrapped(head);
+            std::snprintf(head, sizeof(head), "light update this frame: candidates %.2f ms, merging %.2f ms, drawn list + indoor tests %.2f ms, baking %.2f ms, grid %.2f ms; the last model scan (4x a second) %.2f ms",
+                          ls.candMs, ls.mergeMs, ls.activeMs, ls.bakeMs, ls.gridMs, ls.scanMs);
+            g_api->UiTextWrapped(head);
             {
                 const lights::Grid& grid = lights::CellGrid();
                 unsigned patchMost = 0, patchFull = 0;

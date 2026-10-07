@@ -110,7 +110,8 @@ namespace wxl_livingazeroth::lights
     /// Whether a point lies in an indoor WMO group: the client's own viewer locate (core
     /// wmo::kLocateViewerMapObjs, called the way its caller 0x795D40 does, on a short segment straight
     /// down from the point) and the group's MOGI flags (0x7AE7B0: [wmo +0x130] + group x 0x20, 0 while
-    /// the WMO isn't loaded) & 0x2000. Cached per half yard.
+    /// the WMO isn't loaded) & 0x2000. Cached per half yard; answers expire after 5-7 s, and at most
+    /// 48 new tests run per frame (the old answer, or outdoor, stands past that).
     bool IsIndoor(const float pos[3]);
 
     /// Every few frames: rescan the doodads (they don't move), refresh positions and colours.
@@ -143,6 +144,7 @@ namespace wxl_livingazeroth::lights
         unsigned indoor = 0, indoorTests = 0;                                // drawn lights inside an indoor WMO group; locate calls this frame
         unsigned bakeWanted = 0, bakeDone = 0, bakeRays = 0, bakeCached = 0; // drawn lights asking for occlusion, of those ready; rays this frame; cache entries
         double   bakeMs = 0.0;                                                // time spent casting this frame
+        double   candMs = 0.0, mergeMs = 0.0, activeMs = 0.0, gridMs = 0.0;   // this frame's steps (scanMs: the last scan)
         double   scanMs = 0.0;
     };
 
