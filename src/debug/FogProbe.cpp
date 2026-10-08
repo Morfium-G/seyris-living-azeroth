@@ -21,7 +21,6 @@ namespace wxl_livingazeroth::debug
         namespace gx = wxl::game::gx;
 
         constexpr const char* kTag = "wxl-seyris-living-azeroth";
-        constexpr const char* kPanelTitle = "wxl-seyris-living-azeroth: fog probe";
 
         // Core hook points used (signatures from the disassembly, XWorkbench 2026-10-08):
         //  Gx.WorldOnRender  0x4F8EA0  __thiscall(world frame), no stack args: the whole world frame.
@@ -227,22 +226,10 @@ namespace wxl_livingazeroth::debug
             End(i);
         }
 
-        // Diagnostics for the depth-write chain: does the state setter hook fire at all, and which of
-        // the four liquid material renders (vtable-dispatched, __thiscall with 7 stack args, ret 0x1C;
-        // each sets state 15: 0x8A52BB, 0x8A56B6, 0x8A5A26, 0x8A5DB9), plus the procedural water
-        // 0x8A6350 (sets states 17, 11, 61 inline, never 15), runs in which liquid pass.
+        // Diagnostics for the depth-write chain: does the state setter hook fire at all, and inside a
+        // liquid pass. (Not all water materials go through it: some write the state cache inline, see
+        // ForceDepthWriteForDraw; RecordRenders shows which material renders actually run.)
         unsigned g_rsCalls = 0, g_rs15[2] = {}, g_rsInLiquid = 0;
-        using MaterialRenderFn = void(__fastcall*)(void* m, void* edx, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7);
-        constexpr uintptr_t kMaterialRenders[5] = { 0x008A5170, 0x008A5590, 0x008A5900, 0x008A5C70, 0x008A6350 };
-        MaterialRenderFn g_origMaterial[5] = {};
-        unsigned g_materialCalls[5][3] = {}; // [material][liquid pass 0, 1, outside]
-
-        template <int N>
-        void __fastcall hkMaterial(void* m, void* edx, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7)
-        {
-            ++g_materialCalls[N][g_liquidPass == 0 ? 0 : (g_liquidPass == 1 ? 1 : 2)];
-            g_origMaterial[N](m, edx, a1, a2, a3, a4, a5, a6, a7);
-        }
 
         void __cdecl hkRsSet(int state, int value)
         {
@@ -281,16 +268,10 @@ namespace wxl_livingazeroth::debug
             std::snprintf(line, sizeof(line),
                           "depth-write requests (Gx state 15): magma/slime pass 0: off %u, on %u;  water pass 1: off %u, on %u;  forced %u (force %s)\r\n"
                           "device after each water draw: depth test off/write off %u, off/on %u, on/off %u, on/on %u\r\n"
-                          "state setter hook: %u calls, state 15 off %u / on %u anywhere, %u calls inside a liquid pass\r\n"
-                          "material renders [pass 0 / pass 1 / outside]: 0x8A5170 %u/%u/%u, 0x8A5590 %u/%u/%u, 0x8A5900 %u/%u/%u, 0x8A5C70 %u/%u/%u, 0x8A6350 (proc water) %u/%u/%u\r\n",
+                          "state setter hook: %u calls, state 15 off %u / on %u anywhere, %u calls inside a liquid pass\r\n",
                           g_asked[0][0], g_asked[0][1], g_asked[1][0], g_asked[1][1], g_forced, g_forceWaterDepth ? "on" : "off",
                           g_deviceZ[0][0], g_deviceZ[0][1], g_deviceZ[1][0], g_deviceZ[1][1],
-                          g_rsCalls, g_rs15[0], g_rs15[1], g_rsInLiquid,
-                          g_materialCalls[0][0], g_materialCalls[0][1], g_materialCalls[0][2],
-                          g_materialCalls[1][0], g_materialCalls[1][1], g_materialCalls[1][2],
-                          g_materialCalls[2][0], g_materialCalls[2][1], g_materialCalls[2][2],
-                          g_materialCalls[3][0], g_materialCalls[3][1], g_materialCalls[3][2],
-                          g_materialCalls[4][0], g_materialCalls[4][1], g_materialCalls[4][2]);
+                          g_rsCalls, g_rs15[0], g_rs15[1], g_rsInLiquid);
             std::string out = line;
             out += "render functions in the queues:";
             if (!g_seenRenderCount) out += " (none yet)";
@@ -380,9 +361,8 @@ namespace wxl_livingazeroth::debug
             return out;
         }
 
-        void __cdecl Panel(void*)
+        void Section()
         {
-            char line[200];
             g_api->UiTextWrapped("Ground fog phase 1. Capture a frame above water and one under water; "
                                  "check the water's depth with the scene depth panel's overlay.");
             g_api->UiSeparator();
@@ -400,7 +380,6 @@ namespace wxl_livingazeroth::debug
             {
                 std::memset(g_asked, 0, sizeof(g_asked));
                 std::memset(g_deviceZ, 0, sizeof(g_deviceZ));
-                std::memset(g_materialCalls, 0, sizeof(g_materialCalls));
                 std::memset(g_rs15, 0, sizeof(g_rs15));
                 g_seenRenderCount = 0;
                 g_forced = 0; g_rsCalls = 0; g_rsInLiquid = 0;
@@ -421,29 +400,14 @@ namespace wxl_livingazeroth::debug
         const int d = api->HookAttachByName("Gx.LiquidRenderPass", reinterpret_cast<void*>(&hkLiquid), reinterpret_cast<void**>(&g_origLiquid), WXL_HOOK_DEFAULT_PRIORITY);
         const int e = api->HookAttachByName("Weather.Render", reinterpret_cast<void*>(&hkWeather), reinterpret_cast<void**>(&g_origWeather), WXL_HOOK_DEFAULT_PRIORITY);
         const int f = api->HookAttachByName("Gx.RenderStateSet", reinterpret_cast<void*>(&hkRsSet), reinterpret_cast<void**>(&g_origRsSet), WXL_HOOK_DEFAULT_PRIORITY);
-        // Core's own chain on Gx.DeviceDraw is live from start-up: attach behind it (as the profiler does).
-        const int g = api->HookAttachByName("Gx.DeviceDraw", reinterpret_cast<void*>(&hkDraw), reinterpret_cast<void**>(&g_origDraw), 1000);
-        void* const materialHooks[5] = { reinterpret_cast<void*>(&hkMaterial<0>), reinterpret_cast<void*>(&hkMaterial<1>),
-                                         reinterpret_cast<void*>(&hkMaterial<2>), reinterpret_cast<void*>(&hkMaterial<3>),
-                                         reinterpret_cast<void*>(&hkMaterial<4>) };
-        int m[5] = {};
-        for (int k = 0; k < 5; ++k)
-        {
-            // 0x8A5590 and 0x8A5900 are core hook points (core names the second "WaterNoSpec", but its
-            // vtable is followed by the "psLiquidMagma..." shader name); the other two attach by address.
-            void** orig = reinterpret_cast<void**>(&g_origMaterial[k]);
-            if (k == 1)      m[k] = api->HookAttachByName("Liquid.MaterialWaterRender", materialHooks[k], orig, WXL_HOOK_DEFAULT_PRIORITY);
-            else if (k == 2) m[k] = api->HookAttachByName("Liquid.MaterialWaterNoSpecRender", materialHooks[k], orig, WXL_HOOK_DEFAULT_PRIORITY);
-            else
-            {
-                char name[48];
-                std::snprintf(name, sizeof(name), "LivingAzeroth.FogProbeMaterial%d", k);
-                m[k] = api->HookAttach(name, kMaterialRenders[k], materialHooks[k], orig, WXL_HOOK_DEFAULT_PRIORITY);
-            }
-        }
+        // In front of the default priority, so core's normal-phase features (installed after the
+        // extensions' chains are live, m2native-indices among them) can still go in behind us; see
+        // the profiler's draw hook.
+        const int g = api->HookAttachByName("Gx.DeviceDraw", reinterpret_cast<void*>(&hkDraw), reinterpret_cast<void**>(&g_origDraw), -1000) ||
+                      api->HookAttachByName("Gx.DeviceDraw", reinterpret_cast<void*>(&hkDraw), reinterpret_cast<void**>(&g_origDraw), 1000);
         api->Log((a && b && c && d && e && f && g) ? WXL_LOG_INFO : WXL_LOG_WARN, kTag,
-                 "fog probe: hooks frame %d map %d scene %d liquid %d weather %d state %d draw %d, materials %d %d %d %d %d",
-                 a, b, c, d, e, f, g, m[0], m[1], m[2], m[3], m[4]);
-        api->UiAddPanel(kPanelTitle, &Panel, nullptr);
+                 "fog probe: hooks frame %d map %d scene %d liquid %d weather %d state %d draw %d", a, b, c, d, e, f, g);
     }
+
+    void DrawFogProbeSection() { Section(); }
 }

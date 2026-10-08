@@ -24,6 +24,8 @@
 #include "debug/WmoBindProbe.hpp"
 #include "debug/FogProbe.hpp"
 #include "env/ClientWeather.hpp"
+#include "env/Fog.hpp"
+#include "debug/FogView.hpp"
 #include "env/Actors.hpp"
 #include "env/Climate.hpp"
 #include "env/Fields.hpp"
@@ -116,6 +118,10 @@ namespace
             wxl_livingazeroth::fields::Update(dt, snap);
         }
         {
+            prof::Scope scope(prof::kOursFogField);
+            wxl_livingazeroth::fog::Update(dt, snap);
+        }
+        {
             prof::Scope scope(prof::kOursLights);
             wxl_livingazeroth::lights::Update(dt, snap);
         }
@@ -184,6 +190,7 @@ int __cdecl WXL_Load(const WXL_Api* api)
     wxl_livingazeroth::debug::RegisterWindPanel(api);
     wxl_livingazeroth::debug::RegisterSurfacePanel(api);
     wxl_livingazeroth::debug::RegisterClimatePanel(api);
+    wxl_livingazeroth::debug::RegisterFogPanel(api);
     wxl_livingazeroth::debug::RegisterLightsPanel(api);
     wxl_livingazeroth::debug::RegisterLightEditor(api);
 

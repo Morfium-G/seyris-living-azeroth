@@ -14,6 +14,10 @@
 
 namespace wxl_livingazeroth::debug
 {
-    /// Hooks and the panel. From WXL_Load.
+    /// The hooks. From WXL_Load.
     void InstallFogProbe(const WXL_Api* api);
+
+    /// Its controls and readouts, drawn as a section of the fog panel (the overlay holds a limited
+    /// number of panels).
+    void DrawFogProbeSection();
 }

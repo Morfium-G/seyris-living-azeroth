@@ -27,6 +27,7 @@ namespace wxl_livingazeroth::prof
             "shadow maps", "weather", "UI + overlay",
             "ours: climate / wind / fields", "ours: lights (scan, grid, baking)", "ours: light textures",
             "ours: surface cover update", "ours: surface cover draw", "ours: anti-aliasing",
+            "ours: fog field", "ours: fog draw",
         };
 
         const WXL_Api* g_api = nullptr;
@@ -505,9 +506,12 @@ namespace wxl_livingazeroth::prof
                 api->Log(WXL_LOG_WARN, "wxl-seyris-living-azeroth", msg);
             }
         }
-        // Behind core's own detour on the draw (live from start-up, so it can't be preceded): counting
-        // doesn't need to be first.
-        if (!api->HookAttachByName("Gx.DeviceDraw", reinterpret_cast<void*>(&hkDeviceDraw), reinterpret_cast<void**>(&g_origDraw), 1000))
+        // In front on the draw too. Core installs its normal-phase features (m2native-indices among
+        // them, at the default priority) after the extensions' chains are live, and a live chain
+        // refuses a new head: a link of ours behind the default would make core's feature fail. In
+        // front, core's link goes in behind ours. Behind only if the chain is already live here.
+        if (!api->HookAttachByName("Gx.DeviceDraw", reinterpret_cast<void*>(&hkDeviceDraw), reinterpret_cast<void**>(&g_origDraw), -1000) &&
+            !api->HookAttachByName("Gx.DeviceDraw", reinterpret_cast<void*>(&hkDeviceDraw), reinterpret_cast<void**>(&g_origDraw), 1000))
             g_origDraw = nullptr;
         api->Subscribe(static_cast<uint32_t>(ev::Event::OnFrame), &OnFrame, nullptr);
         api->Subscribe(static_cast<uint32_t>(ev::Event::OnWorldRenderEnd), &OnWorldRenderEnd, nullptr);

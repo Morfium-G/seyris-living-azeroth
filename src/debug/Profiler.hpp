@@ -36,6 +36,8 @@ namespace wxl_livingazeroth::prof
         kOursCoverFill,   // this module: surface cover update (sampling, trenches)
         kOursCoverDraw,   // this module: surface cover draw
         kOursPost,        // this module: anti-aliasing
+        kOursFogField,    // this module: ground fog field update (env/Fog)
+        kOursFogDraw,     // this module: ground fog pass
         kCount
     };
 
