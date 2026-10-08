@@ -25,6 +25,7 @@
 #include "debug/FogProbe.hpp"
 #include "env/ClientWeather.hpp"
 #include "env/Fog.hpp"
+#include "features/GroundFog.hpp"
 #include "debug/FogView.hpp"
 #include "env/Actors.hpp"
 #include "env/Climate.hpp"
@@ -173,6 +174,8 @@ int __cdecl WXL_Load(const WXL_Api* api)
     wxl_livingazeroth::modellights::InstallProbe(api);
     wxl_livingazeroth::debug::InstallWmoBindProbe(api);
     wxl_livingazeroth::debug::InstallFogProbe(api);
+    // Ground fog: drawn at the weather render's entry (after the water, before rain and see-through models).
+    wxl_livingazeroth::groundfog::Install(api);
     // Records the M2 shader effects as the client loads them (research: dumps; later M2 patches).
     wxl_livingazeroth::m2effects::Install(api);
 

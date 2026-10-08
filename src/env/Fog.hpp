@@ -51,6 +51,14 @@ namespace wxl_livingazeroth::fog
         const float* amount[kKindCount] = {};
         float        maxAmount[kKindCount] = {};   // the largest amount anywhere, per kind
         uint32_t     version = 0;
+
+        // The surface the fog lies on, per cell: the higher of the terrain and terrain liquid (fog
+        // over a lake lies on the water). Filled a few hundred cells per frame as cells scroll in;
+        // until a cell is known it holds the ground under the player.
+        const float*   ground = nullptr;
+        const uint8_t* groundKnown = nullptr;
+        unsigned       groundMissing = 0;
+        uint32_t       groundVersion = 0;
     };
     const Grid& Current();
 

@@ -1,6 +1,7 @@
 #include "FogProbe.hpp"
 
 #include "../features/SurfaceCover.hpp"
+#include "../render/GxState.hpp"
 
 #include "game/Gx.hpp"
 
@@ -144,11 +145,6 @@ namespace wxl_livingazeroth::debug
             End(i);
         }
 
-        // The Gx state cache: [[0xC5DF88] + 0x28F4] + state * 0x18 holds each state's value (GxRsSet
-        // 0x408BF0 compares and writes it there); usable while [[0xC5DF88] + 0xF58] is non-zero.
-        constexpr uintptr_t kGxDevice = 0x00C5DF88;
-        constexpr size_t    kGxStateCache = 0x28F4, kGxStateStride = 0x18, kGxReady = 0xF58;
-
         // The pass (0x8A2240) draws bucket `passType` of the bank (16 bytes each: +4 count, +8 array of
         // instances); each instance's +0 is its material, whose vtable slot 2 ([vtable + 8]) is called.
         // Recorded here: every distinct render function seen, per pass type, with its draw count.
@@ -183,26 +179,13 @@ namespace wxl_livingazeroth::debug
             g_origLiquid(bank, edx, transform, passType);
         }
 
-        // Depth writes on for a water draw, the way the client changes a state itself: IRsDirty
-        // (0x685970, __thiscall(gxDevice, state), ret 4: queues the state for the next flush and saves
-        // its old value for the current push level), then the cache write. The water materials push
-        // their states and write state 15 = 0 inline before drawing (the live one, 0x8A48F0, at
-        // 0x8A4AD5..0x8A4AEF, unconditionally; the procedural water inherits it), so this has to run
-        // right before each draw; their RsPop at the end puts the old value back.
-        using IRsDirtyFn = void(__fastcall*)(void* gxDevice, void* edx, int state);
-        constexpr uintptr_t kIRsDirty = 0x00685970;
-
+        // Depth writes on for a water draw (render/GxState). The water materials push their states and
+        // write state 15 = 0 inline before drawing (the live one, 0x8A48F0, at 0x8A4AD5..0x8A4AEF,
+        // unconditionally; the procedural water inherits it), so this has to run right before each
+        // draw; their RsPop at the end puts the old value back.
         void ForceDepthWriteForDraw()
         {
-            auto* gxDev = *reinterpret_cast<uint8_t* const*>(kGxDevice);
-            if (!gxDev || !*reinterpret_cast<const uint32_t*>(gxDev + kGxReady)) return;
-            auto* cache = *reinterpret_cast<uint8_t* const*>(gxDev + kGxStateCache);
-            if (!cache) return;
-            auto* value = reinterpret_cast<uint32_t*>(cache + kGxStateDepthWrite * kGxStateStride);
-            if (*value == 1) return;
-            reinterpret_cast<IRsDirtyFn>(kIRsDirty)(gxDev, nullptr, kGxStateDepthWrite);
-            *value = 1;
-            ++g_forced;
+            if (gxstate::Force(gxstate::kDepthWrite, 1)) ++g_forced;
         }
 
         void __fastcall hkLiquid(void* bank, void* edx, void* transform, int passType)

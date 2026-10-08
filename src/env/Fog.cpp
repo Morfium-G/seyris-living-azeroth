@@ -1,5 +1,7 @@
 #include "Fog.hpp"
 
+#include "TerrainHeight.hpp"
+
 #include "../features/GrassPerf.hpp"
 
 #include <algorithm>
@@ -31,6 +33,11 @@ namespace wxl_livingazeroth::fog
         KindSettings g_settings[kKindCount] = { MakeDefaults(0), MakeDefaults(1), MakeDefaults(2), MakeDefaults(3), MakeDefaults(4) };
 
         std::vector<float> g_amount[kKindCount];
+        std::vector<float>   g_ground;
+        std::vector<uint8_t> g_groundKnown;
+        float    g_groundFallback = 0.0f;  // the ground under the player, for cells not known yet
+        int      g_groundCursor = 0;
+        constexpr int kGroundQueriesPerFrame = 512;
         Grid     g_grid;
         bool     g_placed = false;     // the grid has been centred once
         int      g_map = -1;
@@ -50,12 +57,71 @@ namespace wxl_livingazeroth::fog
                 g_amount[k].assign(kGridSize * kGridSize, 0.0f);
                 g_grid.amount[k] = g_amount[k].data();
             }
-            g_stats.kilobytes = static_cast<unsigned>(kKindCount * kGridSize * kGridSize * sizeof(float) / 1024);
+            g_ground.assign(kGridSize * kGridSize, 0.0f);
+            g_groundKnown.assign(kGridSize * kGridSize, 0);
+            g_grid.ground = g_ground.data();
+            g_grid.groundKnown = g_groundKnown.data();
+            g_stats.kilobytes = static_cast<unsigned>((kKindCount * sizeof(float) + sizeof(float) + 1) * kGridSize * kGridSize / 1024);
         }
 
-        /// Zeroes world column i (all rows) / world row j (all columns) in every kind.
-        void ClearColumn(int i) { for (int k = 0; k < kKindCount; ++k) for (int r = 0; r < kGridSize; ++r) g_amount[k][r * kGridSize + Wrap(i)] = 0.0f; }
-        void ClearRow(int j)    { for (int k = 0; k < kKindCount; ++k) for (int c = 0; c < kGridSize; ++c) g_amount[k][Wrap(j) * kGridSize + c] = 0.0f; }
+        void ForgetGround(int index)
+        {
+            g_groundKnown[index] = 0;
+            g_ground[index] = g_groundFallback;
+        }
+
+        /// Zeroes world column i (all rows) / world row j (all columns) in every kind, and forgets
+        /// their ground (they're other places now).
+        void ClearColumn(int i)
+        {
+            for (int r = 0; r < kGridSize; ++r)
+            {
+                const int index = r * kGridSize + Wrap(i);
+                for (int k = 0; k < kKindCount; ++k) g_amount[k][index] = 0.0f;
+                ForgetGround(index);
+            }
+        }
+        void ClearRow(int j)
+        {
+            for (int c = 0; c < kGridSize; ++c)
+            {
+                const int index = Wrap(j) * kGridSize + c;
+                for (int k = 0; k < kKindCount; ++k) g_amount[k][index] = 0.0f;
+                ForgetGround(index);
+            }
+        }
+
+        /// Some cells' ground per frame: the higher of the terrain and terrain liquid at the cell's
+        /// centre. Cells whose chunk isn't loaded stay unknown and are asked again on the next round.
+        void FillGround()
+        {
+            int queries = 0;
+            unsigned missing = 0;
+            bool changed = false;
+            for (int n = 0; n < kGridSize * kGridSize && queries < kGroundQueriesPerFrame; ++n)
+            {
+                const int index = g_groundCursor;
+                g_groundCursor = (g_groundCursor + 1) % (kGridSize * kGridSize);
+                if (g_groundKnown[index]) continue;
+                // Storage index -> the world cell it holds now.
+                const int ci = index % kGridSize, cj = index / kGridSize;
+                const int i = g_grid.firstI + Wrap(ci - g_grid.firstI);
+                const int j = g_grid.firstJ + Wrap(cj - g_grid.firstJ);
+                const float x = (i + 0.5f) * kCellSize, y = (j + 0.5f) * kCellSize;
+                ++queries;
+                float z = 0.0f;
+                if (!terrain::HeightAt(x, y, z)) { ++missing; continue; }
+                float liquid = 0.0f;
+                if (terrain::LiquidHeightAt(x, y, liquid) && liquid > z) z = liquid;
+                g_ground[index] = z;
+                g_groundKnown[index] = 1;
+                changed = true;
+            }
+            if (changed) ++g_grid.groundVersion;
+            unsigned unknown = 0;
+            for (uint8_t k : g_groundKnown) unknown += k ? 0 : 1;
+            g_grid.groundMissing = unknown;
+        }
 
         void ClearAll()
         {
@@ -76,7 +142,11 @@ namespace wxl_livingazeroth::fog
             const int fj = static_cast<int>(std::floor(y / kCellSize)) - kGridSize / 2;
             if (g_placed && fi == g_grid.firstI && fj == g_grid.firstJ) return;
             if (!g_placed || std::abs(fi - g_grid.firstI) >= kGridSize || std::abs(fj - g_grid.firstJ) >= kGridSize)
+            {
                 ClearAll();
+                for (int index = 0; index < kGridSize * kGridSize; ++index) ForgetGround(index);
+                ++g_grid.groundVersion;
+            }
             else
             {
                 // Columns entering on the side we move toward (they reuse the slots of those leaving).
@@ -144,7 +214,9 @@ namespace wxl_livingazeroth::fog
         if (snap.mapId != g_map) { ClearAll(); g_map = snap.mapId; g_placed = false; }
         g_px = snap.playerPos[0];
         g_py = snap.playerPos[1];
+        if (!terrain::HeightAt(g_px, g_py, g_groundFallback)) g_groundFallback = snap.playerPos[2];
         Recenter(g_px, g_py);
+        FillGround();
 
         g_tickTime += dt;
         if (g_tickTime < kTickSeconds) return;

@@ -3,6 +3,7 @@
 #include "FogProbe.hpp"
 
 #include "../env/Fog.hpp"
+#include "../features/GroundFog.hpp"
 #include "../env/WorldQuery.hpp"
 
 #include <cstdio>
@@ -24,8 +25,9 @@ namespace wxl_livingazeroth::debug
             const world::Snapshot& s = world::Current();
             char line[256];
 
-            g_api->UiTextWrapped("Ground fog, delivery 1: the field only. Nothing is drawn yet; deposited fog shows "
-                                 "in the numbers below and burns off at each kind's rate.");
+            g_api->UiTextWrapped("Ground fog. No rules yet: fog is only there when deposited, and burns off at each kind's rate.");
+            g_api->UiSeparator();
+            groundfog::DrawPanelSection();
             g_api->UiSeparator();
 
             g_api->UiText("Here / in the grid:");
