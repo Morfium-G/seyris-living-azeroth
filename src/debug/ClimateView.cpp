@@ -1,6 +1,7 @@
 #include "ClimateView.hpp"
 
 #include "../env/Climate.hpp"
+#include "../env/ClientWeather.hpp"
 #include "../env/Fields.hpp"
 #include "../env/Regional.hpp"
 #include "../env/TerrainHeight.hpp"
@@ -148,6 +149,20 @@ namespace wxl_livingazeroth::debug
             bool changed = g_api->UiCombo("weather", &g_weatherChoice, kChoices, 5) != 0;
             changed |= g_api->UiSliderFloat("intensity", &g_weatherIntensity, 0.0f, 1.0f) != 0;
             if (changed) climate::SetWeatherOverride(g_weatherChoice - 1, g_weatherIntensity);
+            // The override above only changes what the climate sees; this makes the client show it
+            // (until the server sends weather again), so the climate follows it as live weather.
+            if (g_weatherChoice > 0 && g_api->UiButton("Show this weather in the client"))
+            {
+                clientweather::Request(clientweather::StateFor(g_weatherChoice - 1, g_weatherIntensity), g_weatherIntensity, false);
+                climate::SetWeatherOverride(-1, g_weatherIntensity);
+                g_weatherChoice = 0;
+            }
+            if (clientweather::Last().state || clientweather::Last().applied)
+            {
+                const clientweather::Result& r = clientweather::Last();
+                std::snprintf(line, sizeof(line), "client weather: state %u, %s (record type %d)", r.state, r.note, r.recordType);
+                g_api->UiText(line);
+            }
             bool timeChanged = g_api->UiCheckbox("override time of day", &g_timeOn) != 0;
             timeChanged |= g_api->UiSliderFloat("hour", &g_timeHours, 0.0f, 24.0f) != 0;
             if (timeChanged) climate::SetTimeOverride(g_timeOn ? g_timeHours / 24.0f : -1.0f);

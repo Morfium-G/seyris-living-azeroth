@@ -2064,6 +2064,13 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
 
     void PatchLightStats(unsigned& most, unsigned& full) { most = g_patchLightsMost; full = g_patchLightsFull; }
 
+    bool SeenSceneFog(float vsFog[4], float psFogColor[4])
+    {
+        std::memcpy(vsFog, g_seenFog, sizeof(g_seenFog));
+        std::memcpy(psFogColor, g_seenFogColor, sizeof(g_seenFogColor));
+        return g_seenScene;
+    }
+
     void Update(float dt, const world::Snapshot& snap)
     {
         // Leaving the world (logout, loading screens without a player) unloads every tile: drop

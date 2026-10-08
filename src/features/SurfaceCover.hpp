@@ -34,4 +34,9 @@ namespace wxl_livingazeroth::cover
     /// Last drawn frame: the most point lights any patch had, and how many patches had more than
     /// lights::kMaxLights (the nearest to the camera kept).
     void PatchLightStats(unsigned& most, unsigned& full);
+
+    /// The stock fog the terrain stage left on the device, as last read there (only while the cover
+    /// draws in that pass with scene lighting on): VS c12 = (x, y, exponent, 0) with fog =
+    /// min(pow(max(viewZ * x + y, 0), exponent), 1), and PS c2 = the fog colour. False if never read.
+    bool SeenSceneFog(float vsFog[4], float psFogColor[4]);
 }

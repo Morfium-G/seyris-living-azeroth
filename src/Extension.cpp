@@ -22,6 +22,8 @@
 #include "debug/SurfaceView.hpp"
 #include "debug/WindView.hpp"
 #include "debug/WmoBindProbe.hpp"
+#include "debug/FogProbe.hpp"
+#include "env/ClientWeather.hpp"
 #include "env/Actors.hpp"
 #include "env/Climate.hpp"
 #include "env/Fields.hpp"
@@ -102,6 +104,7 @@ namespace
         const auto* a = static_cast<const ev::UpdateArgs*>(args);
         const float dt = a ? a->dt : 0.0f;
         namespace prof = wxl_livingazeroth::prof;
+        wxl_livingazeroth::clientweather::Apply();
         const auto& snap = wxl_livingazeroth::world::Refresh();
         {
             prof::Scope scope(prof::kOursEnv);
@@ -163,6 +166,7 @@ int __cdecl WXL_Load(const WXL_Api* api)
     wxl_livingazeroth::shaderpatch::Install(api);
     wxl_livingazeroth::modellights::InstallProbe(api);
     wxl_livingazeroth::debug::InstallWmoBindProbe(api);
+    wxl_livingazeroth::debug::InstallFogProbe(api);
     // Records the M2 shader effects as the client loads them (research: dumps; later M2 patches).
     wxl_livingazeroth::m2effects::Install(api);
 
