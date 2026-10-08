@@ -22,13 +22,14 @@ namespace wxl_livingazeroth::climate
             {"SeasonOffset",    6, WXL_CDBC_FIELD_VALUE},
             {"Humidity",        7, WXL_CDBC_FIELD_VALUE},
             {"Flags",           8, WXL_CDBC_FIELD_VALUE},
+            {"Fogginess",       9, WXL_CDBC_FIELD_VALUE}, // appended 2026-10-08 (ground fog)
         };
-        constexpr WXL_SeyrisCdbcDefinition kDef = { "AreaClimate", "DBFilesClient\\AreaClimate.cdbc", kFields, 9 };
+        constexpr WXL_SeyrisCdbcDefinition kDef = { "AreaClimate", "DBFilesClient\\AreaClimate.cdbc", kFields, 10 };
 
         enum Scope : uint32_t { kGlobal = 0, kMap = 1, kArea = 2 };
-        enum Field { kDay, kNight, kAmplitude, kOffset, kHumidity, kFieldCount };
-        constexpr const char* kColumns[kFieldCount] = { "DayTemp", "NightTemp", "SeasonAmplitude", "SeasonOffset", "Humidity" };
-        constexpr bool kSigned[kFieldCount] = { true, true, false, false, false };
+        enum Field { kDay, kNight, kAmplitude, kOffset, kHumidity, kFogginess, kFieldCount };
+        constexpr const char* kColumns[kFieldCount] = { "DayTemp", "NightTemp", "SeasonAmplitude", "SeasonOffset", "Humidity", "Fogginess" };
+        constexpr bool kSigned[kFieldCount] = { true, true, false, false, false, false };
 
         // Signed columns inherit at -1000 and below, the others at any negative value.
         bool IsSet(int f, float v) { return kSigned[f] ? v > -1000.0f : v >= 0.0f; }
@@ -137,6 +138,7 @@ namespace wxl_livingazeroth::climate
         if (set[kAmplitude]) r.seasonAmplitude = value[kAmplitude];
         if (set[kOffset])    r.seasonOffset = value[kOffset];
         if (set[kHumidity])  r.humidity = value[kHumidity] > 1.0f ? 1.0f : value[kHumidity];
+        if (set[kFogginess]) r.fogginess = value[kFogginess] > 1.0f ? 1.0f : value[kFogginess];
         r.flags = flags;
         if (g_cache.size() > 4096) g_cache.clear();
         return g_cache.emplace(key, r).first->second;

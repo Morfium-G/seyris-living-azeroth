@@ -1,0 +1,22 @@
+  <Table Name="FogSettings" Build="12340">
+    <Field Name="ID" Type="int" IsIndex="true" />
+    <Field Name="ScopeType" Type="int" />
+    <Field Name="ScopeID" Type="int" />
+    <Field Name="Kind" Type="int" />
+    <Field Name="Strength" Type="float" />
+    <Field Name="Density" Type="float" />
+    <Field Name="Thickness" Type="float" />
+    <Field Name="BuildUp" Type="float" />
+    <Field Name="BurnOff" Type="float" />
+    <Field Name="WindThin" Type="float" />
+    <Field Name="WindDrift" Type="float" />
+    <Field Name="Patchiness" Type="float" />
+    <Field Name="Weight" Type="float" />
+    <Field Name="ColorMode" Type="int" />
+    <Field Name="ColorR" Type="float" />
+    <Field Name="ColorG" Type="float" />
+    <Field Name="ColorB" Type="float" />
+    <Field Name="Saturation" Type="float" />
+    <Field Name="Brightness" Type="float" />
+    <Field Name="Flags" Type="int" />
+  </Table>

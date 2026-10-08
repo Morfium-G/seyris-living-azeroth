@@ -2,7 +2,9 @@
 
 #include "FogProbe.hpp"
 
+#include "../env/Climate.hpp"
 #include "../env/Fog.hpp"
+#include "../env/FogSettings.hpp"
 #include "../features/GroundFog.hpp"
 #include "../env/WorldQuery.hpp"
 
@@ -55,6 +57,10 @@ namespace wxl_livingazeroth::debug
             if (g_api->UiCheckbox("pause build-up and burn-off", &paused)) fog::SetPaused(paused != 0);
 
             g_api->UiSeparator();
+            std::snprintf(line, sizeof(line), "FogSettings.cdbc: %s; AreaClimate fogginess here: %.2f",
+                          fogsettings::Status(), climate::For(s.areaCount > 0 ? s.areaChain[0] : 0, s.mapId).fogginess);
+            g_api->UiTextWrapped(line);
+            if (g_api->UiButton("Reload FogSettings##fogreload")) fogsettings::Reload();
             for (int k = 0; k < fog::kKindCount; ++k)
             {
                 char header[64];
@@ -64,14 +70,19 @@ namespace wxl_livingazeroth::debug
                 char label[64];
                 std::snprintf(label, sizeof(label), "enabled##fogen%d", k);
                 g_api->UiCheckbox(label, &ks.enabled);
+                std::snprintf(label, sizeof(label), "use the panel's values (instead of the table; not saved)##fogov%d", k);
+                g_api->UiCheckbox(label, &ks.panelOverride);
+                std::snprintf(line, sizeof(line), "strength %.2f, wind thin %.2f, wind drift %.2f, patchiness %.2f, weight %.2f (rules and flow: later steps)",
+                              ks.strength, ks.windThin, ks.windDrift, ks.patchiness, ks.weight);
+                g_api->UiTextWrapped(line);
                 std::snprintf(label, sizeof(label), "build-up half-life (s)##fogup%d", k);
-                g_api->UiSliderFloat(label, &ks.buildUpSeconds, 1.0f, 3600.0f);
+                if (g_api->UiSliderFloat(label, &ks.buildUpSeconds, 1.0f, 3600.0f)) ks.panelOverride = 1;
                 std::snprintf(label, sizeof(label), "burn-off half-life (s)##fogdown%d", k);
-                g_api->UiSliderFloat(label, &ks.burnOffSeconds, 1.0f, 3600.0f);
+                if (g_api->UiSliderFloat(label, &ks.burnOffSeconds, 1.0f, 3600.0f)) ks.panelOverride = 1;
                 std::snprintf(label, sizeof(label), "layer thickness (yd)##fogthick%d", k);
-                g_api->UiSliderFloat(label, &ks.thickness, 0.5f, 50.0f);
+                if (g_api->UiSliderFloat(label, &ks.thickness, 0.5f, 50.0f)) ks.panelOverride = 1;
                 std::snprintf(label, sizeof(label), "density at the ground (per yd)##fogdens%d", k);
-                g_api->UiSliderFloat(label, &ks.density, 0.0f, 0.3f);
+                if (g_api->UiSliderFloat(label, &ks.density, 0.0f, 0.3f)) ks.panelOverride = 1;
             }
 
             g_api->UiSeparator();

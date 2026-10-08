@@ -8,4 +8,5 @@
     <Field Name="SeasonOffset" Type="float" />
     <Field Name="Humidity" Type="float" />
     <Field Name="Flags" Type="int" />
+    <Field Name="Fogginess" Type="float" />
   </Table>

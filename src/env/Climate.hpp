@@ -25,6 +25,7 @@ namespace wxl_livingazeroth::climate
         float    seasonAmplitude = 12.0f; // degC between midsummer and midwinter
         float    seasonOffset = 0.0f;     // months the seasons are shifted (6 = flipped)
         float    humidity = 0.5f;         // 0 dry air .. 1 saturated (slows drying; later fog, dust)
+        float    fogginess = 0.0f;        // 0 .. 1: how foggy the place is by nature (area fog, more mist)
         uint32_t flags = 0;               // reserved
     };
 

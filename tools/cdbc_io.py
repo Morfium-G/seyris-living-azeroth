@@ -66,8 +66,11 @@ GROUND_MATERIAL_SELECTOR = ["u", "u", "u", "s", "u", "i", "u", "u", "u"]
 SURFACE_COVER = ["u", "u", "u", "f", "f", "f", "f", "f", "f", "f", "u", "f", "s", "f", "f", "f", "f", "u", "f", "f"]
 #  ID MaterialID CoverMaterial Depth MaxSlope SlopeFade DriftNoise EdgeBreakup Rim RelaxSeconds
 #  TintColor TintStrength CoverTexture Opacity Flatten ZOffset Wetness Flags MeltKeptShare MeltGoneTemperature
-AREA_CLIMATE = ["u", "u", "u", "f", "f", "f", "f", "f", "u"]
-#  ID ScopeType ScopeID DayTemp NightTemp SeasonAmplitude SeasonOffset Humidity Flags
+AREA_CLIMATE = ["u", "u", "u", "f", "f", "f", "f", "f", "u", "f"]
+#  ID ScopeType ScopeID DayTemp NightTemp SeasonAmplitude SeasonOffset Humidity Flags Fogginess
+FOG_SETTINGS = ["u", "u", "u", "u", "f", "f", "f", "f", "f", "f", "f", "f", "f", "i", "f", "f", "f", "f", "f", "u"]
+#  ID ScopeType ScopeID Kind Strength Density Thickness BuildUp BurnOff WindThin WindDrift Patchiness
+#  Weight ColorMode ColorR ColorG ColorB Saturation Brightness Flags
 DOODAD_LIGHT_PROPERTIES = ["u", "s", "u", "u", "f", "f", "f", "f", "f", "i", "f", "f", "u"]
 #  ID Name Type Color Intensity Radius Falloff InnerAngle OuterAngle FlickerMode FlickerSpeed FlickerAmount Flags
 DOODAD_LIGHT_ASSIGNMENT = ["u", "s", "u", "i", "s", "f", "f", "f", "f", "f", "f", "u", "u"]
@@ -79,7 +82,8 @@ TABLES = {
     "GroundMaterial": (GROUND_MATERIAL, [0, "", 0, -1.0, -1.0, 0, -1.0, -1000.0]),
     "GroundMaterialSelector": (GROUND_MATERIAL_SELECTOR, [0, 0, 0, "", 0, -1, 0, 0, 0]),
     "SurfaceCover": (SURFACE_COVER, [0, 0, 0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 0, -1.0, "", -1.0, -1.0, -1000.0, -1.0, 0, -1.0, -1000.0]),
-    "AreaClimate": (AREA_CLIMATE, [0, 0, 0, -1000.0, -1000.0, -1.0, -1.0, -1.0, 0]),
+    "AreaClimate": (AREA_CLIMATE, [0, 0, 0, -1000.0, -1000.0, -1.0, -1.0, -1.0, 0, -1.0]),
+    "FogSettings": (FOG_SETTINGS, [0, 0, 0, 0] + [-1.0] * 9 + [-1] + [-1.0] * 5 + [0]),
     "DoodadLightProperties": (DOODAD_LIGHT_PROPERTIES, [0, "", 0, 0xFFA050, 1.4, -1.0, -1.0, 20.0, 35.0, -1, -1.0, -1.0, 0]),
     "DoodadLightAssignment": (DOODAD_LIGHT_ASSIGNMENT, [0, "", 0, 0, "", 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0, 0]),
 }

@@ -28,14 +28,19 @@ namespace wxl_livingazeroth::fog
     };
     const char* KindName(int kind);
 
-    /// Per kind, tunable from the panel (not saved yet; FogSettings.cdbc later).
+    /// Per kind, in effect where the player is: from FogSettings.cdbc (env/FogSettings) for the
+    /// player's place, re-resolved when the place or the table changes -- unless `panelOverride` is
+    /// set, then the panel's values stand (testing; not saved).
     struct KindSettings
     {
         int   enabled = 1;                // drawn (and, once they exist, its rules run); its amounts still burn off
-        float buildUpSeconds = 120.0f;  // half-life of the gap to a higher target (used once targets exist)
-        float burnOffSeconds = 600.0f;  // half-life of the gap to a lower target
-        float thickness = 4.0f;         // yd: the layer's height above the ground at full amount
-        float density = 0.05f;          // extinction per yd at full amount, at the ground
+        int   panelOverride = 0;          // the panel's values instead of the table's
+        float strength = 1.0f;            // multiplies the target from the kind's rules
+        float buildUpSeconds = 300.0f;    // half-life of the gap to a higher target (used once targets exist)
+        float burnOffSeconds = 900.0f;    // half-life of the gap to a lower target
+        float thickness = 4.0f;           // yd: the layer's height above the ground at full amount
+        float density = 0.05f;            // extinction per yd at full amount, at the ground
+        float windThin = 0.5f, windDrift = 0.5f, patchiness = 0.6f, weight = 0.0f; // phase 3 (rules, flow)
     };
     KindSettings& Settings(int kind);
 

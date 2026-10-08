@@ -2,7 +2,9 @@
 
 #include "../debug/Profiler.hpp"
 #include "../env/Fog.hpp"
+#include "../env/FogSettings.hpp"
 #include "../env/Wind.hpp"
+#include "../env/WorldQuery.hpp"
 #include "../render/GxState.hpp"
 #include "../render/SceneDepth.hpp"
 #include "GrassPerf.hpp"
@@ -301,6 +303,39 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             return true;
         }
 
+        float Luminance(const float c[3]) { return 0.299f * c[0] + 0.587f * c[1] + 0.114f * c[2]; }
+
+        /// The fog's colour where the player is: the zone's stock fog colour (it follows the time of
+        /// day), changed by FogSettings' "all kinds" rows of the player's place. Hue mode keeps the
+        /// stock colour's brightness and takes Color's hue and saturation, so day and night still show.
+        void FogColor(float out[3])
+        {
+            const uint32_t argb = *reinterpret_cast<const uint32_t*>(kFogColor);
+            const float stock[3] = { ((argb >> 16) & 0xFF) / 255.0f, ((argb >> 8) & 0xFF) / 255.0f, (argb & 0xFF) / 255.0f };
+            const world::Snapshot& s = world::Current();
+            fogsettings::Values v = fogsettings::Resolve(s.areaCount > 0 ? s.areaChain[0] : 0, s.mapId, -1);
+            if (g_settings.colorTest)
+            {
+                v.colorMode = g_settings.colorMode;
+                for (int i = 0; i < 3; ++i) v.color[i] = g_settings.color[i];
+                v.saturation = g_settings.saturation;
+                v.brightness = g_settings.colorBrightness;
+            }
+
+            float c[3] = { stock[0], stock[1], stock[2] };
+            if (v.colorMode == fogsettings::kColorReplace)
+                for (int i = 0; i < 3; ++i) c[i] = v.color[i];
+            else if (v.colorMode == fogsettings::kColorHue)
+            {
+                const float wanted = Luminance(v.color);
+                const float scale = wanted > 1.0e-4f ? Luminance(stock) / wanted : 0.0f;
+                for (int i = 0; i < 3; ++i) c[i] = v.color[i] * scale;
+            }
+            const float grey = Luminance(c);
+            const float brightness = v.brightness * g_settings.brightness;
+            for (int i = 0; i < 3; ++i) out[i] = (grey + (c[i] - grey) * v.saturation) * brightness;
+        }
+
         bool AnyFog()
         {
             const fog::Grid& grid = fog::Current();
@@ -390,9 +425,9 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
 
             const fog::Grid& grid = fog::Current();
             const float extent = fog::kGridSize * fog::kCellSize;
-            const uint32_t fogColor = *reinterpret_cast<const uint32_t*>(kFogColor);
+            float color[3];
+            FogColor(color);
             const float interior = *reinterpret_cast<const float*>(kInteriorBlend);
-            const float b = g_settings.brightness / 255.0f;
             const int steps = g_settings.steps < 2 ? 2 : (g_settings.steps > 64 ? 64 : g_settings.steps);
 
             const float c[13 * 4] = {
@@ -406,7 +441,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                 1.0f / extent, 0.0f, 0.0f, 0.0f,
                 grid.firstI * fog::kCellSize, grid.firstJ * fog::kCellSize,
                 (grid.firstI + fog::kGridSize) * fog::kCellSize, (grid.firstJ + fog::kGridSize) * fog::kCellSize,
-                ((fogColor >> 16) & 0xFF) * b, ((fogColor >> 8) & 0xFF) * b, (fogColor & 0xFF) * b,
+                color[0], color[1], color[2],
                 g_settings.densityScale * (1.0f - (interior > 0.0f ? interior : 0.0f)),
                 g_noiseOffset[0], g_noiseOffset[1], g_noiseOffset[2], 1.0f / (g_settings.noiseTileYards > 1.0f ? g_settings.noiseTileYards : 1.0f),
                 g_settings.noiseAmount, 1.0f / 16.0f, g_settings.debugColour ? 1.0f : 0.0f, 0.0f,
@@ -552,6 +587,22 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
         g_api->UiSliderFloat("colour brightness##gfbright", &g_settings.brightness, 0.0f, 3.0f);
         g_api->UiCheckbox("water writes depth while fog draws##gfwater", &g_settings.forceWaterDepth);
         g_api->UiCheckbox("debug: magenta fog##gfdebug", &g_settings.debugColour);
+        {
+            const world::Snapshot& s = world::Current();
+            const fogsettings::Values& v = fogsettings::Resolve(s.areaCount > 0 ? s.areaChain[0] : 0, s.mapId, -1);
+            static const char* const kModes[] = { "stock", "hue", "replace" };
+            std::snprintf(line, sizeof(line), "colour here (FogSettings, all kinds): %s, colour %.2f %.2f %.2f, saturation %.2f, brightness %.2f",
+                          kModes[v.colorMode], v.color[0], v.color[1], v.color[2], v.saturation, v.brightness);
+            g_api->UiTextWrapped(line);
+            g_api->UiCheckbox("colour test (instead of the table; not saved)##gfctest", &g_settings.colorTest);
+            if (g_settings.colorTest)
+            {
+                g_api->UiCombo("mode##gfcmode", &g_settings.colorMode, kModes, 3);
+                g_api->UiColorEdit("colour##gfccol", g_settings.color);
+                g_api->UiSliderFloat("saturation##gfcsat", &g_settings.saturation, 0.0f, 1.5f);
+                g_api->UiSliderFloat("brightness##gfcbright", &g_settings.colorBrightness, 0.0f, 3.0f);
+            }
+        }
         if (g_inactive)
             std::snprintf(line, sizeof(line), "renderer: not drawing -- %s", g_inactive);
         else

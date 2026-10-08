@@ -307,9 +307,10 @@ ground moisture (drying) now; later by snow melting and freezing, frost, fog and
 | SeasonOffset | months the seasons are shifted (6 = flipped, a "southern" continent) |
 | Humidity | 0 = dry air .. 1 = saturated: humid places dry slowly (later: fog, dust) |
 | Flags | reserved, 0 |
+| Fogginess | 0 .. 1: how foggy the place is by nature; drives area fog, boosts mist. −1 inherits. Appended 2026-10-08 |
 
 Lookup: Global < Map < Area (zone) < Area (sub-area); the more specific row wins **field by field**.
-No row at all: 18 °C day, 8 °C night, ±6 °C over the year, humidity 0.5.
+No row at all: 18 °C day, 8 °C night, ±6 °C over the year, humidity 0.5, fogginess 0.
 
 **Temperature** = night .. day by the time of day (the sky's clock) + the season (from the server's
 game date: warmest around 20 July, shifted by SeasonOffset) + the weather (rain −3 °C, snow −6 °C,
@@ -317,4 +318,39 @@ sandstorm +2 °C, × its intensity). The climate panel shows each part, and can 
 and the time of day for testing.
 
 Generator: `tools/gen_default_climate.py` (one Global row; `--examples` adds Northrend, Outland,
-Winterspring, Dun Morogh, Tanaris, Stranglethorn and Swamp of Sorrows).
+Winterspring, Dun Morogh, Tanaris, Stranglethorn, Swamp of Sorrows and Duskwood).
+
+## FogSettings.cdbc — `FogSettings.xml`
+
+How the ground fog behaves and looks, per place and fog kind. Optional: without the file (or for
+any field no row sets) the module's built-in values for the kind apply.
+
+| Field | Meaning |
+|---|---|
+| ID | row id |
+| ScopeType | 0 = Global, 1 = Map, 2 = Area |
+| ScopeID | Map.dbc ID or AreaTable ID (ignored for Global) |
+| Kind | 0 = all kinds, 1 mist, 2 water fog, 3 steam, 4 area fog, 5 haze |
+| Strength | multiplies the kind's target from its rules (0 = never here) |
+| Density | extinction per yd at the ground at full amount (mist ~0.06) |
+| Thickness | yd: layer height at full amount (the pool's depth for heavy fog) |
+| BuildUp / BurnOff | half-lives (s) toward a higher / lower target |
+| WindThin | wind strength (0..1) above which it can't settle |
+| WindDrift | how strongly the wind moves it (0..1) |
+| Patchiness | noise amount (0 smooth .. 1 patchy) |
+| Weight | 0 = rises and thins upward .. 1 = heavy: flat-topped, flows downhill, pools in hollows |
+| ColorMode | 0 = the zone's stock fog colour, 1 = hue (the stock colour's brightness with Color's hue and saturation: follows day and night), 2 = replace (Color as is); −1 inherits |
+| ColorR/G/B | 0 .. 1 |
+| Saturation | 0 = grey .. 1 = as is (on top of the mode) |
+| Brightness | multiplier |
+| Flags | reserved, 0 |
+
+All floats: −1 takes the field from the next row. Lookup (workspace rule, most specific wins):
+place first -- the area, its parent zones, the map, global -- and within each place the kind's
+own row before the Kind 0 row. Values never add up.
+
+The colour columns of the Kind 0 rows colour the whole fog (one colour per place, for now). The
+fog panel's "colour test" applies values live, to find them by eye before writing a row.
+
+Generator: `tools/gen_default_fog_settings.py` (no default rows; `--examples` adds colour rows for
+Swamp of Sorrows and Duskwood).

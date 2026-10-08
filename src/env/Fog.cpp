@@ -1,5 +1,6 @@
 #include "Fog.hpp"
 
+#include "FogSettings.hpp"
 #include "TerrainHeight.hpp"
 
 #include "../features/GrassPerf.hpp"
@@ -15,22 +16,48 @@ namespace wxl_livingazeroth::fog
         constexpr float kTickSeconds = 0.25f;
         constexpr float kGone = 1.0e-4f; // below this an amount counts as no fog
 
+        /// Copies a kind's table values (or built-in defaults) into its settings.
+        void Apply(KindSettings& s, const fogsettings::Values& v)
+        {
+            s.strength = v.strength;
+            s.buildUpSeconds = v.buildUp;
+            s.burnOffSeconds = v.burnOff;
+            s.thickness = v.thickness;
+            s.density = v.density;
+            s.windThin = v.windThin;
+            s.windDrift = v.windDrift;
+            s.patchiness = v.patchiness;
+            s.weight = v.weight;
+        }
+
         KindSettings MakeDefaults(int kind)
         {
             KindSettings s;
-            switch (kind)
-            {
-                case kMist:     s.buildUpSeconds = 300.0f; s.burnOffSeconds = 900.0f;  s.thickness = 4.0f;  s.density = 0.04f; break;
-                case kWaterFog: s.buildUpSeconds = 300.0f; s.burnOffSeconds = 1200.0f; s.thickness = 3.0f;  s.density = 0.05f; break;
-                case kSteam:    s.buildUpSeconds = 10.0f;  s.burnOffSeconds = 30.0f;   s.thickness = 2.0f;  s.density = 0.08f; break;
-                case kAreaFog:  s.buildUpSeconds = 600.0f; s.burnOffSeconds = 1800.0f; s.thickness = 8.0f;  s.density = 0.03f; break;
-                case kHaze:     s.buildUpSeconds = 120.0f; s.burnOffSeconds = 600.0f;  s.thickness = 20.0f; s.density = 0.01f; break;
-                default: break;
-            }
+            Apply(s, fogsettings::Defaults(kind));
             return s;
         }
 
         KindSettings g_settings[kKindCount] = { MakeDefaults(0), MakeDefaults(1), MakeDefaults(2), MakeDefaults(3), MakeDefaults(4) };
+
+        // The place and table generation the settings were last resolved for.
+        uint32_t g_resolvedArea = ~0u, g_resolvedGeneration = 0;
+        int      g_resolvedMap = -2;
+
+        void ResolveForPlace(const world::Snapshot& snap)
+        {
+            const uint32_t area = snap.areaCount > 0 ? snap.areaChain[0] : 0;
+            const uint32_t generation = fogsettings::Generation();
+            static int lastOverride[kKindCount] = {};
+            bool overrideChanged = false;
+            for (int k = 0; k < kKindCount; ++k)
+                if (g_settings[k].panelOverride != lastOverride[k]) { lastOverride[k] = g_settings[k].panelOverride; overrideChanged = true; }
+            if (!overrideChanged && area == g_resolvedArea && snap.mapId == g_resolvedMap && generation == g_resolvedGeneration) return;
+            g_resolvedArea = area;
+            g_resolvedMap = snap.mapId;
+            g_resolvedGeneration = generation;
+            for (int k = 0; k < kKindCount; ++k)
+                if (!g_settings[k].panelOverride) Apply(g_settings[k], fogsettings::Resolve(area, snap.mapId, k));
+        }
 
         std::vector<float> g_amount[kKindCount];
         std::vector<float>   g_ground;
@@ -211,6 +238,7 @@ namespace wxl_livingazeroth::fog
     {
         if (!snap.inWorld) { Reset(); return; }
         EnsureStorage();
+        ResolveForPlace(snap);
         if (snap.mapId != g_map) { ClearAll(); g_map = snap.mapId; g_placed = false; }
         g_px = snap.playerPos[0];
         g_py = snap.playerPos[1];

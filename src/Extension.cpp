@@ -25,6 +25,7 @@
 #include "debug/FogProbe.hpp"
 #include "env/ClientWeather.hpp"
 #include "env/Fog.hpp"
+#include "env/FogSettings.hpp"
 #include "features/GroundFog.hpp"
 #include "debug/FogView.hpp"
 #include "env/Actors.hpp"
@@ -82,6 +83,7 @@ namespace
         wxl_livingazeroth::grassdensity::Load(cdbc);
         wxl_livingazeroth::cover::LoadTable(cdbc);
         wxl_livingazeroth::climate::Load(cdbc);
+        wxl_livingazeroth::fogsettings::Load(cdbc);
         wxl_livingazeroth::debug::SetClimateCdbc(cdbc);
         wxl_livingazeroth::lighttable::Load(cdbc);
         wxl_livingazeroth::debug::SetLightsCdbc(cdbc);

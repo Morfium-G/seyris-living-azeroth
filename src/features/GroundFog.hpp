@@ -26,6 +26,14 @@ namespace wxl_livingazeroth::groundfog
         float brightness = 1.0f;        // multiplies the stock fog colour
         int   forceWaterDepth = 1;      // the water writes depth while there's fog to draw
         int   debugColour = 0;          // draw the fog magenta, to see where it is
+
+        // Colour test (panel, not saved): these instead of FogSettings' colour columns, to find the
+        // values for a place by eye before writing them into the table.
+        int   colorTest = 0;
+        int   colorMode = 1;            // fogsettings::ColorMode
+        float color[4] = { 0.6f, 0.65f, 0.7f, 1.0f };
+        float saturation = 1.0f;
+        float colorBrightness = 1.0f;
     };
     Settings& Config();
 
