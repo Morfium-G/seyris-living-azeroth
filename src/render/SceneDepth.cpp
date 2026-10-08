@@ -1,5 +1,7 @@
 #include "SceneDepth.hpp"
 
+#include "DepthCopy.hpp"
+
 #include "game/Gx.hpp"
 
 #include <d3d9.h>
@@ -28,6 +30,11 @@ namespace wxl_livingazeroth::depth
         const void* g_declinedFor = nullptr;
 
         unsigned g_width = 0, g_height = 0, g_originalFormat = 0, g_swapCount = 0;
+
+        // Copied mode (multisampling on): the method probed for this device (-1 = not yet), why none.
+        int         g_probedMethod = -1;
+        const char* g_copyWhy = "";
+        unsigned    g_copiesDone = 0, g_copiesFailed = 0;
 
         gx::off::GxDevice* GraphicsDevice()
         {
@@ -73,6 +80,7 @@ namespace wxl_livingazeroth::depth
 
         void ReleaseOurs()
         {
+            depthcopy::Detach();
             if (g_surface) { g_surface->Release(); g_surface = nullptr; }
             if (g_texture) { g_texture->Release(); g_texture = nullptr; }
         }
@@ -102,11 +110,53 @@ namespace wxl_livingazeroth::depth
             g_api->Log(WXL_LOG_WARN, kTag, "depth: %s", message);
         }
 
+        /// Multisampled world depth: leave it bound and copy it into our INTZ texture on demand.
+        void SetUpCopy(IDirect3DDevice9* dev, IDirect3DSurface9* current, const D3DSURFACE_DESC& desc)
+        {
+            if (g_probedMethod < 0)
+            {
+                const depthcopy::Method m = depthcopy::Probe(dev, g_copyWhy);
+                g_probedMethod = static_cast<int>(m);
+                g_api->Log(m != depthcopy::Method::None ? WXL_LOG_INFO : WXL_LOG_WARN, kTag, "depth: multisampled depth copy: %s%s%s.",
+                           depthcopy::MethodName(m), m == depthcopy::Method::None ? ", " : "", g_copyWhy);
+            }
+            const auto method = static_cast<depthcopy::Method>(g_probedMethod);
+            if (method == depthcopy::Method::None)
+            {
+                Decline(State::Multisampled, current, "multisampling is on and no depth copy method works; readable depth is off.");
+                return;
+            }
+            if (FAILED(dev->CreateTexture(desc.Width, desc.Height, 1, D3DUSAGE_DEPTHSTENCIL, kFormatIntz,
+                                          D3DPOOL_DEFAULT, &g_texture, nullptr)) || !g_texture)
+            {
+                g_texture = nullptr;
+                Decline(State::CreateFailed, current, "creating the INTZ copy texture failed.");
+                return;
+            }
+            if (!depthcopy::Attach(method, current, g_texture))
+            {
+                ReleaseOurs();
+                g_copyWhy = "the copy method refused the depth surfaces";
+                Decline(State::Multisampled, current, "the depth copy method refused the multisampled surface; readable depth is off.");
+                return;
+            }
+            g_original = current; // our own reference: the client's field keeps its own
+            g_original->AddRef();
+            g_width = desc.Width;
+            g_height = desc.Height;
+            g_declinedFor = nullptr;
+            g_state = State::Copied;
+            ++g_swapCount;
+            g_api->Log(WXL_LOG_INFO, kTag, "depth: multisampled world depth (%ux%u, %u samples) is copied into INTZ by %s (setup #%u).",
+                       g_width, g_height, static_cast<unsigned>(desc.MultiSampleType), depthcopy::MethodName(method), g_swapCount);
+        }
+
         void Swap(gx::off::GxDevice* gd, IDirect3DDevice9* dev)
         {
             auto* current = static_cast<IDirect3DSurface9*>(gd->depthSurface);
             if (!current || current == g_surface) return;
             if (current == g_declinedFor) return;
+            if (g_state == State::Copied && current == g_original) return;
 
             // A new automatic surface (first frame, or re-cached after a reset). Anything we still
             // hold belongs to the old device state.
@@ -121,8 +171,7 @@ namespace wxl_livingazeroth::depth
 
             if (desc.MultiSampleType != D3DMULTISAMPLE_NONE)
             {
-                Decline(State::Multisampled, current,
-                        "multisampling is on; readable depth needs it off (INTZ can't be multisampled).");
+                SetUpCopy(dev, current, desc);
                 return;
             }
 
@@ -192,17 +241,32 @@ namespace wxl_livingazeroth::depth
         ReleaseOurs();
 
         g_intzSupported = -1;
+        g_probedMethod = -1;
         g_declinedFor = nullptr;
-        if (g_state == State::Active) g_state = State::NotStarted;
+        if (g_state == State::Active || g_state == State::Copied) g_state = State::NotStarted;
     }
 
     void SetEnabled(bool enabled) { g_enabled = enabled; }
     bool Enabled() { return g_enabled; }
     State CurrentState() { return g_state; }
 
-    void* Texture()         { return g_state == State::Active ? g_texture : nullptr; }
+    bool Refresh(void* device)
+    {
+        if (g_state == State::Active) return true;
+        if (g_state != State::Copied) return false;
+        const bool ok = depthcopy::Copy(static_cast<IDirect3DDevice9*>(device));
+        ++(ok ? g_copiesDone : g_copiesFailed);
+        return ok;
+    }
+
+    void* Texture()         { return g_state == State::Active || g_state == State::Copied ? g_texture : nullptr; }
     void* Surface()         { return g_state == State::Active ? g_surface : nullptr; }
-    void* OriginalSurface() { return g_state == State::Active ? g_original : nullptr; }
+    void* OriginalSurface() { return g_state == State::Active || g_state == State::Copied ? g_original : nullptr; }
+
+    const char* CopyMethod()      { return g_probedMethod >= 0 ? depthcopy::MethodName(static_cast<depthcopy::Method>(g_probedMethod)) : "not probed"; }
+    unsigned    CopiesDone()      { return g_copiesDone; }
+    unsigned    CopiesFailed()    { return g_copiesFailed; }
+    const char* CopyUnavailable() { return g_copyWhy; }
 
     unsigned Width()          { return g_width; }
     unsigned Height()         { return g_height; }

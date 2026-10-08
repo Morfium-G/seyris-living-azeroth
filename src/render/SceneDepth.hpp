@@ -7,6 +7,10 @@
 // own render-target bind reads that field for every world pass, so writing our surface there
 // redirects the whole world pass with no D3D hooks. After every device reset the client re-caches
 // the automatic surface, which Update() notices and swaps again.
+//
+// With the client's multisampling on, the automatic surface is multisampled and INTZ can't be: then
+// the client keeps its surface, and Refresh() copies it into our INTZ texture where a pass needs it
+// (render/DepthCopy: NVAPI or the driver's RESZ resolve).
 #pragma once
 
 #include "wxl/PluginApi.h"
@@ -18,9 +22,11 @@ namespace wxl_livingazeroth::depth
     {
         NotStarted,     // no device yet
         Active,         // our INTZ surface is the world depth
+        Copied,         // MSAA is on: the client keeps its multisampled depth, Refresh() copies it into
+                        // our INTZ texture (render/DepthCopy)
         Disabled,       // turned off from the panel
         Unsupported,    // driver has no INTZ
-        Multisampled,   // MSAA is on; a non-MSAA INTZ surface can't pair with a multisampled target
+        Multisampled,   // MSAA is on and no copy method works (see CopyUnavailable())
         CreateFailed,   // CreateTexture refused
     };
 
@@ -36,13 +42,25 @@ namespace wxl_livingazeroth::depth
     bool Enabled();
     State CurrentState();
 
-    /// The readable depth texture (IDirect3DTexture9*), or null while not Active.
+    /// Makes Texture() hold the depth drawn so far. Call right before sampling it, mid-frame, with the
+    /// world's targets bound: Active needs nothing; Copied copies the multisampled depth now (one
+    /// full-screen copy each call). False if Texture() can't be trusted.
+    bool Refresh(void* device);
+
+    /// The readable depth texture (IDirect3DTexture9*), or null while neither Active nor Copied.
     void* Texture();
-    /// Our depth surface (IDirect3DSurface9*), or null while not Active.
+    /// Our depth surface (IDirect3DSurface9*), or null while not Active (Copied has none).
     void* Surface();
-    /// The client's automatic depth surface we replaced. Bind this while sampling Texture(), since a
-    /// surface can't be read while it is also the bound depth target.
+    /// The client's own depth surface (Active: the one we replaced; Copied: its multisampled one).
+    /// Bind this while sampling Texture(), since a surface can't be read while it is also the bound
+    /// depth target.
     void* OriginalSurface();
+
+    /// Copied mode: the method, how many copies succeeded / failed; why no method if Multisampled.
+    const char* CopyMethod();
+    unsigned    CopiesDone();
+    unsigned    CopiesFailed();
+    const char* CopyUnavailable();
 
     /// Details for the debug panel.
     unsigned Width();

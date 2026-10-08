@@ -71,9 +71,10 @@ namespace wxl_livingazeroth::debug
             {
                 case depth::State::NotStarted:   return "not started (no device yet)";
                 case depth::State::Active:       return "ACTIVE";
+                case depth::State::Copied:       return "ACTIVE (multisampling on: copied)";
                 case depth::State::Disabled:     return "disabled";
                 case depth::State::Unsupported:  return "unsupported (driver has no INTZ)";
-                case depth::State::Multisampled: return "off: multisampling is on (turn MSAA off)";
+                case depth::State::Multisampled: return "off: multisampling is on and no depth copy method works";
                 case depth::State::CreateFailed: return "failed to create the INTZ texture";
             }
             return "?";
@@ -90,11 +91,18 @@ namespace wxl_livingazeroth::debug
             std::snprintf(line, sizeof(line), "state: %s", StateText(depth::CurrentState()));
             g_api->UiText(line);
 
-            if (depth::CurrentState() == depth::State::Active)
+            if (depth::CurrentState() == depth::State::Active || depth::CurrentState() == depth::State::Copied)
             {
                 std::snprintf(line, sizeof(line), "size %ux%u, replaced %s, swaps %u",
                               depth::Width(), depth::Height(), FormatName(depth::OriginalFormat()), depth::SwapCount());
                 g_api->UiText(line);
+            }
+            if (depth::CurrentState() == depth::State::Copied || depth::CurrentState() == depth::State::Multisampled)
+            {
+                std::snprintf(line, sizeof(line), "copy: %s, %u done, %u failed%s%s", depth::CopyMethod(),
+                              depth::CopiesDone(), depth::CopiesFailed(),
+                              depth::CopyUnavailable()[0] ? "; " : "", depth::CopyUnavailable());
+                g_api->UiTextWrapped(line);
             }
 
             std::snprintf(line, sizeof(line), "world passes drawn into our depth: %u / %u",
@@ -176,6 +184,7 @@ namespace wxl_livingazeroth::debug
         const auto* a = static_cast<const ev::WorldRenderEndArgs*>(args);
         auto* dev = static_cast<IDirect3DDevice9*>(a && a->device ? a->device : gx::RawDevice());
         if (!dev) return;
+        if (!depth::Refresh(dev)) return; // multisampled: copy the depth drawn so far
 
         // A graphics restart can replace the device; a shader from the old one can't be used.
         static void* shaderDevice = nullptr;
