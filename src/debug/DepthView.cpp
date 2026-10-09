@@ -19,8 +19,9 @@ namespace wxl_livingazeroth::debug
 
         constexpr const char* kPanelTitle = "wxl-seyris-living-azeroth: scene depth";
 
-        // Raw depth d relates to view distance z by d = m10 + m14 / z (row-vector D3D projection,
-        // w = z), so z = m14 / (d - m10). Far-plane pixels (sky) have d = 1.
+        // The client's projection is OpenGL-style (0x6BF370: m10 = (f + n) / (f - n), m14 = -2fn / (f - n),
+        // w = z, depth -1..1); the D3D backend maps -1..1 to the viewport's 0..0.94 (the world's depth
+        // range). So ndc = d / 0.94 * 2 - 1 and z = m14 / (ndc - m10). Beyond 0.94: distant terrain, sky.
         const char* kDepthViewHlsl = R"(
             sampler2D depthTex : register(s0);
             float4 p : register(c0); // x = proj m10, y = proj m14, z = display range (yards), w = raw mode
@@ -29,10 +30,10 @@ namespace wxl_livingazeroth::debug
             {
                 float d = tex2D(depthTex, uv).r;
                 if (p.w > 0.5) return float4(d, d, d, 1);
-                if (d >= 0.99999) return float4(0.15, 0.25, 0.5, 1);
-                // d - m10 is always negative here (m10 = f/(f-n) > 1 > d), as is m14 = -n*f/(f-n);
-                // keep the divisor away from zero on the negative side.
-                float z = p.y / min(d - p.x, -1e-6);
+                if (d > 0.9401) return float4(0.15, 0.25, 0.5, 1);
+                // ndc - m10 is always negative here (m10 > 1 > ndc), as is m14; keep the divisor away
+                // from zero on the negative side.
+                float z = p.y / min(saturate(d / 0.94) * 2 - 1 - p.x, -1e-6);
                 float g = sqrt(saturate(z / p.z));
                 return float4(g, g, g, 1);
             }
@@ -133,7 +134,7 @@ namespace wxl_livingazeroth::debug
                 const float samples[] = { 0.5f, 0.9f, 0.99f, 0.999f, 0.9999f };
                 for (float d : samples)
                 {
-                    const float denom = d - g_projM10;
+                    const float denom = (d / 0.94f * 2.0f - 1.0f) - g_projM10; // see kDepthViewHlsl
                     std::snprintf(line, sizeof(line), "d = %.4f -> z = %.3f yards", d,
                                   denom != 0.0f ? g_projM14 / denom : 0.0f);
                     g_api->UiText(line);

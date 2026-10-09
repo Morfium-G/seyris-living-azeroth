@@ -8,6 +8,8 @@
 
 #include "../features/GrassPerf.hpp"
 
+#include "game/Pick.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -64,8 +66,19 @@ namespace wxl_livingazeroth::fog
 
         std::vector<float> g_amount[kKindCount];
         std::vector<uint8_t> g_target[kKindCount]; // where each kind is heading, 0..255 = 0..1 (the rules)
-        std::vector<float>   g_ground;
+        std::vector<float>   g_ground;   // the surface the fog lies on: terrain/liquid, or a WMO floor on it
+        std::vector<float>   g_terrain;  // the terrain or terrain liquid alone
         std::vector<uint8_t> g_groundKnown;
+        // WMOs, from one ray straight down per cell: 0 not traced yet, 1 open, 2 a WMO floor at most
+        // kFloorRise above the terrain (the fog lies on it), 3 a structure (roof, stands, wall top):
+        // no fog, and fog doesn't flow into it.
+        enum Block : uint8_t { kUntraced = 0, kOpen = 1, kFloor = 2, kStructure = 3 };
+        std::vector<uint8_t> g_block;
+        int      g_traceCursor = 0;
+        constexpr int   kTracesPerFrame = 64;    // a full grid in ~4 s at 60 fps, then again (late WMOs)
+        constexpr float kFloorRise = 3.0f;       // yd: a WMO surface up to this above the terrain is a floor
+        constexpr float kTraceFrom = 40.0f;      // yd above the terrain the ray starts
+        constexpr float kMaxPool = 4.0f;         // amounts may pile up to this in hollows (heavy fog)
         std::vector<uint8_t> g_liquid;   // terrain liquid on the cell: 0 none, 1 water/ocean, 2 magma, 3 slime
         std::vector<uint8_t> g_fresh;    // scrolled in, not started yet (starts from its target x the area's progress)
         // How far the fog around the player has come toward its targets. 1 on a fresh grid (login,
@@ -98,18 +111,22 @@ namespace wxl_livingazeroth::fog
             }
             for (int k = 0; k < kKindCount; ++k) g_target[k].assign(kGridSize * kGridSize, 0);
             g_ground.assign(kGridSize * kGridSize, 0.0f);
+            g_terrain.assign(kGridSize * kGridSize, 0.0f);
             g_groundKnown.assign(kGridSize * kGridSize, 0);
+            g_block.assign(kGridSize * kGridSize, kUntraced);
             g_liquid.assign(kGridSize * kGridSize, 0);
             g_fresh.assign(kGridSize * kGridSize, 1);
             g_grid.ground = g_ground.data();
             g_grid.groundKnown = g_groundKnown.data();
-            g_stats.kilobytes = static_cast<unsigned>((kKindCount * (sizeof(float) + 1) + sizeof(float) + 3) * kGridSize * kGridSize / 1024);
+            g_grid.block = g_block.data();
+            g_stats.kilobytes = static_cast<unsigned>((kKindCount * (sizeof(float) + 1) + 2 * sizeof(float) + 4) * kGridSize * kGridSize / 1024);
         }
 
         void ForgetGround(int index)
         {
             g_groundKnown[index] = 0;
-            g_ground[index] = g_groundFallback;
+            g_ground[index] = g_terrain[index] = g_groundFallback;
+            g_block[index] = kUntraced;
             g_liquid[index] = 0;
             g_fresh[index] = 1;
             for (int k = 0; k < kKindCount; ++k) g_target[k][index] = 0;
@@ -169,14 +186,57 @@ namespace wxl_livingazeroth::fog
                         default:                    g_liquid[index] = 1; break; // water, ocean, unknown
                     }
                 }
-                g_ground[index] = z;
+                g_ground[index] = g_terrain[index] = z;
                 g_groundKnown[index] = 1;
+                g_block[index] = kUntraced;
                 changed = true;
             }
             if (changed) ++g_grid.groundVersion;
             unsigned unknown = 0;
             for (uint8_t k : g_groundKnown) unknown += k ? 0 : 1;
             g_grid.groundMissing = unknown;
+        }
+
+        /// Some cells per frame, round and round (WMOs stream in after the terrain): one ray straight
+        /// down from kTraceFrom above the terrain. The first surface it meets: the terrain (open), a
+        /// WMO floor close above it (the fog lies on it: an arena floor, a courtyard), or something
+        /// higher (a roof, stands, a wall top: no fog under or in it).
+        void TraceCells()
+        {
+            namespace gw = wxl::game::world;
+            bool changed = false;
+            int rays = 0;
+            for (int n = 0; n < kGridSize * kGridSize && rays < kTracesPerFrame; ++n)
+            {
+                const int index = g_traceCursor;
+                g_traceCursor = (g_traceCursor + 1) % (kGridSize * kGridSize);
+                if (!g_groundKnown[index]) continue;
+                const int ci = index % kGridSize, cj = index / kGridSize;
+                const int i = g_grid.firstI + Wrap(ci - g_grid.firstI);
+                const int j = g_grid.firstJ + Wrap(cj - g_grid.firstJ);
+                const float x = (i + 0.5f) * kCellSize, y = (j + 0.5f) * kCellSize;
+                const float terrainZ = g_terrain[index];
+                const float from[3] = { x, y, terrainZ + kTraceFrom };
+                const float to[3] = { x, y, terrainZ - 0.5f };
+                gw::WorldHit hit;
+                ++rays;
+                uint8_t state = kOpen;
+                float surface = terrainZ;
+                if (gw::TraceLine(from, to, hit))
+                {
+                    const float z = from[2] + (to[2] - from[2]) * hit.t;
+                    const float rise = z - terrainZ;
+                    if (rise > kFloorRise) state = kStructure;
+                    else if (rise > 0.25f) { state = kFloor; surface = z; }
+                }
+                if (state == g_block[index] && surface == g_ground[index]) continue;
+                g_block[index] = state;
+                g_ground[index] = surface;
+                if (state == kStructure)
+                    for (int k = 0; k < kKindCount; ++k) { g_amount[k][index] = 0.0f; g_target[k][index] = 0; }
+                changed = true;
+            }
+            if (changed) { ++g_grid.groundVersion; ++g_grid.version; }
         }
 
         void ClearAll()
@@ -234,7 +294,12 @@ namespace wxl_livingazeroth::fog
             in.water = climate::WaterTemperature(row);
             in.humidity = row.humidity;
             in.fogginess = row.fogginess;
-            in.wind = wind::At(snap.playerPos).strength;
+            // The area's steady ground wind, not the sample at the player: standing in a lee or under a
+            // roof mustn't calm the fog everywhere. Bearing clockwise from north (+X), east is -Y.
+            in.wind = wind::SteadyGround();
+            const float bearing = wind::BearingDegrees() * 3.14159265f / 180.0f;
+            in.windDirX = std::cos(bearing);
+            in.windDirY = -std::sin(bearing);
             in.night = 1.0f - climate::SunNow().daylight;
             const climate::Weather& w = climate::CurrentWeather();
             in.weatherType = w.type;
@@ -268,6 +333,7 @@ namespace wxl_livingazeroth::fog
         void CellTargets(int i, int j, int index, float out[kKindCount])
         {
             for (int k = 0; k < kKindCount; ++k) out[k] = 0.0f;
+            if (g_block[index] == kStructure) return; // inside or under a WMO
             const float z = g_ground[index];
             const float pos[3] = { (i + 0.5f) * kCellSize, (j + 0.5f) * kCellSize, z + 0.5f };
             float wet = 0.0f, groundTemp = g_inputs.airNow;
@@ -356,10 +422,104 @@ namespace wxl_livingazeroth::fog
             g_stats.rulesMs = grassperf::Now() - t0;
         }
 
+        bool InGrid(int i, int j) { return i >= g_grid.firstI && i < g_grid.firstI + kGridSize && j >= g_grid.firstJ && j < g_grid.firstJ + kGridSize; }
+        bool Open(int index) { return g_groundKnown[index] && g_block[index] != kStructure; }
+
+        /// The wind carries every kind by its WindDrift: each cell takes the fog from upwind
+        /// (bilinear, so less than a cell per step works). Fog blown off the grid or into a WMO is gone;
+        /// the upwind edge refills from the rules.
+        void Advect(float dt)
+        {
+            static std::vector<float> next(kGridSize * kGridSize);
+            for (int k = 0; k < kKindCount; ++k)
+            {
+                const float drift = g_settings[k].windDrift;
+                if (drift <= 0.0f || g_grid.maxAmount[k] <= 0.0f) continue;
+                const float speed = g_inputs.wind * drift * 4.0f * dt / kCellSize; // cells this step (4 yd/s at full wind)
+                if (speed < 1.0e-3f) continue;
+                const float sx = g_inputs.windDirX * speed, sy = g_inputs.windDirY * speed;
+                const std::vector<float>& a = g_amount[k];
+                auto at = [&](int i, int j) { if (!InGrid(i, j)) return 0.0f; const int n = Index(i, j); return Open(n) ? a[n] : 0.0f; };
+                for (int j = g_grid.firstJ; j < g_grid.firstJ + kGridSize; ++j)
+                    for (int i = g_grid.firstI; i < g_grid.firstI + kGridSize; ++i)
+                    {
+                        const int index = Index(i, j);
+                        if (!Open(index)) { next[index] = 0.0f; continue; }
+                        const float fx = i - sx, fy = j - sy;
+                        const int x0 = static_cast<int>(std::floor(fx)), y0 = static_cast<int>(std::floor(fy));
+                        const float tx = fx - x0, ty = fy - y0;
+                        const float top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * tx;
+                        const float bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * tx;
+                        next[index] = top + (bottom - top) * ty;
+                    }
+                std::copy(next.begin(), next.end(), g_amount[k].begin());
+            }
+        }
+
+        /// Heavy fog flows downhill: per cell, the heavy depth (sum over the kinds of Weight x amount x
+        /// Thickness) on top of the ground is a surface; fog moves toward neighbours whose surface is
+        /// lower, each kind by its share of the depth, so it runs down slopes and levels out in hollows
+        /// (where it may pile up past 1, to kMaxPool). Not into WMO structures.
+        void Flow(float dt)
+        {
+            bool any = false;
+            for (int k = 0; k < kKindCount; ++k) any = any || (g_settings[k].weight > 0.0f && g_grid.maxAmount[k] > 0.0f);
+            if (!any) return;
+            static std::vector<float> depth(kGridSize * kGridSize), delta[kKindCount];
+            for (int k = 0; k < kKindCount; ++k) delta[k].assign(kGridSize * kGridSize, 0.0f);
+            for (int n = 0; n < kGridSize * kGridSize; ++n)
+            {
+                float d = 0.0f;
+                for (int k = 0; k < kKindCount; ++k) d += g_settings[k].weight * g_amount[k][n] * g_settings[k].thickness;
+                depth[n] = d;
+            }
+            const float rate = std::fmin(1.0f, dt * 1.0f); // share of a surface difference that evens out per second
+            const int di[4] = { 1, -1, 0, 0 }, dj[4] = { 0, 0, 1, -1 };
+            for (int j = g_grid.firstJ; j < g_grid.firstJ + kGridSize; ++j)
+                for (int i = g_grid.firstI; i < g_grid.firstI + kGridSize; ++i)
+                {
+                    const int c = Index(i, j);
+                    if (depth[c] < 1.0e-3f || !Open(c)) continue;
+                    const float surface = g_ground[c] + depth[c];
+                    float out[4] = {}, total = 0.0f;
+                    for (int d = 0; d < 4; ++d)
+                    {
+                        const int ni = i + di[d], nj = j + dj[d];
+                        if (!InGrid(ni, nj)) continue;
+                        const int n = Index(ni, nj);
+                        if (!Open(n)) continue;
+                        const float drop = surface - (g_ground[n] + depth[n]);
+                        if (drop > 0.0f) { out[d] = 0.25f * drop * rate; total += out[d]; }
+                    }
+                    if (total <= 0.0f) continue;
+                    const float scale = total > 0.5f * depth[c] ? 0.5f * depth[c] / total : 1.0f; // never more than half per step
+                    for (int d = 0; d < 4; ++d)
+                    {
+                        if (out[d] <= 0.0f) continue;
+                        const int n = Index(i + di[d], j + dj[d]);
+                        const float moved = out[d] * scale; // yd of heavy depth
+                        for (int k = 0; k < kKindCount; ++k)
+                        {
+                            const KindSettings& s = g_settings[k];
+                            if (s.weight <= 0.0f || g_amount[k][c] <= 0.0f || s.thickness <= 0.0f) continue;
+                            const float share = s.weight * g_amount[k][c] * s.thickness / depth[c];
+                            const float amount = moved * share / (s.weight * s.thickness);
+                            delta[k][c] -= amount;
+                            delta[k][n] += amount;
+                        }
+                    }
+                }
+            for (int k = 0; k < kKindCount; ++k)
+                for (int n = 0; n < kGridSize * kGridSize; ++n)
+                    if (delta[k][n] != 0.0f) g_amount[k][n] = std::fmin(kMaxPool, std::fmax(0.0f, g_amount[k][n] + delta[k][n]));
+        }
+
         /// One step: every amount toward its target at the kind's rates (build-up toward a higher one,
         /// burn-off toward a lower one), and how far the fog has come toward its targets overall.
         void Step(float dt)
         {
+            Advect(dt);
+            Flow(dt);
             bool changed = false;
             for (int k = 0; k < kKindCount; ++k)
             {
@@ -409,6 +569,19 @@ namespace wxl_livingazeroth::fog
         return g_amount[kind][Index(i, j)];
     }
 
+    bool GroundAt(float x, float y, float& z, int& block)
+    {
+        if (g_ground.empty()) return false;
+        const int i = static_cast<int>(std::floor(x / kCellSize));
+        const int j = static_cast<int>(std::floor(y / kCellSize));
+        if (i < g_grid.firstI || i >= g_grid.firstI + kGridSize || j < g_grid.firstJ || j >= g_grid.firstJ + kGridSize) return false;
+        const int index = Index(i, j);
+        if (!g_groundKnown[index]) return false;
+        z = g_ground[index];
+        block = g_block[index];
+        return true;
+    }
+
     const RulesInputs& Inputs() { return g_inputs; }
     float Progress(int kind) { return kind >= 0 && kind < kKindCount ? g_progress[kind] : 0.0f; }
 
@@ -432,6 +605,7 @@ namespace wxl_livingazeroth::fog
         if (!terrain::HeightAt(g_px, g_py, g_groundFallback)) g_groundFallback = snap.playerPos[2];
         Recenter(g_px, g_py);
         FillGround();
+        TraceCells();
 
         g_tickTime += dt;
         if (g_tickTime < kTickSeconds) return;

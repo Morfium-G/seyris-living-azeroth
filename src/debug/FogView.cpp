@@ -95,9 +95,23 @@ namespace wxl_livingazeroth::debug
                 if (g_api->UiSliderFloat(label, &ks.thickness, 0.5f, 50.0f)) ks.panelOverride = 1;
                 std::snprintf(label, sizeof(label), "density at the ground (per yd)##fogdens%d", k);
                 if (g_api->UiSliderFloat(label, &ks.density, 0.0f, 0.3f)) ks.panelOverride = 1;
+                std::snprintf(label, sizeof(label), "weight (0 rises .. 1 heavy, pools, flows)##fogweight%d", k);
+                if (g_api->UiSliderFloat(label, &ks.weight, 0.0f, 1.0f)) ks.panelOverride = 1;
+                std::snprintf(label, sizeof(label), "wind drift (how far the wind carries it)##fogdrift%d", k);
+                if (g_api->UiSliderFloat(label, &ks.windDrift, 0.0f, 1.0f)) ks.panelOverride = 1;
+                std::snprintf(label, sizeof(label), "wind thin (wind above which it can't form)##fogthin%d", k);
+                if (g_api->UiSliderFloat(label, &ks.windThin, 0.0f, 1.5f)) ks.panelOverride = 1;
             }
 
             g_api->UiSeparator();
+            {
+                const fog::Grid& grid = fog::Current();
+                unsigned counts[4] = {};
+                if (grid.block) for (int n = 0; n < fog::kGridSize * fog::kGridSize; ++n) ++counts[grid.block[n] < 4 ? grid.block[n] : 0];
+                std::snprintf(line, sizeof(line), "WMOs in the field: %u cells under/in structures (no fog), %u on WMO floors, %u open, %u not traced yet",
+                              counts[3], counts[2], counts[1], counts[0]);
+                g_api->UiTextWrapped(line);
+            }
             std::snprintf(line, sizeof(line), "field: %d x %d cells of %.0f yd, %u KB; last step %.3f ms (rules %.3f ms; %u steps, 4 per second)%s",
                           fog::kGridSize, fog::kGridSize, fog::kCellSize, st.kilobytes, st.tickMs, st.rulesMs, st.ticks,
                           fog::Paused() ? ", PAUSED" : "");

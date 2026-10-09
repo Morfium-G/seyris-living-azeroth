@@ -18,7 +18,9 @@ namespace wxl_livingazeroth::groundfog
     struct Settings
     {
         int   enabled = 1;
-        int   steps = 16;               // march steps per pixel
+        int   steps = 48;               // the march's step budget per pixel (jumps through air + steps in the fog)
+        float fogStep = 1.0f;           // yd: step length inside the fog near the camera (grows 4% of the distance)
+        float dither = 0.0f;            // 0 sample each step's middle .. 1 anywhere in it, per pixel (grain instead of banding)
         float maxDistance = 250.0f;     // yd: the march ends here (and for sky pixels)
         float densityScale = 1.0f;      // multiplies every kind's density
         float noiseAmount = 0.6f;       // 0 = smooth layers .. 1 = patchy
@@ -26,6 +28,10 @@ namespace wxl_livingazeroth::groundfog
         float brightness = 1.0f;        // multiplies the stock fog colour
         int   forceWaterDepth = 1;      // the water writes depth while there's fog to draw
         int   debugColour = 0;          // draw the fog magenta, to see where it is
+        int   heightBands = 0;          // debug: paint the reconstructed world height as bands (they must stay on the terrain)
+        int   depthDecode = 0;          // 0 OpenGL-style depth (-1..1), 1 D3D-style (0..1): which one keeps the bands still
+        int   poolGate = 1;             // heavy pool fog only in and around cells that hold a pool (off: the old behaviour, for comparison)
+        int   debugView = 0;           // 0 the fog, 1 light layer only, 2 pools only, 3 ground check (field ground vs the drawn surface)
 
         // Colour test (panel, not saved): these instead of FogSettings' colour columns, to find the
         // values for a place by eye before writing them into the table.

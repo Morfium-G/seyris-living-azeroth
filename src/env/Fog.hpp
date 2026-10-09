@@ -60,8 +60,9 @@ namespace wxl_livingazeroth::fog
         // The surface the fog lies on, per cell: the higher of the terrain and terrain liquid (fog
         // over a lake lies on the water). Filled a few hundred cells per frame as cells scroll in;
         // until a cell is known it holds the ground under the player.
-        const float*   ground = nullptr;
+        const float*   ground = nullptr;      // includes a WMO floor the fog lies on
         const uint8_t* groundKnown = nullptr;
+        const uint8_t* block = nullptr;       // 0 not traced, 1 open, 2 WMO floor, 3 WMO structure (no fog)
         unsigned       groundMissing = 0;
         uint32_t       groundVersion = 0;
     };
@@ -69,6 +70,9 @@ namespace wxl_livingazeroth::fog
 
     /// Amount of a kind at a world position (0 outside the grid).
     float AmountAt(int kind, float x, float y);
+    /// The surface the fog lies on at a world position (false outside the grid or not known yet), and
+    /// its WMO state (0 not traced, 1 open, 2 WMO floor, 3 structure).
+    bool GroundAt(float x, float y, float& z, int& block);
 
     /// The rules' inputs for the player's place (the panel's "why"), each kind's target at a
     /// position (0..1, from its rules x its Strength), and how far the fog around the player has
@@ -78,7 +82,8 @@ namespace wxl_livingazeroth::fog
         bool  valid = false;
         float airNow = 0.0f, airHourAgo = 0.0f, water = 0.0f; // degC
         float cooling = 0.0f;                                 // 0..1 (2.5 degC an hour = 1)
-        float humidity = 0.0f, fogginess = 0.0f, wind = 0.0f, night = 0.0f;
+        float humidity = 0.0f, fogginess = 0.0f, night = 0.0f;
+        float wind = 0.0f, windDirX = 1.0f, windDirY = 0.0f; // the area's steady wind at the ground (not the player's lee)
         int   weatherType = 0;
         float precipitation = 0.0f, rain = 0.0f, snow = 0.0f;
     };

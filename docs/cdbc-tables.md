@@ -349,8 +349,10 @@ All floats: −1 takes the field from the next row. Lookup (workspace rule, most
 place first -- the area, its parent zones, the map, global -- and within each place the kind's
 own row before the Kind 0 row. Values never add up.
 
-The colour columns of the Kind 0 rows colour the whole fog (one colour per place, for now). The
-fog panel's "colour test" applies values live, to find them by eye before writing a row.
+Colour per kind: a kind's own row can set its colour (e.g. whiter steam), the Kind 0 row is the
+fallback for every kind. Where kinds mix, the fog shows their colours by each one's share there.
+The fog panel's "colour test" applies values live to every kind, to find them by eye before writing
+a row.
 
 Generator: `tools/gen_default_fog_settings.py` (no default rows; `--examples` adds colour rows for
 Swamp of Sorrows and Duskwood).
