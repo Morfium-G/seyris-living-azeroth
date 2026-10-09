@@ -245,6 +245,28 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                 std::fabs(groundRef - g_groundRef) < 64.0f)
                 return true;
 
+            // The fog lies on the lowest ground among a cell and its 8 neighbours: at a steep edge (a
+            // cliff over lava) the 2 yd cells interpolate a ramp the thin layer would climb as a
+            // sheet; on the lower envelope it stays at the bottom. Gentle ground barely changes.
+            constexpr int N = fog::kGridSize;
+            static std::vector<float> base(N * N);
+            auto wrap = [](int v) { const int m = v % N; return m < 0 ? m + N : m; };
+            for (int r = 0; r < N; ++r)
+                for (int c = 0; c < N; ++c)
+                {
+                    const int i = grid.firstI + wrap(c - grid.firstI), j = grid.firstJ + wrap(r - grid.firstJ); // world cell
+                    float low = grid.ground[r * N + c];
+                    for (int dj = -1; dj <= 1; ++dj)
+                        for (int di = -1; di <= 1; ++di)
+                        {
+                            const int ni = i + di, nj = j + dj;
+                            if (ni < grid.firstI || ni >= grid.firstI + N || nj < grid.firstJ || nj >= grid.firstJ + N) continue;
+                            const int n = wrap(nj) * N + wrap(ni);
+                            if (grid.groundKnown[n] && grid.ground[n] < low) low = grid.ground[n];
+                        }
+                    base[r * N + c] = low;
+                }
+
             D3DLOCKED_RECT lr{};
             if (FAILED(g_field->LockRect(0, &lr, nullptr, 0))) return false;
             g_groundRef = groundRef;
@@ -266,7 +288,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                     const float thickness = density > 0.0f ? weighted / density : 1.0f;
                     texel[0] = ToHalf(density);
                     texel[1] = ToHalf(thickness);
-                    texel[2] = ToHalf(grid.ground[index] - g_groundRef);
+                    texel[2] = ToHalf(base[index] - g_groundRef);
                     texel[3] = 0;
                 }
             }

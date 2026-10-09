@@ -53,6 +53,12 @@ namespace wxl_livingazeroth::climate
         float total = 0.0f;
     };
     Breakdown Temperature(const Row& row);
+    /// The same at another time of day (0..1, wraps): today's season and weather, e.g. an hour ago
+    /// (the ground fog's "is it cooling?").
+    Breakdown TemperatureAtTime(const Row& row, float dayFraction);
+    /// degC of standing water: the day's mean plus the season, without the weather's chill (water
+    /// lags the air, so cool evenings over lakes make fog).
+    float WaterTemperature(const Row& row);
     float     TemperatureAt(uint32_t areaId, int mapId);
 
     /// The sun: the direction toward it (world space, z up) and how much it shines (0 at night .. 1

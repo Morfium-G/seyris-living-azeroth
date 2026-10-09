@@ -9,6 +9,9 @@ namespace wxl_livingazeroth::debug
 {
     void RegisterPanel(const WXL_Api* api);
 
+    /// The depth overlay switch (also on the Rendering quick feature).
+    int& DepthOverlayShown();
+
     /// OnWorldSceneEnd: the world's projection is still current; remembers what linearizing needs,
     /// and whether the world really drew into our depth surface.
     void OnWorldSceneEnd(const void* args);

@@ -1,4 +1,5 @@
 #include "SurfaceView.hpp"
+#include "Pages.hpp"
 
 #include "ShaderDump.hpp"
 #include "../env/TerrainHeight.hpp"
@@ -117,6 +118,6 @@ namespace wxl_livingazeroth::debug
     void RegisterSurfacePanel(const WXL_Api* api)
     {
         g_api = api;
-        api->UiAddPanel(kPanelTitle, &Panel, nullptr);
+        pages::AddPanel(kPanelTitle, &Panel);
     }
 }

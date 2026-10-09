@@ -1,7 +1,10 @@
 #include "Fog.hpp"
 
+#include "Climate.hpp"
+#include "Fields.hpp"
 #include "FogSettings.hpp"
 #include "TerrainHeight.hpp"
+#include "Wind.hpp"
 
 #include "../features/GrassPerf.hpp"
 
@@ -60,8 +63,17 @@ namespace wxl_livingazeroth::fog
         }
 
         std::vector<float> g_amount[kKindCount];
+        std::vector<uint8_t> g_target[kKindCount]; // where each kind is heading, 0..255 = 0..1 (the rules)
         std::vector<float>   g_ground;
         std::vector<uint8_t> g_groundKnown;
+        std::vector<uint8_t> g_liquid;   // terrain liquid on the cell: 0 none, 1 water/ocean, 2 magma, 3 slime
+        std::vector<uint8_t> g_fresh;    // scrolled in, not started yet (starts from its target x the area's progress)
+        // How far the fog around the player has come toward its targets. 1 on a fresh grid (login,
+        // teleport, new map): a place you arrive at shows its fog as if the conditions had held.
+        float    g_progress[kKindCount] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+        RulesInputs g_inputs;
+        int      g_rulesRow = 0;         // the next grid row the rules evaluate (a quarter per step)
+        int      g_fieldMoisture = -2, g_fieldTemperature = -2;
         float    g_groundFallback = 0.0f;  // the ground under the player, for cells not known yet
         int      g_groundCursor = 0;
         constexpr int kGroundQueriesPerFrame = 512;
@@ -84,17 +96,23 @@ namespace wxl_livingazeroth::fog
                 g_amount[k].assign(kGridSize * kGridSize, 0.0f);
                 g_grid.amount[k] = g_amount[k].data();
             }
+            for (int k = 0; k < kKindCount; ++k) g_target[k].assign(kGridSize * kGridSize, 0);
             g_ground.assign(kGridSize * kGridSize, 0.0f);
             g_groundKnown.assign(kGridSize * kGridSize, 0);
+            g_liquid.assign(kGridSize * kGridSize, 0);
+            g_fresh.assign(kGridSize * kGridSize, 1);
             g_grid.ground = g_ground.data();
             g_grid.groundKnown = g_groundKnown.data();
-            g_stats.kilobytes = static_cast<unsigned>((kKindCount * sizeof(float) + sizeof(float) + 1) * kGridSize * kGridSize / 1024);
+            g_stats.kilobytes = static_cast<unsigned>((kKindCount * (sizeof(float) + 1) + sizeof(float) + 3) * kGridSize * kGridSize / 1024);
         }
 
         void ForgetGround(int index)
         {
             g_groundKnown[index] = 0;
             g_ground[index] = g_groundFallback;
+            g_liquid[index] = 0;
+            g_fresh[index] = 1;
+            for (int k = 0; k < kKindCount; ++k) g_target[k][index] = 0;
         }
 
         /// Zeroes world column i (all rows) / world row j (all columns) in every kind, and forgets
@@ -139,7 +157,18 @@ namespace wxl_livingazeroth::fog
                 float z = 0.0f;
                 if (!terrain::HeightAt(x, y, z)) { ++missing; continue; }
                 float liquid = 0.0f;
-                if (terrain::LiquidHeightAt(x, y, liquid) && liquid > z) z = liquid;
+                uint32_t liquidType = 0;
+                g_liquid[index] = 0;
+                if (terrain::LiquidAt(x, y, liquid, liquidType) && liquid > z)
+                {
+                    z = liquid;
+                    switch (terrain::LiquidCategoryOf(liquidType))
+                    {
+                        case terrain::kLiquidMagma: g_liquid[index] = 2; break;
+                        case terrain::kLiquidSlime: g_liquid[index] = 3; break;
+                        default:                    g_liquid[index] = 1; break; // water, ocean, unknown
+                    }
+                }
                 g_ground[index] = z;
                 g_groundKnown[index] = 1;
                 changed = true;
@@ -172,6 +201,7 @@ namespace wxl_livingazeroth::fog
             {
                 ClearAll();
                 for (int index = 0; index < kGridSize * kGridSize; ++index) ForgetGround(index);
+                for (int k = 0; k < kKindCount; ++k) g_progress[k] = 1.0f; // a fresh grid: as if the conditions had held
                 ++g_grid.groundVersion;
             }
             else
@@ -188,28 +218,173 @@ namespace wxl_livingazeroth::fog
             g_placed = true;
         }
 
-        /// One step: every amount toward its target (0 for now) at the kind's rate.
+        float Clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+        float Smooth(float a, float b, float v) { const float t = Clamp01((v - a) / (b - a)); return t * t * (3.0f - 2.0f * t); }
+
+        /// What the rules need about the place and the moment (the player's place; per-cell values
+        /// come from the cell). The air an hour ago is computed from the climate, not remembered, so a
+        /// place you just arrived at knows whether it's been cooling.
+        void GatherInputs(const world::Snapshot& snap)
+        {
+            RulesInputs in;
+            const uint32_t area = snap.areaCount > 0 ? snap.areaChain[0] : 0;
+            const climate::Row& row = climate::For(area, snap.mapId);
+            in.airNow = climate::Temperature(row).total;
+            in.airHourAgo = climate::TemperatureAtTime(row, climate::Now().dayFraction - 1.0f / 24.0f).total;
+            in.water = climate::WaterTemperature(row);
+            in.humidity = row.humidity;
+            in.fogginess = row.fogginess;
+            in.wind = wind::At(snap.playerPos).strength;
+            in.night = 1.0f - climate::SunNow().daylight;
+            const climate::Weather& w = climate::CurrentWeather();
+            in.weatherType = w.type;
+            in.precipitation = (w.type == 1 || w.type == 2) ? w.intensity : 0.0f;
+            in.rain = w.type == 1 ? w.intensity : 0.0f;
+            in.snow = w.type == 2 ? w.intensity : 0.0f;
+            in.cooling = Clamp01((in.airHourAgo - in.airNow) / 2.5f); // 2.5 degC an hour = full
+            in.valid = true;
+            g_inputs = in;
+        }
+
+        /// How calm it is for a kind: 1 still air .. 0 at its WindThin and above.
+        float Calm(int kind)
+        {
+            const float thin = g_settings[kind].windThin;
+            return thin <= 0.0f ? 0.0f : Clamp01(1.0f - g_inputs.wind / thin);
+        }
+
+        /// Fresh wetness of world cell (i, j): the ground moisture above its material's rest (0..1),
+        /// from the moisture grid (same 2 yd cells); 0 outside it.
+        float ExcessAt(int i, int j)
+        {
+            const fields::WetGrid& w = fields::Wet();
+            if (!w.excess || w.size <= 0) return 0.0f;
+            if (i < w.firstI || i >= w.firstI + w.size || j < w.firstJ || j >= w.firstJ + w.size) return 0.0f;
+            const int mi = ((i % w.size) + w.size) % w.size, mj = ((j % w.size) + w.size) % w.size;
+            return w.excess[mj * w.size + mi] / 255.0f;
+        }
+
+        /// The targets of one cell (world i, j at storage index), every kind.
+        void CellTargets(int i, int j, int index, float out[kKindCount])
+        {
+            for (int k = 0; k < kKindCount; ++k) out[k] = 0.0f;
+            const float z = g_ground[index];
+            const float pos[3] = { (i + 0.5f) * kCellSize, (j + 0.5f) * kCellSize, z + 0.5f };
+            float wet = 0.0f, groundTemp = g_inputs.airNow;
+            if (g_fieldMoisture >= 0) fields::Sample(g_fieldMoisture, pos, wet);
+            if (g_fieldTemperature >= 0) fields::Sample(g_fieldTemperature, pos, groundTemp);
+
+            // Low ground: how far the cell lies below the ground 8 yd around it (8 directions).
+            float around = 0.0f;
+            int known = 0;
+            constexpr int kRing = 4;
+            const int di[8] = { kRing, -kRing, 0, 0, kRing, kRing, -kRing, -kRing };
+            const int dj[8] = { 0, 0, kRing, -kRing, kRing, -kRing, kRing, -kRing };
+            for (int d = 0; d < 8; ++d)
+            {
+                const int ni = i + di[d], nj = j + dj[d];
+                if (ni < g_grid.firstI || ni >= g_grid.firstI + kGridSize || nj < g_grid.firstJ || nj >= g_grid.firstJ + kGridSize) continue;
+                const int n = Index(ni, nj);
+                if (!g_groundKnown[n]) continue;
+                around += g_ground[n];
+                ++known;
+            }
+            const float hollow = known ? Clamp01((around / known - z) / 3.0f) : 0.0f; // 3 yd below = full
+
+            // Water: the cell itself, else the nearest water within 3 cells (6 yd), fading out.
+            const uint8_t liquid = g_liquid[index];
+            float shore = liquid == 1 ? 1.0f : 0.0f;
+            if (!shore)
+                for (int r = 1; r <= 3 && !shore; ++r)
+                    for (int dj2 = -r; dj2 <= r && !shore; ++dj2)
+                        for (int di2 = -r; di2 <= r; ++di2)
+                        {
+                            const int ni = i + di2, nj = j + dj2;
+                            if (ni < g_grid.firstI || ni >= g_grid.firstI + kGridSize || nj < g_grid.firstJ || nj >= g_grid.firstJ + kGridSize) continue;
+                            if (g_liquid[Index(ni, nj)] == 1) { shore = 1.0f - r / 4.0f; break; }
+                        }
+
+            const RulesInputs& in = g_inputs;
+            // Mist: humid air or wet ground, air cooling (or simply night), calm; pools in low ground.
+            const float humid = Clamp01(Smooth(0.4f, 0.95f, in.humidity) + 0.5f * wet);
+            const float still = std::fmax(in.cooling, 0.7f * in.night);
+            out[kMist] = humid * still * Calm(kMist) * (0.4f + 0.6f * hollow) * (1.0f + 0.5f * in.fogginess);
+            // Water fog: over water and its shore, the water warmer than the air.
+            out[kWaterFog] = shore * Smooth(1.0f, 8.0f, in.water - in.airNow) * Calm(kWaterFog) * (0.5f + 0.5f * in.humidity);
+            // Steam: rain or snow on hot ground or magma; hot water steams anyway; and drying ground:
+            // fresh wetness (moisture above the ground's rest: recent rain, melt water) on warm,
+            // sunlit ground gives thin wisps while it dries.
+            const float hot = std::fmax(Smooth(35.0f, 80.0f, groundTemp), liquid == 2 ? 1.0f : 0.0f);
+            const float hotSpring = liquid == 1 ? Smooth(35.0f, 60.0f, groundTemp) : 0.0f;
+            const float drying = 0.5f * ExcessAt(i, j) * Smooth(12.0f, 30.0f, groundTemp) * (1.0f - in.night) * (1.0f - in.precipitation);
+            out[kSteam] = std::fmax(std::fmax(in.precipitation * hot, hotSpring), drying) * Calm(kSteam);
+            // Area fog: the place's own fogginess, more at night.
+            out[kAreaFog] = in.fogginess * (0.6f + 0.4f * in.night) * Calm(kAreaFog);
+            // Haze: rain (snow less).
+            out[kHaze] = (0.8f * in.rain + 0.4f * in.snow) * Calm(kHaze);
+
+            for (int k = 0; k < kKindCount; ++k)
+                out[k] = g_settings[k].enabled ? Clamp01(out[k] * g_settings[k].strength) : 0.0f;
+        }
+
+        /// A quarter of the grid's rows per step: their targets, and new cells started.
+        void RulesPass()
+        {
+            if (!g_inputs.valid) return;
+            if (g_fieldMoisture == -2) g_fieldMoisture = fields::Find("moisture");
+            if (g_fieldTemperature == -2) g_fieldTemperature = fields::Find("temperature");
+            const double t0 = grassperf::Now();
+            for (int r = 0; r < kGridSize / 4; ++r)
+            {
+                const int j = g_grid.firstJ + g_rulesRow;
+                g_rulesRow = (g_rulesRow + 1) % kGridSize;
+                for (int i = g_grid.firstI; i < g_grid.firstI + kGridSize; ++i)
+                {
+                    const int index = Index(i, j);
+                    if (!g_groundKnown[index]) continue;
+                    float t[kKindCount];
+                    CellTargets(i, j, index, t);
+                    for (int k = 0; k < kKindCount; ++k)
+                    {
+                        g_target[k][index] = static_cast<uint8_t>(t[k] * 255.0f + 0.5f);
+                        // A cell that just scrolled in starts where the fog around the player has got.
+                        if (g_fresh[index]) g_amount[k][index] = std::fmax(g_amount[k][index], t[k] * g_progress[k]);
+                    }
+                    g_fresh[index] = 0;
+                }
+            }
+            g_stats.rulesMs = grassperf::Now() - t0;
+        }
+
+        /// One step: every amount toward its target at the kind's rates (build-up toward a higher one,
+        /// burn-off toward a lower one), and how far the fog has come toward its targets overall.
         void Step(float dt)
         {
             bool changed = false;
             for (int k = 0; k < kKindCount; ++k)
             {
-                if (g_grid.maxAmount[k] <= 0.0f) { g_stats.cellsWithFog[k] = 0; continue; }
                 const KindSettings& s = g_settings[k];
-                const float down = std::exp2(-dt / (s.burnOffSeconds > 0.1f ? s.burnOffSeconds : 0.1f));
-                float most = 0.0f;
+                const float up = 1.0f - std::exp2(-dt / (s.buildUpSeconds > 0.1f ? s.buildUpSeconds : 0.1f));
+                const float down = 1.0f - std::exp2(-dt / (s.burnOffSeconds > 0.1f ? s.burnOffSeconds : 0.1f));
+                float most = 0.0f, sumAmount = 0.0f, sumTarget = 0.0f;
                 unsigned cells = 0;
-                for (float& a : g_amount[k])
+                const uint8_t* target = g_target[k].data();
+                float* amount = g_amount[k].data();
+                for (int n = 0; n < kGridSize * kGridSize; ++n)
                 {
-                    if (a <= 0.0f) continue;
-                    a *= down;
-                    if (a < kGone) { a = 0.0f; continue; }
-                    if (a > most) most = a;
-                    ++cells;
+                    float a = amount[n];
+                    const float t = target[n] * (1.0f / 255.0f);
+                    if (a == 0.0f && t == 0.0f) continue;
+                    a += (t - a) * (t > a ? up : down);
+                    if (a < kGone && t == 0.0f) a = 0.0f;
+                    amount[n] = a;
+                    if (t > 0.02f) { sumAmount += a < t ? a : t; sumTarget += t; }
+                    if (a > 0.0f) { ++cells; if (a > most) most = a; }
                 }
+                if (sumTarget > 0.0f) g_progress[k] = sumAmount / sumTarget;
                 g_grid.maxAmount[k] = most;
                 g_stats.cellsWithFog[k] = cells;
-                changed = true;
+                changed = changed || cells;
             }
             if (changed) ++g_grid.version;
         }
@@ -234,6 +409,18 @@ namespace wxl_livingazeroth::fog
         return g_amount[kind][Index(i, j)];
     }
 
+    const RulesInputs& Inputs() { return g_inputs; }
+    float Progress(int kind) { return kind >= 0 && kind < kKindCount ? g_progress[kind] : 0.0f; }
+
+    float TargetAt(int kind, float x, float y)
+    {
+        if (kind < 0 || kind >= kKindCount || g_target[kind].empty()) return 0.0f;
+        const int i = static_cast<int>(std::floor(x / kCellSize));
+        const int j = static_cast<int>(std::floor(y / kCellSize));
+        if (i < g_grid.firstI || i >= g_grid.firstI + kGridSize || j < g_grid.firstJ || j >= g_grid.firstJ + kGridSize) return 0.0f;
+        return g_target[kind][Index(i, j)] / 255.0f;
+    }
+
     void Update(float dt, const world::Snapshot& snap)
     {
         if (!snap.inWorld) { Reset(); return; }
@@ -253,6 +440,8 @@ namespace wxl_livingazeroth::fog
         if (g_paused) return;
 
         const double t0 = grassperf::Now();
+        GatherInputs(snap);
+        RulesPass();
         Step(step);
         g_stats.tickMs = grassperf::Now() - t0;
         ++g_stats.ticks;
@@ -283,6 +472,15 @@ namespace wxl_livingazeroth::fog
     }
 
     void Clear() { if (!g_amount[0].empty()) ClearAll(); }
+
+    void FastForward()
+    {
+        if (g_amount[0].empty()) return;
+        for (int k = 0; k < kKindCount; ++k)
+            for (int n = 0; n < kGridSize * kGridSize; ++n)
+                g_amount[k][n] = g_target[k][n] / 255.0f;
+        ++g_grid.version;
+    }
     void SetPaused(bool paused) { g_paused = paused; }
     bool Paused() { return g_paused; }
     Stats GetStats() { return g_stats; }

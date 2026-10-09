@@ -160,6 +160,9 @@ namespace wxl_livingazeroth::fogsettings
                 if (!flagsSet) { v.flags = r->flags; flagsSet = true; }
             }
         }
+        // A colour without a mode means "use this colour": hue mode (keeps the stock colour's brightness).
+        // Stock mode would ignore the colour, which reads as "the colour does nothing".
+        if (!set[kFloats] && (set[9] || set[10] || set[11])) v.colorMode = kColorHue;
         if (v.colorMode < kColorStock || v.colorMode > kColorReplace) v.colorMode = kColorStock;
         if (g_cache.size() > 4096) g_cache.clear();
         return g_cache.emplace(key, v).first->second;

@@ -70,6 +70,22 @@ namespace wxl_livingazeroth::fog
     /// Amount of a kind at a world position (0 outside the grid).
     float AmountAt(int kind, float x, float y);
 
+    /// The rules' inputs for the player's place (the panel's "why"), each kind's target at a
+    /// position (0..1, from its rules x its Strength), and how far the fog around the player has
+    /// come toward its targets (0..1; new cells start there).
+    struct RulesInputs
+    {
+        bool  valid = false;
+        float airNow = 0.0f, airHourAgo = 0.0f, water = 0.0f; // degC
+        float cooling = 0.0f;                                 // 0..1 (2.5 degC an hour = 1)
+        float humidity = 0.0f, fogginess = 0.0f, wind = 0.0f, night = 0.0f;
+        int   weatherType = 0;
+        float precipitation = 0.0f, rain = 0.0f, snow = 0.0f;
+    };
+    const RulesInputs& Inputs();
+    float TargetAt(int kind, float x, float y);
+    float Progress(int kind);
+
     /// Once per frame, after fields::Update(). Steps the field a few times a second.
     void Update(float dt, const world::Snapshot& snap);
 
@@ -79,11 +95,13 @@ namespace wxl_livingazeroth::fog
     void Deposit(int kind, float amount, float radius);
     /// Removes all fog.
     void Clear();
+    /// Every cell straight to its target (as if the conditions had held for a long time).
+    void FastForward();
     /// Holds every amount where it is (no build-up, no burn-off).
     void  SetPaused(bool paused);
     bool  Paused();
 
-    struct Stats { double tickMs = 0.0; unsigned ticks = 0; unsigned cellsWithFog[kKindCount] = {}; unsigned kilobytes = 0; };
+    struct Stats { double tickMs = 0.0, rulesMs = 0.0; unsigned ticks = 0; unsigned cellsWithFog[kKindCount] = {}; unsigned kilobytes = 0; };
     Stats GetStats();
 
     /// Forget everything (world left).

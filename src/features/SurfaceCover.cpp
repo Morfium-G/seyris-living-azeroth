@@ -1,4 +1,5 @@
 #include "SurfaceCover.hpp"
+#include "../debug/Pages.hpp"
 
 #include "../debug/Profiler.hpp"
 #include "../env/Actors.hpp"
@@ -2059,7 +2060,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             api->Log(WXL_LOG_WARN, kTag, "surface cover: terrain stage hook failed; drawing at the end of the scene instead.");
             g_settings.drawPoint = 1;
         }
-        api->UiAddPanel(kPanelTitle, &Panel, nullptr);
+        pages::AddPanel(kPanelTitle, &Panel);
     }
 
     void PatchLightStats(unsigned& most, unsigned& full) { most = g_patchLightsMost; full = g_patchLightsFull; }

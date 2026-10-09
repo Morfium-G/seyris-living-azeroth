@@ -1,4 +1,5 @@
 #include "DepthView.hpp"
+#include "Pages.hpp"
 
 #include "../render/SceneDepth.hpp"
 
@@ -150,10 +151,12 @@ namespace wxl_livingazeroth::debug
     void RegisterPanel(const WXL_Api* api)
     {
         g_api = api;
-        api->UiAddPanel(kPanelTitle, &DepthPanel, nullptr);
+        pages::AddPanel(kPanelTitle, &DepthPanel);
         api->Subscribe(static_cast<uint32_t>(ev::Event::OnWorldSceneEnd), &OnWorldSceneEndThunk, nullptr);
         api->Subscribe(static_cast<uint32_t>(ev::Event::OnWorldRenderEnd), &OnWorldRenderEndThunk, nullptr);
     }
+
+    int& DepthOverlayShown() { return g_showOverlay; }
 
     void OnWorldSceneEnd(const void* args)
     {

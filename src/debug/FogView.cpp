@@ -1,4 +1,5 @@
 #include "FogView.hpp"
+#include "Pages.hpp"
 
 #include "FogProbe.hpp"
 
@@ -27,7 +28,8 @@ namespace wxl_livingazeroth::debug
             const world::Snapshot& s = world::Current();
             char line[256];
 
-            g_api->UiTextWrapped("Ground fog. No rules yet: fog is only there when deposited, and burns off at each kind's rate.");
+            g_api->UiTextWrapped("Ground fog. Each kind heads for the target its rules give (x its Strength); deposited fog "
+                                 "above the target burns off. The climate panel's time / temperature / weather overrides trigger real conditions.");
             g_api->UiSeparator();
             groundfog::DrawPanelSection();
             g_api->UiSeparator();
@@ -36,11 +38,17 @@ namespace wxl_livingazeroth::debug
             const fog::Stats st = fog::GetStats();
             for (int k = 0; k < fog::kKindCount; ++k)
             {
-                std::snprintf(line, sizeof(line), "  %-10s here %.3f   max %.3f   cells with fog %u",
+                std::snprintf(line, sizeof(line), "  %-10s here %.3f -> target %.3f   max %.3f   cells %5u   progress %.2f",
                               fog::KindName(k), fog::AmountAt(k, s.playerPos[0], s.playerPos[1]),
-                              fog::Current().maxAmount[k], st.cellsWithFog[k]);
+                              fog::TargetAt(k, s.playerPos[0], s.playerPos[1]),
+                              fog::Current().maxAmount[k], st.cellsWithFog[k], fog::Progress(k));
                 g_api->UiText(line);
             }
+            const fog::RulesInputs& in = fog::Inputs();
+            std::snprintf(line, sizeof(line), "why: air %.1f degC (an hour ago %.1f, cooling %.2f), water %.1f degC, humidity %.2f, "
+                                              "fogginess %.2f, wind %.2f, night %.2f, rain %.2f, snow %.2f",
+                          in.airNow, in.airHourAgo, in.cooling, in.water, in.humidity, in.fogginess, in.wind, in.night, in.rain, in.snow);
+            g_api->UiTextWrapped(line);
 
             g_api->UiSeparator();
             g_api->UiText("Deposit (testing, not saved):");
@@ -53,6 +61,8 @@ namespace wxl_livingazeroth::debug
             if (g_api->UiButton("Deposit##fogdeposit")) fog::Deposit(g_kind, g_amount, g_wholeGrid ? 0.0f : g_radius);
             g_api->UiSameLine();
             if (g_api->UiButton("Clear all fog##fogdeposit")) fog::Clear();
+            g_api->UiSameLine();
+            if (g_api->UiButton("Fast-forward to the targets##fogff")) fog::FastForward();
             int paused = fog::Paused() ? 1 : 0;
             if (g_api->UiCheckbox("pause build-up and burn-off", &paused)) fog::SetPaused(paused != 0);
 
@@ -63,11 +73,11 @@ namespace wxl_livingazeroth::debug
             if (g_api->UiButton("Reload FogSettings##fogreload")) fogsettings::Reload();
             for (int k = 0; k < fog::kKindCount; ++k)
             {
-                char header[64];
+                char header[128];
                 std::snprintf(header, sizeof(header), "kind: %s##fogkind%d", fog::KindName(k), k);
                 if (!g_api->UiCollapsingHeader(header)) continue;
                 fog::KindSettings& ks = fog::Settings(k);
-                char label[64];
+                char label[128];
                 std::snprintf(label, sizeof(label), "enabled##fogen%d", k);
                 g_api->UiCheckbox(label, &ks.enabled);
                 std::snprintf(label, sizeof(label), "use the panel's values (instead of the table; not saved)##fogov%d", k);
@@ -75,6 +85,8 @@ namespace wxl_livingazeroth::debug
                 std::snprintf(line, sizeof(line), "strength %.2f, wind thin %.2f, wind drift %.2f, patchiness %.2f, weight %.2f (rules and flow: later steps)",
                               ks.strength, ks.windThin, ks.windDrift, ks.patchiness, ks.weight);
                 g_api->UiTextWrapped(line);
+                std::snprintf(label, sizeof(label), "strength (x the rules' target)##fogstr%d", k);
+                if (g_api->UiSliderFloat(label, &ks.strength, 0.0f, 4.0f)) ks.panelOverride = 1;
                 std::snprintf(label, sizeof(label), "build-up half-life (s)##fogup%d", k);
                 if (g_api->UiSliderFloat(label, &ks.buildUpSeconds, 1.0f, 3600.0f)) ks.panelOverride = 1;
                 std::snprintf(label, sizeof(label), "burn-off half-life (s)##fogdown%d", k);
@@ -86,8 +98,8 @@ namespace wxl_livingazeroth::debug
             }
 
             g_api->UiSeparator();
-            std::snprintf(line, sizeof(line), "field: %d x %d cells of %.0f yd, %u KB; last step %.3f ms (%u steps, 4 per second)%s",
-                          fog::kGridSize, fog::kGridSize, fog::kCellSize, st.kilobytes, st.tickMs, st.ticks,
+            std::snprintf(line, sizeof(line), "field: %d x %d cells of %.0f yd, %u KB; last step %.3f ms (rules %.3f ms; %u steps, 4 per second)%s",
+                          fog::kGridSize, fog::kGridSize, fog::kCellSize, st.kilobytes, st.tickMs, st.rulesMs, st.ticks,
                           fog::Paused() ? ", PAUSED" : "");
             g_api->UiTextWrapped(line);
 
@@ -100,6 +112,6 @@ namespace wxl_livingazeroth::debug
     void RegisterFogPanel(const WXL_Api* api)
     {
         g_api = api;
-        api->UiAddPanel(kPanelTitle, &Panel, nullptr);
+        pages::AddPanel(kPanelTitle, &Panel);
     }
 }

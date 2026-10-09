@@ -1,4 +1,5 @@
 #include "LightsView.hpp"
+#include "Pages.hpp"
 
 #include "../env/Lights.hpp"
 #include "../env/WorldQuery.hpp"
@@ -353,6 +354,6 @@ namespace wxl_livingazeroth::debug
     void RegisterLightsPanel(const WXL_Api* api)
     {
         g_api = api;
-        api->UiAddPanel(kPanelTitle, &Panel, nullptr);
+        pages::AddPanel(kPanelTitle, &Panel);
     }
 }

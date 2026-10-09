@@ -1,4 +1,5 @@
 #include "Profiler.hpp"
+#include "Pages.hpp"
 
 #include "engine/events/Event.hpp"
 #include "game/Gx.hpp"
@@ -516,7 +517,7 @@ namespace wxl_livingazeroth::prof
         api->Subscribe(static_cast<uint32_t>(ev::Event::OnFrame), &OnFrame, nullptr);
         api->Subscribe(static_cast<uint32_t>(ev::Event::OnWorldRenderEnd), &OnWorldRenderEnd, nullptr);
         api->Subscribe(static_cast<uint32_t>(ev::Event::OnEndScene), &OnEndScene, nullptr);
-        api->UiAddPanel(kPanelTitle, &Panel, nullptr);
+        pages::AddPanel(kPanelTitle, &Panel);
     }
 
     void OnDeviceLost() { ReleaseGpu(); }

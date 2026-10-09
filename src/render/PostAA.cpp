@@ -1,4 +1,5 @@
 #include "PostAA.hpp"
+#include "../debug/Pages.hpp"
 
 #include "../debug/Profiler.hpp"
 #include "../features/GrassPerf.hpp"
@@ -275,6 +276,6 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
 
     void RegisterPanel(const WXL_Api* api)
     {
-        api->UiAddPanel("wxl-seyris-living-azeroth: anti-aliasing", &Panel, nullptr);
+        pages::AddPanel("wxl-seyris-living-azeroth: anti-aliasing", &Panel);
     }
 }

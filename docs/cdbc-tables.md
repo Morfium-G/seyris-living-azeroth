@@ -339,7 +339,7 @@ any field no row sets) the module's built-in values for the kind apply.
 | WindDrift | how strongly the wind moves it (0..1) |
 | Patchiness | noise amount (0 smooth .. 1 patchy) |
 | Weight | 0 = rises and thins upward .. 1 = heavy: flat-topped, flows downhill, pools in hollows |
-| ColorMode | 0 = the zone's stock fog colour, 1 = hue (the stock colour's brightness with Color's hue and saturation: follows day and night), 2 = replace (Color as is); −1 inherits |
+| ColorMode | 0 = the zone's stock fog colour (Color is ignored), 1 = hue (the stock colour's brightness with Color's hue and saturation: follows day and night), 2 = replace (Color as is); −1 inherits. No row sets a mode but one sets a Color: hue |
 | ColorR/G/B | 0 .. 1 |
 | Saturation | 0 = grey .. 1 = as is (on top of the mode) |
 | Brightness | multiplier |

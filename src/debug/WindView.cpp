@@ -1,4 +1,5 @@
 #include "WindView.hpp"
+#include "Pages.hpp"
 
 #include "ShaderDump.hpp"
 
@@ -570,8 +571,8 @@ namespace wxl_livingazeroth::debug
     void RegisterWindPanel(const WXL_Api* api)
     {
         g_api = api;
-        api->UiAddPanel(kPanelTitle, &WindPanel, nullptr);
-        api->UiAddPanel("wxl-seyris-living-azeroth: grass performance", &GrassPerfPanel, nullptr);
+        pages::AddPanel(kPanelTitle, &WindPanel);
+        pages::AddPanel("wxl-seyris-living-azeroth: grass performance", &GrassPerfPanel);
         api->Subscribe(static_cast<uint32_t>(ev::Event::OnWorldSceneEnd), &OnWorldSceneEnd, nullptr);
     }
 

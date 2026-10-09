@@ -1,4 +1,5 @@
 #include "ClimateView.hpp"
+#include "Pages.hpp"
 
 #include "../env/Climate.hpp"
 #include "../env/ClientWeather.hpp"
@@ -180,6 +181,6 @@ namespace wxl_livingazeroth::debug
     void RegisterClimatePanel(const WXL_Api* api)
     {
         g_api = api;
-        api->UiAddPanel(kPanelTitle, &Panel, nullptr);
+        pages::AddPanel(kPanelTitle, &Panel);
     }
 }

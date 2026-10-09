@@ -23,6 +23,8 @@
 #include "debug/WindView.hpp"
 #include "debug/WmoBindProbe.hpp"
 #include "debug/FogProbe.hpp"
+#include "debug/Overview.hpp"
+#include "debug/Pages.hpp"
 #include "env/ClientWeather.hpp"
 #include "env/Fog.hpp"
 #include "env/FogSettings.hpp"
@@ -74,6 +76,9 @@ namespace
         static bool done = false;
         if (done) return;
         done = true;
+
+        // The panels: as pages of wxl-seyris-tools' control panel, or plain overlay panels without it.
+        wxl_livingazeroth::pages::Publish(g_api);
 
         const auto* cdbc = static_cast<const WXL_SeyrisCdbcApi*>(
             g_api->GetInterface(WXL_SEYRIS_CDBC_INTERFACE_NAME, WXL_SEYRIS_CDBC_INTERFACE_VERSION));
@@ -152,6 +157,9 @@ int __cdecl WXL_Load(const WXL_Api* api)
 {
     if (!api) return 0;
     g_api = api;
+
+    // The overview first among the pages (pages are listed in registration order).
+    wxl_livingazeroth::debug::RegisterOverview(api);
 
     // The frame profiler first: its hooks go first in every chain, and its UI scope opens at the
     // world -> UI boundary before the anti-aliasing (subscribed below) runs there.

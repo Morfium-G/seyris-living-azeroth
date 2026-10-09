@@ -199,10 +199,18 @@ namespace wxl_livingazeroth::climate
         else { g_weather.type = snap.weatherType; g_weather.intensity = snap.weatherIntensity; }
     }
 
-    Breakdown Temperature(const Row& row)
+    Breakdown Temperature(const Row& row) { return TemperatureAtTime(row, g_clock.dayFraction); }
+
+    float WaterTemperature(const Row& row)
+    {
+        Breakdown b = TemperatureAtTime(row, g_clock.dayFraction);
+        return 0.5f * (row.dayTemp + row.nightTemp) + b.season + b.test;
+    }
+
+    Breakdown TemperatureAtTime(const Row& row, float dayFraction)
     {
         Breakdown b;
-        b.daily = row.nightTemp + (row.dayTemp - row.nightTemp) * DailyCurve(g_clock.dayFraction);
+        b.daily = row.nightTemp + (row.dayTemp - row.nightTemp) * DailyCurve(Wrap01(dayFraction));
         // Peak around 20 July (0.55 of the year), shifted by SeasonOffset months.
         constexpr float kPi = 3.14159265f;
         const float y = Wrap01(g_clock.yearFraction - 0.55f - row.seasonOffset / 12.0f);
