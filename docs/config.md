@@ -1,8 +1,10 @@
 # Config (`WarcraftXL.ini`)
 
 Read through `wxl-seyris-tools` (needs settings 1.1.0) from `WTF\WXL\WarcraftXL.ini`, or from
-`WarcraftXL.ini` in the client root if one exists there. Section `[LivingAzeroth]`. Missing keys
-are written with their default and a comment on first launch.
+`WarcraftXL.ini` in the client root if one exists there. Section `[LivingAzeroth]`, and the
+sub-sections `[LivingAzeroth.Fog]` and `[LivingAzeroth.FogWake]` (an ini has no real nesting; the
+dotted names keep them together). Missing keys are written with their default and a comment on
+first launch.
 
 The ini sets what each launch starts with. The debug panels (F9) still change everything at
 runtime, without writing back. Without `wxl-seyris-tools` the defaults below apply and the log
@@ -38,6 +40,39 @@ says why.
 | WindShelter | 1 | Roofs and overhangs shelter the ground below from wind. |
 | WindLee | 1 | Walls and cliffs cast a wind shadow on their downwind side. |
 | DebugWindArrows | 0 | Debug: draw the wind as arrows around the player. |
+
+## `[LivingAzeroth.Fog]`: the ground fog renderer
+
+Where fog forms, and each kind's density, thickness, colour and so on, come from
+`FogSettings.cdbc` ([cdbc-tables.md](cdbc-tables.md)); these are your limits and quality.
+
+| Key | Default | Meaning |
+|---|---|---|
+| Enabled | 1 | Draw the ground fog. |
+| DensityScale | 1 | Your multiplier on every fog kind's density (1 = as `FogSettings.cdbc` says). |
+| MaxDistance | 250 | How far the fog is drawn, in yards. |
+| StepBudget | 48 | Steps per pixel through the fog (quality, not the look): more = smoother far away, slower. |
+| StepLength | 1 | Step length inside the fog near you, in yards (grows with distance). Smaller = finer, slower. |
+| Dither | 0 | 0 = smooth (may show faint bands) .. 1 = grainy. |
+| FloorReach | 2 | Light fog starts on the lowest ground this many 2-yard cells around (0..4): higher keeps it off walls, thins it on slopes. |
+| Patchiness | 0.6 | How patchy the fog is, 0 (smooth layers) .. 1. |
+| PatchSize | 64 | Size of the patch pattern's tile in yards (the patches are about 1/8 of it). |
+| Brightness | 1 | Your multiplier on the fog's colour brightness. |
+| WaterWritesDepth | 1 | While fog is drawn, water writes depth so lakes are fogged at their surface (not their bed). |
+
+## `[LivingAzeroth.FogWake]`: characters and creatures pushing the fog aside
+
+| Key | Default | Meaning |
+|---|---|---|
+| Enabled | 1 | Characters and creatures push the ground fog aside and leave a swirling trail. |
+| PushMoving | 0.9 | How much fog a moving unit pushes out, 0..1. |
+| PushStanding | 0.35 | How much fog a standing unit pushes out, 0..1. |
+| FillSeconds | 3 | Seconds until a trail fills back in. |
+| Radius | 2.25 | Wake radius as a multiple of the unit's radius (at least 0.6 yards). |
+| Widening | 1 | How much the trail widens as it fades, times its radius. |
+| Height | 1 | How high the push reaches, as a multiple of the unit's height. |
+| Rim | 0.25 | Fog piled up at the wake's edge, as a share of the push. |
+| Swirl | 1 | How far the fog's pattern is dragged and curled along the path. |
 
 The grass distance itself is still the client's own setting (`groundEffectDist`, options or
 console); the cap only decides how high it may go.

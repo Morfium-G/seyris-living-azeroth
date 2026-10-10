@@ -2,6 +2,8 @@
 
 #include "debug/WindView.hpp"
 #include "env/Shelter.hpp"
+#include "features/FogWake.hpp"
+#include "features/GroundFog.hpp"
 #include "features/GrassInstanced.hpp"
 #include "features/GrassMotion.hpp"
 #include "features/SurfaceCover.hpp"
@@ -42,6 +44,21 @@ namespace wxl_livingazeroth::config
         float Float(const WXL_SeyrisSettingsApi* s, const char* key, const char* description, float fallback)
         {
             return s->GetFloat(kSection, key, description, fallback);
+        }
+
+        // In a sub-section.
+        int In(const WXL_SeyrisSettingsApi* s, const char* section, const char* key, const char* description, int fallback)
+        {
+            return s->GetBool(section, key, description, fallback ? 1 : 0) != 0 ? 1 : 0;
+        }
+        float In(const WXL_SeyrisSettingsApi* s, const char* section, const char* key, const char* description, float fallback)
+        {
+            return s->GetFloat(section, key, description, fallback);
+        }
+        int Whole(const WXL_SeyrisSettingsApi* s, const char* section, const char* key, const char* description, int fallback)
+        {
+            const float v = s->GetFloat(section, key, description, static_cast<float>(fallback));
+            return static_cast<int>(v < 0.0f ? v - 0.5f : v + 0.5f);
         }
     }
 
@@ -105,6 +122,37 @@ namespace wxl_livingazeroth::config
 
         debug::SetShowArrows(Bool(s, "DebugWindArrows", "Debug: draw the wind as arrows around the player.", debug::ShowArrows()));
 
-        api->Log(WXL_LOG_INFO, kTag, "config: settings read from [%s] in WarcraftXL.ini.", kSection);
+        // Ground fog renderer. Where fog forms and its kinds' values come from FogSettings.cdbc.
+        {
+            const char* f = kSectionFog;
+            groundfog::Settings& g = groundfog::Config();
+            g.enabled = In(s, f, "Enabled", "Draw the ground fog.", g.enabled);
+            g.densityScale = In(s, f, "DensityScale", "Your multiplier on every fog kind's density (1 = as FogSettings.cdbc says).", g.densityScale);
+            g.maxDistance = In(s, f, "MaxDistance", "How far the fog is drawn, in yards.", g.maxDistance);
+            g.steps = Whole(s, f, "StepBudget", "Steps per pixel through the fog (quality, not the look): more = smoother far away, slower.", g.steps);
+            g.fogStep = In(s, f, "StepLength", "Step length inside the fog near you, in yards (grows with distance). Smaller = finer, slower.", g.fogStep);
+            g.dither = In(s, f, "Dither", "0 = smooth (may show faint bands) .. 1 = grainy.", g.dither);
+            g.floorReach = Whole(s, f, "FloorReach", "Light fog starts on the lowest ground this many 2-yard cells around (0..4): higher keeps it off walls, thins it on slopes.", g.floorReach);
+            g.noiseAmount = In(s, f, "Patchiness", "How patchy the fog is, 0 (smooth layers) .. 1.", g.noiseAmount);
+            g.noiseTileYards = In(s, f, "PatchSize", "Size of the patch pattern's tile in yards (the patches are about 1/8 of it).", g.noiseTileYards);
+            g.brightness = In(s, f, "Brightness", "Your multiplier on the fog's colour brightness.", g.brightness);
+            g.forceWaterDepth = In(s, f, "WaterWritesDepth", "While fog is drawn, water writes depth so lakes are fogged at their surface (not their bed).", g.forceWaterDepth);
+        }
+        // Units pushing the ground fog aside.
+        {
+            const char* f = kSectionFogWake;
+            fogwake::Settings& w = fogwake::Config();
+            w.enabled = In(s, f, "Enabled", "Characters and creatures push the ground fog aside and leave a swirling trail.", w.enabled);
+            w.strength = In(s, f, "PushMoving", "How much fog a moving unit pushes out, 0..1.", w.strength);
+            w.standing = In(s, f, "PushStanding", "How much fog a standing unit pushes out, 0..1.", w.standing);
+            w.trailSeconds = In(s, f, "FillSeconds", "Seconds until a trail fills back in.", w.trailSeconds);
+            w.radiusScale = In(s, f, "Radius", "Wake radius as a multiple of the unit's radius (at least 0.6 yards).", w.radiusScale);
+            w.spread = In(s, f, "Widening", "How much the trail widens as it fades, times its radius.", w.spread);
+            w.heightScale = In(s, f, "Height", "How high the push reaches, as a multiple of the unit's height.", w.heightScale);
+            w.rim = In(s, f, "Rim", "Fog piled up at the wake's edge, as a share of the push.", w.rim);
+            w.swirl = In(s, f, "Swirl", "How far the fog's pattern is dragged and curled along the path.", w.swirl);
+        }
+
+        api->Log(WXL_LOG_INFO, kTag, "config: settings read from [%s], [%s], [%s] in WarcraftXL.ini.", kSection, kSectionFog, kSectionFogWake);
     }
 }

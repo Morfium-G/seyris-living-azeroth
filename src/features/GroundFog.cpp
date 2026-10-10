@@ -7,6 +7,7 @@
 #include "../env/WorldQuery.hpp"
 #include "../render/GxState.hpp"
 #include "../render/SceneDepth.hpp"
+#include "FogWake.hpp"
 #include "GrassPerf.hpp"
 
 #include "game/Camera.hpp"
@@ -100,6 +101,20 @@ float4 cPool   : register(c13); // x = heavy pool density per yd, y = the pools'
 float4 cView   : register(c14); // x = debug view: 0 the fog, 1 light layer only, 2 pools only, 3 ground check;
                                 //   y = step in the fog (yd), z = the top map's block (yd), w = step growth per yd of distance
 sampler2D topTex : register(s4);     // r = the highest fog top in the block and its 8 neighbours - cCam.w (-1e5: none), point sampled
+sampler2D wakeTex : register(s5);    // units pushing the fog (features/FogWake): r = push (< 0 at the rim), g = its top z - cCam.w, ba = pattern displacement (yd)
+float4 cWake   : register(c15); // xy = the wake map's origin (world), z = 1 / its extent (yd), w = on
+
+// The wake at a step (its middle pm, height zm): how much of the fog stays (the push reaches up to
+// the unit's height, softly), and the patch pattern's displacement there.
+float WakeKeep(float3 pm, float zm, out float2 displace)
+{
+    displace = 0;
+    if (cWake.w < 0.5) return 1;
+    float4 w = tex2Dlod(wakeTex, float4((pm.xy - cWake.xy) * cWake.z, 0, 0));
+    float below = saturate((w.g + cCam.w - zm) / 0.5 + 0.5);
+    displace = w.ba * below;
+    return max(1 - w.r * below, 0);
+}
 
 // The light layer's density factor exp(-max(z - B, 0) / T) averaged over z in [za, zb]: full below
 // the ground B, falling off above it. Antiderivative: z - B below, T (1 - exp(-(z - B) / T)) above.
@@ -268,7 +283,11 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             // Each step's fog in its own colour (the kinds' mix at both ends, by their fog), seen
             // through what's in front.
             float3 pm = cCam.xyz + dir * (0.5 * (t + tb));
-            float a = 1 - exp(-sigma * Patchiness(pm, tb - t) * (tb - t) * cColor.a);
+            // Units: the fog pushed out around them and their trail, its pattern dragged along
+            // (sampled where the pattern would have come from).
+            float2 displace;
+            sigma *= WakeKeep(pm, 0.5 * (za + zb), displace);
+            float a = 1 - exp(-sigma * Patchiness(pm - float3(displace, 0), tb - t) * (tb - t) * cColor.a);
             float3 c = cNoise2.z > 0.5 ? float3(1, 0, 1) : (sA * cA.rgb + sB * cB.rgb) / (sA + sB) * 2;
             scatter += T * a * c;
             T *= 1 - a;
@@ -299,6 +318,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             if (g_field) { g_field->Release(); g_field = nullptr; }
             if (g_colorTex) { g_colorTex->Release(); g_colorTex = nullptr; }
             if (g_topTex) { g_topTex->Release(); g_topTex = nullptr; }
+            fogwake::Release();
             if (g_noise) { g_noise->Release(); g_noise = nullptr; }
             g_fieldVersion = g_groundVersion = ~0u;
             g_fieldSignature = -1.0f;
@@ -819,7 +839,12 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             const float interior = *reinterpret_cast<const float*>(kInteriorBlend);
             const int steps = g_settings.steps < 4 ? 4 : (g_settings.steps > 128 ? 128 : g_settings.steps);
 
-            const float c[15 * 4] = {
+            // Units pushing the fog: their wake map (nullptr when off or none near).
+            IDirect3DTexture9* wake = fogwake::Texture(dev, g_groundRef);
+            float wakePlace[3] = {};
+            fogwake::Placement(wakePlace);
+
+            const float c[16 * 4] = {
                 vp.MinZ, 1.0f / (vp.MaxZ - vp.MinZ), vp.MaxZ + 1.0e-4f, g_settings.maxDistance,
                 proj[0], proj[5], proj[8], proj[9],
                 proj[10], proj[14], static_cast<float>(steps), g_settings.depthDecode ? 1.0f : 0.0f,
@@ -839,6 +864,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                 g_poolDensity, 0.3f, g_ceiling, g_settings.poolGate ? 1.0f : 0.0f,
                 static_cast<float>(g_settings.debugView), g_settings.fogStep > 0.1f ? g_settings.fogStep : 0.1f,
                 kTopBlock * fog::kCellSize, 0.04f,
+                wakePlace[0], wakePlace[1], wakePlace[2], wake ? 1.0f : 0.0f,
             };
 
             // Everything the pass changes goes back through the state block, so the client's own cache
@@ -869,7 +895,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
 
             dev->SetVertexShader(nullptr);
             dev->SetPixelShader(g_ps);
-            dev->SetPixelShaderConstantF(0, c, 15);
+            dev->SetPixelShaderConstantF(0, c, 16);
 
             dev->SetTexture(0, depthTex);
             dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
@@ -907,6 +933,13 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             dev->SetSamplerState(4, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
             dev->SetSamplerState(4, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
             dev->SetSamplerState(4, D3DSAMP_SRGBTEXTURE, FALSE);
+            dev->SetTexture(5, wake);
+            dev->SetSamplerState(5, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+            dev->SetSamplerState(5, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+            dev->SetSamplerState(5, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+            dev->SetSamplerState(5, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+            dev->SetSamplerState(5, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+            dev->SetSamplerState(5, D3DSAMP_SRGBTEXTURE, FALSE);
 
             // The viewport, in pixels; the half-pixel offset lines pixels up with D3D9 pixel centres.
             const float x0 = vp.X - 0.5f, y0 = vp.Y - 0.5f, x1 = x0 + vp.Width, y1 = y0 + vp.Height;
@@ -989,6 +1022,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
         g_api->UiSliderFloat("step length in the fog (yd)##gfstep", &g_settings.fogStep, 0.25f, 4.0f);
         g_api->UiSliderFloat("dither (0 smooth .. 1 grainy)##gfdither", &g_settings.dither, 0.0f, 1.0f);
         g_api->UiSliderInt("fog floor reach (cells of 2 yd; 0 = follows every cell)##gffloor", &g_settings.floorReach, 0, 4);
+        if (g_api->UiCollapsingHeader("Units pushing the fog##gfwake")) fogwake::DrawPanelSection(g_api);
         g_api->UiSliderFloat("max distance (yd)##gfdist", &g_settings.maxDistance, 30.0f, 600.0f);
         g_api->UiSliderFloat("density scale##gfdens", &g_settings.densityScale, 0.0f, 4.0f);
         g_api->UiSliderFloat("patchiness (noise)##gfnoise", &g_settings.noiseAmount, 0.0f, 1.0f);

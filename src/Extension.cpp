@@ -28,6 +28,7 @@
 #include "env/ClientWeather.hpp"
 #include "env/Fog.hpp"
 #include "env/FogSettings.hpp"
+#include "features/FogWake.hpp"
 #include "features/GroundFog.hpp"
 #include "debug/FogView.hpp"
 #include "env/Actors.hpp"
@@ -128,6 +129,7 @@ namespace
         {
             prof::Scope scope(prof::kOursFogField);
             wxl_livingazeroth::fog::Update(dt, snap);
+            wxl_livingazeroth::fogwake::Update(dt, snap);
         }
         {
             prof::Scope scope(prof::kOursLights);
