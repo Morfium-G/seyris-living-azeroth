@@ -20,7 +20,10 @@ namespace wxl_livingazeroth::groundfog
         int   enabled = 1;
         int   steps = 48;               // the march's step budget per pixel (jumps through air + steps in the fog)
         float fogStep = 1.0f;           // yd: step length inside the fog near the camera (grows 4% of the distance)
-        int   floorReach = 2;           // cells: the light layer starts on the lowest ground this far around (smoothed), so it doesn't drape up walls
+        int   fogLights = 1;            // our lights (torches, braziers...) light the fog around them
+        float lightStrength = 1.0f;     // x their light in the fog
+        float lightRange = 128.0f;      // yd from the camera: lights farther away don't light the fog
+        int   floorReach = 2;          // cells: the light layer starts on the lowest ground this far around (smoothed), so it doesn't drape up walls
         float dither = 0.0f;           // 0 sample each step's middle .. 1 anywhere in it, per pixel (grain instead of banding)
         float maxDistance = 250.0f;     // yd: the march ends here (and for sky pixels)
         float densityScale = 1.0f;      // multiplies every kind's density

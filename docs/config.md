@@ -58,6 +58,9 @@ Where fog forms, and each kind's density, thickness, colour and so on, come from
 | Patchiness | 0.6 | How patchy the fog is, 0 (smooth layers) .. 1. |
 | PatchSize | 64 | Size of the patch pattern's tile in yards (the patches are about 1/8 of it). |
 | Brightness | 1 | Your multiplier on the fog's colour brightness. |
+| Lights | 1 | Our lights (torches, braziers, lamps) light the fog around them. |
+| LightStrength | 1 | Your multiplier on our lights' light in the fog. |
+| LightRange | 128 | Lights farther than this from the camera (yards) don't light the fog. Lower = cheaper. |
 | WaterWritesDepth | 1 | While fog is drawn, water writes depth so lakes are fogged at their surface (not their bed). |
 
 ## `[LivingAzeroth.FogWake]`: characters and creatures pushing the fog aside

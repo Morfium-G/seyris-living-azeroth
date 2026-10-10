@@ -136,6 +136,9 @@ namespace wxl_livingazeroth::config
             g.noiseAmount = In(s, f, "Patchiness", "How patchy the fog is, 0 (smooth layers) .. 1.", g.noiseAmount);
             g.noiseTileYards = In(s, f, "PatchSize", "Size of the patch pattern's tile in yards (the patches are about 1/8 of it).", g.noiseTileYards);
             g.brightness = In(s, f, "Brightness", "Your multiplier on the fog's colour brightness.", g.brightness);
+            g.fogLights = In(s, f, "Lights", "Our lights (torches, braziers, lamps) light the fog around them.", g.fogLights);
+            g.lightStrength = In(s, f, "LightStrength", "Your multiplier on our lights' light in the fog.", g.lightStrength);
+            g.lightRange = In(s, f, "LightRange", "Lights farther than this from the camera (yards) don't light the fog. Lower = cheaper.", g.lightRange);
             g.forceWaterDepth = In(s, f, "WaterWritesDepth", "While fog is drawn, water writes depth so lakes are fogged at their surface (not their bed).", g.forceWaterDepth);
         }
         // Units pushing the ground fog aside.

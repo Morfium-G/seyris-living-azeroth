@@ -3,6 +3,7 @@
 #include "../debug/Profiler.hpp"
 #include "../env/Fog.hpp"
 #include "../env/FogSettings.hpp"
+#include "../env/Lights.hpp"
 #include "../env/TerrainHeight.hpp"
 #include "../env/WorldQuery.hpp"
 #include "../render/GxState.hpp"
@@ -68,6 +69,10 @@ namespace wxl_livingazeroth::groundfog
         constexpr int   kTopBlock = 4;                                 // cells per top-map block (8 yd)
         constexpr int   kTopSize = fog::kGridSize / kTopBlock;         // 32^2 = 4 KB
         constexpr float kNoTop = -1.0e5f;                              // a block without fog
+        float g_topDilated[kTopSize * kTopSize];                       // the top map as uploaded (kNoTop: no fog in or next to the block)
+        IDirect3DTexture9* g_lightTex = nullptr;   // A16B16G16R16F, the field's cells: our lights' light reaching the fog there
+        double   g_lightMs = 0.0;
+        unsigned g_lightsUsed = 0, g_lightCells = 0;
         float                    g_ceiling = -1.0e9f;  // world z of the highest fog top in the field
         IDirect3DVolumeTexture9* g_noise = nullptr;
         bool                     g_shaderFailed = false;
@@ -93,7 +98,7 @@ float4 cInv2   : register(c5);
 float4 cCam    : register(c6);  // xyz = r3 = the camera in world space, w = ground reference z
 float4 cGrid   : register(c7);  // x = 1 / the field's extent (yd), y = dither (0 none .. 1 the first step in the fog shortened per pixel)
 float4 cBox    : register(c8);  // the field's valid box: min x, min y, max x, max y
-float4 cColor  : register(c9);  // a = density scale
+float4 cColor  : register(c9);  // x = our lights in the fog (lightTex bound), a = density scale
 float4 cNoise  : register(c10); // xyz = drift offset (tiles), w = 1 / tile size (yd)
 float4 cNoise2 : register(c11); // x = noise amount, y = 1 / edge fade (yd), z = debug colour
 float4 cUv     : register(c12); // depth texture uv = xy + uv * zw
@@ -101,7 +106,8 @@ float4 cPool   : register(c13); // x = heavy pool density per yd, y = the pools'
 float4 cView   : register(c14); // x = debug view: 0 the fog, 1 light layer only, 2 pools only, 3 ground check;
                                 //   y = step in the fog (yd), z = the top map's block (yd), w = step growth per yd of distance
 sampler2D topTex : register(s4);     // r = the highest fog top in the block and its 8 neighbours - cCam.w (-1e5: none), point sampled
-sampler2D wakeTex : register(s5);    // units pushing the fog (features/FogWake): r = push (< 0 at the rim), g = its top z - cCam.w, ba = pattern displacement (yd)
+sampler2D lightTex : register(s6);   // our lights' light reaching the fog per field cell (rgb, linear), on when cColor.x
+sampler2D wakeTex : register(s5);   // units pushing the fog (features/FogWake): r = push (< 0 at the rim), g = its top z - cCam.w, ba = pattern displacement (yd)
 float4 cWake   : register(c15); // xy = the wake map's origin (world), z = 1 / its extent (yd), w = on
 
 // The wake at a step (its middle pm, height zm): how much of the fog stays (the push reaches up to
@@ -135,11 +141,14 @@ float PoolAverage(float S, float za, float zb, float s)
     return (RampIntegral(ua) - RampIntegral(ub)) / (ua - ub);
 }
 
-// The field and the colour texture at a point (xy), and the fade at the field's edge.
+// The field and the colour texture at a point (xy), our lights' light reaching the fog there (added to
+// the colour), and the fade at the field's edge.
 float4 SampleField(float2 xy, out float4 col, out float edge)
 {
     float4 uvw = float4(xy * cGrid.x, 0, 0);
     col = tex2Dlod(colorTex, uvw);
+    col.rgb = col.rgb * 2;
+    if (cColor.x > 0.5) col.rgb += tex2Dlod(lightTex, uvw).rgb;
     edge = saturate(min(min(xy.x - cBox.x, cBox.z - xy.x), min(xy.y - cBox.y, cBox.w - xy.y)) * cNoise2.y);
     return tex2Dlod(fieldTex, uvw);
 }
@@ -288,7 +297,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             float2 displace;
             sigma *= WakeKeep(pm, 0.5 * (za + zb), displace);
             float a = 1 - exp(-sigma * Patchiness(pm - float3(displace, 0), tb - t) * (tb - t) * cColor.a);
-            float3 c = cNoise2.z > 0.5 ? float3(1, 0, 1) : (sA * cA.rgb + sB * cB.rgb) / (sA + sB) * 2;
+            float3 c = cNoise2.z > 0.5 ? float3(1, 0, 1) : (sA * cA.rgb + sB * cB.rgb) / (sA + sB);
             scatter += T * a * c;
             T *= 1 - a;
         }
@@ -318,6 +327,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             if (g_field) { g_field->Release(); g_field = nullptr; }
             if (g_colorTex) { g_colorTex->Release(); g_colorTex = nullptr; }
             if (g_topTex) { g_topTex->Release(); g_topTex = nullptr; }
+            if (g_lightTex) { g_lightTex->Release(); g_lightTex = nullptr; }
             fogwake::Release();
             if (g_noise) { g_noise->Release(); g_noise = nullptr; }
             g_fieldVersion = g_groundVersion = ~0u;
@@ -607,6 +617,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                                 for (int dc = -1; dc <= 1; ++dc)
                                     most = std::fmax(most, blockTop[((r + dr + B) % B) * B + (c + dc + B) % B]);
                             row[c] = most;
+                            g_topDilated[r * B + c] = most;
                         }
                     }
                     g_topTex->UnlockRect(0);
@@ -619,6 +630,116 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             g_fieldSignature = signature;
             ++g_fieldUploads;
             return true;
+        }
+
+        /// Our lights (env/Lights) in the fog: per field cell with fog in or next to its block, the
+        /// light reaching the fog there (at the cell's ground + 1 yd), summed over the lights whose
+        /// radius covers it. The same light as on the terrain and the cover (TerrainLights.cpp): a
+        /// ~1 yd source on the client's 1 / (0.7 d + 0.03 d^2), windowed to 0 at the radius (its
+        /// falloff shape), spot cone, baked occlusion; no facing term (fog scatters every way). Every
+        /// frame (the flames flicker). nullptr: off or nothing lit.
+        IDirect3DTexture9* UploadLights(IDirect3DDevice9* dev, const float cam[3])
+        {
+            const double t0 = grassperf::Now();
+            g_lightsUsed = g_lightCells = 0;
+            if (!g_settings.fogLights || g_settings.lightStrength <= 0.0f) return nullptr;
+            const fog::Grid& grid = fog::Current();
+            if (!grid.ground) return nullptr;
+            constexpr int N = fog::kGridSize;
+            static std::vector<float> sum(N * N * 3);
+            std::fill(sum.begin(), sum.end(), 0.0f);
+            auto wrap = [](int v) { const int m = v % N; return m < 0 ? m + N : m; };
+            const bool skipIndoor = lights::Config().indoorSkipsTerrain != 0;
+            const float range2 = g_settings.lightRange * g_settings.lightRange;
+
+            for (const lights::ActiveLight& l : lights::Active())
+            {
+                if (l.indoor && skipIndoor) continue;
+                const float cx = l.pos[0] - cam[0], cy = l.pos[1] - cam[1];
+                if (cx * cx + cy * cy > range2 || l.radius <= 0.0f) continue;
+                const float r = l.radius;
+                const int i0 = std::max(grid.firstI, static_cast<int>(std::floor((l.pos[0] - r) / fog::kCellSize)));
+                const int i1 = std::min(grid.firstI + N - 1, static_cast<int>(std::floor((l.pos[0] + r) / fog::kCellSize)));
+                const int j0 = std::max(grid.firstJ, static_cast<int>(std::floor((l.pos[1] - r) / fog::kCellSize)));
+                const int j1 = std::min(grid.firstJ + N - 1, static_cast<int>(std::floor((l.pos[1] + r) / fog::kCellSize)));
+                if (i0 > i1 || j0 > j1) continue;
+                bool used = false;
+                for (int j = j0; j <= j1; ++j)
+                    for (int i = i0; i <= i1; ++i)
+                    {
+                        const int wi = wrap(i), wj = wrap(j);
+                        if (g_topDilated[(wj / kTopBlock) * kTopSize + wi / kTopBlock] <= kNoTop) continue; // no fog near
+                        const int index = wj * N + wi;
+                        const float p[3] = { (i + 0.5f) * fog::kCellSize, (j + 0.5f) * fog::kCellSize, grid.ground[index] + 1.0f };
+                        const float dx = p[0] - l.pos[0], dy = p[1] - l.pos[1], dz = p[2] - l.pos[2]; // light -> fog
+                        const float d2 = dx * dx + dy * dy + dz * dz;
+                        const float d = std::sqrt(d2);
+                        if (d >= r) continue;
+                        float window = 1.0f - (d / r) * (d / r);
+                        window *= window;
+                        if (l.falloff != 1.0f) window = std::pow(window, l.falloff);
+                        float spot = 1.0f;
+                        if (l.cosOuter > -1.5f && d > 1.0e-4f)
+                        {
+                            const float c = (dx * l.spotDir[0] + dy * l.spotDir[1] + dz * l.spotDir[2]) / d;
+                            spot = (c - l.cosOuter) * l.spotScale;
+                            spot = spot < 0.0f ? 0.0f : (spot > 1.0f ? 1.0f : spot);
+                            if (spot <= 0.0f) continue;
+                        }
+                        // Baked occlusion: the octahedral direction light -> fog, no light past the
+                        // stored reach (+ 0.5 yd, soft over 0.5 yd), as the terrain's shader does.
+                        float occluded = 1.0f;
+                        if (l.occlusion && d > 1.0e-4f)
+                        {
+                            const float inv = 1.0f / (std::fabs(dx) + std::fabs(dy) + std::fabs(dz));
+                            float ox = dx * inv, oy = dy * inv;
+                            if (dz * inv < 0.0f)
+                            {
+                                const float tx = (1.0f - std::fabs(oy)) * (ox >= 0.0f ? 1.0f : -1.0f);
+                                const float ty = (1.0f - std::fabs(ox)) * (oy >= 0.0f ? 1.0f : -1.0f);
+                                ox = tx; oy = ty;
+                            }
+                            const int ix = std::min(lights::kOccSide - 1, static_cast<int>((ox + 1.0f) * 0.5f * lights::kOccSide));
+                            const int iy = std::min(lights::kOccSide - 1, static_cast<int>((oy + 1.0f) * 0.5f * lights::kOccSide));
+                            const float reach = l.occlusion[iy * lights::kOccSide + std::max(ix, 0)];
+                            occluded = (reach + 1.0f - d) / 0.5f;
+                            occluded = occluded < 0.0f ? 0.0f : (occluded > 1.0f ? 1.0f : occluded);
+                            if (occluded <= 0.0f) continue;
+                        }
+                        const float dd = std::sqrt(d2 + 1.0f);
+                        const float k = window * spot * occluded / (dd * (0.7f + 0.03f * dd));
+                        float* s = &sum[index * 3];
+                        s[0] += l.color[0] * k; s[1] += l.color[1] * k; s[2] += l.color[2] * k;
+                        ++g_lightCells;
+                        used = true;
+                    }
+                if (used) ++g_lightsUsed;
+            }
+            if (!g_lightsUsed) { g_lightMs = grassperf::Now() - t0; return nullptr; }
+
+            if (!g_lightTex && FAILED(dev->CreateTexture(N, N, 1, 0, D3DFMT_A16B16G16R16F, D3DPOOL_MANAGED, &g_lightTex, nullptr)))
+            {
+                g_lightTex = nullptr;
+                return nullptr;
+            }
+            D3DLOCKED_RECT lr{};
+            if (FAILED(g_lightTex->LockRect(0, &lr, nullptr, 0))) return nullptr;
+            const float strength = g_settings.lightStrength;
+            for (int r = 0; r < N; ++r)
+            {
+                auto* texel = reinterpret_cast<uint16_t*>(static_cast<uint8_t*>(lr.pBits) + r * lr.Pitch);
+                for (int c = 0; c < N; ++c, texel += 4)
+                {
+                    const float* s = &sum[(r * N + c) * 3];
+                    texel[0] = ToHalf(s[0] * strength);
+                    texel[1] = ToHalf(s[1] * strength);
+                    texel[2] = ToHalf(s[2] * strength);
+                    texel[3] = 0;
+                }
+            }
+            g_lightTex->UnlockRect(0);
+            g_lightMs = grassperf::Now() - t0;
+            return g_lightTex;
         }
 
         bool Invert(const float m[16], float out[16])
@@ -839,6 +960,9 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             const float interior = *reinterpret_cast<const float*>(kInteriorBlend);
             const int steps = g_settings.steps < 4 ? 4 : (g_settings.steps > 128 ? 128 : g_settings.steps);
 
+            // Our lights in the fog (nullptr when off or nothing lit).
+            IDirect3DTexture9* lightTex = UploadLights(dev, cam);
+
             // Units pushing the fog: their wake map (nullptr when off or none near).
             IDirect3DTexture9* wake = fogwake::Texture(dev, g_groundRef);
             float wakePlace[3] = {};
@@ -855,7 +979,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                 1.0f / extent, g_settings.dither, 0.0f, 0.0f,
                 grid.firstI * fog::kCellSize, grid.firstJ * fog::kCellSize,
                 (grid.firstI + fog::kGridSize) * fog::kCellSize, (grid.firstJ + fog::kGridSize) * fog::kCellSize,
-                0.0f, 0.0f, 0.0f, // (colours come from the colour texture)
+                lightTex ? 1.0f : 0.0f, 0.0f, 0.0f, // (colours come from the colour texture)
                 g_settings.densityScale * (1.0f - (interior > 0.0f ? interior : 0.0f)),
                 g_noiseOffset[0], g_noiseOffset[1], g_noiseOffset[2], 1.0f / (g_settings.noiseTileYards > 1.0f ? g_settings.noiseTileYards : 1.0f),
                 g_settings.noiseAmount, 1.0f / 16.0f, g_settings.debugColour ? 1.0f : 0.0f, g_settings.heightBands ? 1.0f : 0.0f,
@@ -933,6 +1057,13 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             dev->SetSamplerState(4, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
             dev->SetSamplerState(4, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
             dev->SetSamplerState(4, D3DSAMP_SRGBTEXTURE, FALSE);
+            dev->SetTexture(6, lightTex);
+            dev->SetSamplerState(6, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+            dev->SetSamplerState(6, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+            dev->SetSamplerState(6, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+            dev->SetSamplerState(6, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+            dev->SetSamplerState(6, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+            dev->SetSamplerState(6, D3DSAMP_SRGBTEXTURE, FALSE);
             dev->SetTexture(5, wake);
             dev->SetSamplerState(5, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
             dev->SetSamplerState(5, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
@@ -1023,6 +1154,15 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
         g_api->UiSliderFloat("dither (0 smooth .. 1 grainy)##gfdither", &g_settings.dither, 0.0f, 1.0f);
         g_api->UiSliderInt("fog floor reach (cells of 2 yd; 0 = follows every cell)##gffloor", &g_settings.floorReach, 0, 4);
         if (g_api->UiCollapsingHeader("Units pushing the fog##gfwake")) fogwake::DrawPanelSection(g_api);
+        if (g_api->UiCollapsingHeader("Lights in the fog##gflights"))
+        {
+            g_api->UiCheckbox("our lights light the fog##gflon", &g_settings.fogLights);
+            g_api->UiSliderFloat("strength##gflstr", &g_settings.lightStrength, 0.0f, 4.0f);
+            g_api->UiSliderFloat("range (yd from the camera)##gflrange", &g_settings.lightRange, 16.0f, 256.0f);
+            std::snprintf(line, sizeof(line), "%u lights reach the fog, %u cell hits, %.3f ms CPU (every frame: they flicker)",
+                          g_lightsUsed, g_lightCells, g_lightMs);
+            g_api->UiTextWrapped(line);
+        }
         g_api->UiSliderFloat("max distance (yd)##gfdist", &g_settings.maxDistance, 30.0f, 600.0f);
         g_api->UiSliderFloat("density scale##gfdens", &g_settings.densityScale, 0.0f, 4.0f);
         g_api->UiSliderFloat("patchiness (noise)##gfnoise", &g_settings.noiseAmount, 0.0f, 1.0f);
