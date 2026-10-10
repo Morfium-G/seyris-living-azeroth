@@ -63,6 +63,11 @@ namespace wxl_livingazeroth::fog
         const float*   ground = nullptr;      // includes a WMO floor the fog lies on
         const uint8_t* groundKnown = nullptr;
         const uint8_t* block = nullptr;       // 0 not traced, 1 open, 2 WMO floor, 3 WMO structure (no fog)
+        // Kinds that hang at their source's height (water fog, steam): per cell, the height the fog
+        // there came from (amount-weighted as it forms, drifts and flows); its layer starts there,
+        // so steam blown onto a bank fades on it instead of draping up it. nullptr for the others
+        // (their layer starts at the ground). Meaningless where the kind's amount is 0.
+        const float*   floor[kKindCount] = {};
         unsigned       groundMissing = 0;
         uint32_t       groundVersion = 0;
     };

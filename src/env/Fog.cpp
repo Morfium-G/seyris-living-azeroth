@@ -65,6 +65,19 @@ namespace wxl_livingazeroth::fog
         }
 
         std::vector<float> g_amount[kKindCount];
+        // Kinds that hang at their source's height (Grid::floor): water fog over the water, steam
+        // over the lava or hot ground it rose from.
+        constexpr bool kAnchored[kKindCount] = { false, true, true, false, false };
+        std::vector<float> g_floor[kKindCount];
+
+        /// A cell's amount of an anchored kind grew from `before` to `after` with fog from height z:
+        /// its floor moves toward z by the new fog's share.
+        void AddFrom(int kind, int index, float before, float after, float z)
+        {
+            if (!kAnchored[kind] || after <= before) return;
+            float& f = g_floor[kind][index];
+            f = before > 0.0f ? (f * before + z * (after - before)) / after : z;
+        }
         std::vector<uint8_t> g_target[kKindCount]; // where each kind is heading, 0..255 = 0..1 (the rules)
         std::vector<float>   g_ground;   // the surface the fog lies on: terrain/liquid, or a WMO floor on it
         std::vector<float>   g_terrain;  // the terrain or terrain liquid alone
@@ -110,6 +123,12 @@ namespace wxl_livingazeroth::fog
                 g_grid.amount[k] = g_amount[k].data();
             }
             for (int k = 0; k < kKindCount; ++k) g_target[k].assign(kGridSize * kGridSize, 0);
+            for (int k = 0; k < kKindCount; ++k)
+                if (kAnchored[k])
+                {
+                    g_floor[k].assign(kGridSize * kGridSize, 0.0f);
+                    g_grid.floor[k] = g_floor[k].data();
+                }
             g_ground.assign(kGridSize * kGridSize, 0.0f);
             g_terrain.assign(kGridSize * kGridSize, 0.0f);
             g_groundKnown.assign(kGridSize * kGridSize, 0);
@@ -119,7 +138,7 @@ namespace wxl_livingazeroth::fog
             g_grid.ground = g_ground.data();
             g_grid.groundKnown = g_groundKnown.data();
             g_grid.block = g_block.data();
-            g_stats.kilobytes = static_cast<unsigned>((kKindCount * (sizeof(float) + 1) + 2 * sizeof(float) + 4) * kGridSize * kGridSize / 1024);
+            g_stats.kilobytes = static_cast<unsigned>((kKindCount * (sizeof(float) + 1) + 4 * sizeof(float) + 4) * kGridSize * kGridSize / 1024);
         }
 
         void ForgetGround(int index)
@@ -378,11 +397,14 @@ namespace wxl_livingazeroth::fog
             // Water fog: over water and its shore, the water warmer than the air.
             out[kWaterFog] = shore * Smooth(1.0f, 8.0f, in.water - in.airNow) * Calm(kWaterFog) * (0.5f + 0.5f * in.humidity);
             // Steam: rain or snow on hot ground or magma; hot water steams anyway; and drying ground:
-            // fresh wetness (moisture above the ground's rest: recent rain, melt water) on warm,
-            // sunlit ground gives thin wisps while it dries.
+            // fresh wetness (moisture above the ground's rest: recent rain, melt water) steams where
+            // the ground is clearly warmer than the air (warm wet ground under cooler air: day or
+            // night, rain only halves it), and gives thin wisps on warm sunlit ground.
             const float hot = std::fmax(Smooth(35.0f, 80.0f, groundTemp), liquid == 2 ? 1.0f : 0.0f);
             const float hotSpring = liquid == 1 ? Smooth(35.0f, 60.0f, groundTemp) : 0.0f;
-            const float drying = 0.5f * ExcessAt(i, j) * Smooth(12.0f, 30.0f, groundTemp) * (1.0f - in.night) * (1.0f - in.precipitation);
+            const float sunWisps = Smooth(12.0f, 30.0f, groundTemp) * (1.0f - in.night) * (1.0f - in.precipitation);
+            const float warmer = Smooth(2.0f, 15.0f, groundTemp - in.airNow) * (1.0f - 0.5f * in.precipitation);
+            const float drying = 0.5f * ExcessAt(i, j) * std::fmax(sunWisps, warmer);
             out[kSteam] = std::fmax(std::fmax(in.precipitation * hot, hotSpring), drying) * Calm(kSteam);
             // Area fog: the place's own fogginess, more at night.
             out[kAreaFog] = in.fogginess * (0.6f + 0.4f * in.night) * Calm(kAreaFog);
@@ -414,7 +436,12 @@ namespace wxl_livingazeroth::fog
                     {
                         g_target[k][index] = static_cast<uint8_t>(t[k] * 255.0f + 0.5f);
                         // A cell that just scrolled in starts where the fog around the player has got.
-                        if (g_fresh[index]) g_amount[k][index] = std::fmax(g_amount[k][index], t[k] * g_progress[k]);
+                        if (g_fresh[index])
+                        {
+                            const float before = g_amount[k][index];
+                            g_amount[k][index] = std::fmax(before, t[k] * g_progress[k]);
+                            AddFrom(k, index, before, g_amount[k][index], g_ground[index]);
+                        }
                     }
                     g_fresh[index] = 0;
                 }
@@ -430,7 +457,7 @@ namespace wxl_livingazeroth::fog
         /// the upwind edge refills from the rules.
         void Advect(float dt)
         {
-            static std::vector<float> next(kGridSize * kGridSize);
+            static std::vector<float> next(kGridSize * kGridSize), nextFloor(kGridSize * kGridSize);
             for (int k = 0; k < kKindCount; ++k)
             {
                 const float drift = g_settings[k].windDrift;
@@ -439,20 +466,37 @@ namespace wxl_livingazeroth::fog
                 if (speed < 1.0e-3f) continue;
                 const float sx = g_inputs.windDirX * speed, sy = g_inputs.windDirY * speed;
                 const std::vector<float>& a = g_amount[k];
+                const bool anchored = kAnchored[k];
                 auto at = [&](int i, int j) { if (!InGrid(i, j)) return 0.0f; const int n = Index(i, j); return Open(n) ? a[n] : 0.0f; };
                 for (int j = g_grid.firstJ; j < g_grid.firstJ + kGridSize; ++j)
                     for (int i = g_grid.firstI; i < g_grid.firstI + kGridSize; ++i)
                     {
                         const int index = Index(i, j);
-                        if (!Open(index)) { next[index] = 0.0f; continue; }
+                        if (!Open(index))
+                        {
+                            next[index] = 0.0f;
+                            if (anchored) nextFloor[index] = g_floor[k][index];
+                            continue;
+                        }
                         const float fx = i - sx, fy = j - sy;
                         const int x0 = static_cast<int>(std::floor(fx)), y0 = static_cast<int>(std::floor(fy));
                         const float tx = fx - x0, ty = fy - y0;
-                        const float top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * tx;
-                        const float bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * tx;
-                        next[index] = top + (bottom - top) * ty;
+                        // Bilinear from the four upwind cells; an anchored kind's floor comes along,
+                        // weighted by the fog each one gives.
+                        const int ci[4] = { x0, x0 + 1, x0, x0 + 1 }, cj[4] = { y0, y0, y0 + 1, y0 + 1 };
+                        const float w[4] = { (1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty };
+                        float sum = 0.0f, floorSum = 0.0f;
+                        for (int s = 0; s < 4; ++s)
+                        {
+                            const float m = w[s] * at(ci[s], cj[s]);
+                            sum += m;
+                            if (anchored && m > 0.0f) floorSum += m * g_floor[k][Index(ci[s], cj[s])];
+                        }
+                        next[index] = sum;
+                        if (anchored) nextFloor[index] = sum > 0.0f ? floorSum / sum : g_floor[k][index];
                     }
                 std::copy(next.begin(), next.end(), g_amount[k].begin());
+                if (anchored) std::copy(nextFloor.begin(), nextFloor.end(), g_floor[k].begin());
             }
         }
 
@@ -466,7 +510,17 @@ namespace wxl_livingazeroth::fog
             for (int k = 0; k < kKindCount; ++k) any = any || (g_settings[k].weight > 0.0f && g_grid.maxAmount[k] > 0.0f);
             if (!any) return;
             static std::vector<float> depth(kGridSize * kGridSize), delta[kKindCount];
-            for (int k = 0; k < kKindCount; ++k) delta[k].assign(kGridSize * kGridSize, 0.0f);
+            // Anchored kinds: what flows into each cell, and its floors (amount-weighted).
+            static std::vector<float> inflow[kKindCount], inflowFloor[kKindCount];
+            for (int k = 0; k < kKindCount; ++k)
+            {
+                delta[k].assign(kGridSize * kGridSize, 0.0f);
+                if (kAnchored[k])
+                {
+                    inflow[k].assign(kGridSize * kGridSize, 0.0f);
+                    inflowFloor[k].assign(kGridSize * kGridSize, 0.0f);
+                }
+            }
             for (int n = 0; n < kGridSize * kGridSize; ++n)
             {
                 float d = 0.0f;
@@ -506,12 +560,27 @@ namespace wxl_livingazeroth::fog
                             const float amount = moved * share / (s.weight * s.thickness);
                             delta[k][c] -= amount;
                             delta[k][n] += amount;
+                            if (kAnchored[k])
+                            {
+                                inflow[k][n] += amount;
+                                inflowFloor[k][n] += amount * g_floor[k][c];
+                            }
                         }
                     }
                 }
             for (int k = 0; k < kKindCount; ++k)
                 for (int n = 0; n < kGridSize * kGridSize; ++n)
-                    if (delta[k][n] != 0.0f) g_amount[k][n] = std::fmin(kMaxPool, std::fmax(0.0f, g_amount[k][n] + delta[k][n]));
+                {
+                    if (delta[k][n] == 0.0f) continue;
+                    const float before = g_amount[k][n];
+                    g_amount[k][n] = std::fmin(kMaxPool, std::fmax(0.0f, before + delta[k][n]));
+                    // An anchored kind's floor: what stayed keeps its own, what came in brings its.
+                    if (kAnchored[k] && inflow[k][n] > 0.0f)
+                    {
+                        const float kept = std::fmax(0.0f, before + delta[k][n] - inflow[k][n]);
+                        g_floor[k][n] = (g_floor[k][n] * kept + inflowFloor[k][n]) / (kept + inflow[k][n]);
+                    }
+                }
         }
 
         /// One step: every amount toward its target at the kind's rates (build-up toward a higher one,
@@ -535,9 +604,11 @@ namespace wxl_livingazeroth::fog
                     float a = amount[n];
                     const float t = target[n] * (1.0f / 255.0f);
                     if (a == 0.0f && t == 0.0f) continue;
+                    const float before = a;
                     a += (t - a) * (t > a ? up : down);
                     if (a < kGone && t == 0.0f) a = 0.0f;
                     amount[n] = a;
+                    AddFrom(k, n, before, a, g_ground[n]); // forming here: from this cell's surface
                     if (t > 0.02f) { sumAmount += a < t ? a : t; sumTarget += t; }
                     if (a > 0.0f) { ++cells; if (a > most) most = a; }
                 }
@@ -638,7 +709,9 @@ namespace wxl_livingazeroth::fog
                     w = t * t * (3.0f - 2.0f * t);
                 }
                 float& a = g_amount[kind][Index(i, j)];
+                const float before = a;
                 a = std::fmin(1.0f, a + amount * w);
+                AddFrom(kind, Index(i, j), before, a, g_ground[Index(i, j)]);
                 if (a > most) most = a;
             }
         g_grid.maxAmount[kind] = most;
@@ -652,7 +725,10 @@ namespace wxl_livingazeroth::fog
         if (g_amount[0].empty()) return;
         for (int k = 0; k < kKindCount; ++k)
             for (int n = 0; n < kGridSize * kGridSize; ++n)
+            {
                 g_amount[k][n] = g_target[k][n] / 255.0f;
+                if (kAnchored[k]) g_floor[k][n] = g_ground[n]; // as if it had formed in place
+            }
         ++g_grid.version;
     }
     void SetPaused(bool paused) { g_paused = paused; }

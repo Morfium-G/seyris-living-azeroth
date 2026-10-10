@@ -4,7 +4,6 @@
 #include "../env/Fog.hpp"
 #include "../env/FogSettings.hpp"
 #include "../env/TerrainHeight.hpp"
-#include "../env/Wind.hpp"
 #include "../env/WorldQuery.hpp"
 #include "../render/GxState.hpp"
 #include "../render/SceneDepth.hpp"
@@ -371,7 +370,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
 
         float SettingsSignature()
         {
-            float s = g_settings.densityScale * 7.0f;
+            float s = g_settings.densityScale * 7.0f + g_settings.floorReach * 0.731f;
             for (int k = 0; k < fog::kKindCount; ++k)
             {
                 const fog::KindSettings& ks = fog::Settings(k);
@@ -418,27 +417,46 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                 std::fabs(groundRef - g_groundRef) < 64.0f)
                 return true;
 
-            // The fog lies on the lowest ground among a cell and its 8 neighbours: at a steep edge (a
-            // cliff over lava) the 2 yd cells interpolate a ramp the thin layer would climb as a
-            // sheet; on the lower envelope it stays at the bottom. Gentle ground barely changes.
+            // The fog floor: the light layer starts here, not on each cell's own ground (a layer
+            // following every cell drapes up cliffs and walls). The lowest ground within floorReach
+            // cells (default 2 = 4 yd), smoothed over the 3x3 around, never above the cell's own ground: on a cliff the
+            // wall's cells get the floor at its foot, so the layer has thinned out before it climbs;
+            // gentle slopes sink it by a fraction of a yard.
             constexpr int N = fog::kGridSize;
-            static std::vector<float> base(N * N);
+            static std::vector<float> base(N * N), low(N * N);
             auto wrap = [](int v) { const int m = v % N; return m < 0 ? m + N : m; };
-            for (int r = 0; r < N; ++r)
-                for (int c = 0; c < N; ++c)
-                {
-                    const int i = grid.firstI + wrap(c - grid.firstI), j = grid.firstJ + wrap(r - grid.firstJ); // world cell
-                    float low = grid.ground[r * N + c];
-                    for (int dj = -1; dj <= 1; ++dj)
-                        for (int di = -1; di <= 1; ++di)
+            auto inGrid = [&](int i, int j) { return i >= grid.firstI && i < grid.firstI + N && j >= grid.firstJ && j < grid.firstJ + N; };
+            for (int pass = 0; pass < 2; ++pass)
+                for (int r = 0; r < N; ++r)
+                    for (int c = 0; c < N; ++c)
+                    {
+                        const int i = grid.firstI + wrap(c - grid.firstI), j = grid.firstJ + wrap(r - grid.firstJ); // world cell
+                        const int index = r * N + c;
+                        if (pass == 0)
                         {
-                            const int ni = i + di, nj = j + dj;
-                            if (ni < grid.firstI || ni >= grid.firstI + N || nj < grid.firstJ || nj >= grid.firstJ + N) continue;
-                            const int n = wrap(nj) * N + wrap(ni);
-                            if (grid.groundKnown[n] && grid.ground[n] < low) low = grid.ground[n];
+                            float most = grid.ground[index];
+                            const int R = g_settings.floorReach < 0 ? 0 : (g_settings.floorReach > 4 ? 4 : g_settings.floorReach);
+                            for (int dj = -R; dj <= R; ++dj)
+                                for (int di = -R; di <= R; ++di)
+                                {
+                                    if (!inGrid(i + di, j + dj)) continue;
+                                    const int n = wrap(j + dj) * N + wrap(i + di);
+                                    if (grid.groundKnown[n] && grid.ground[n] < most) most = grid.ground[n];
+                                }
+                            low[index] = most;
+                            continue;
                         }
-                    base[r * N + c] = low;
-                }
+                        float sum = 0.0f;
+                        int count = 0;
+                        for (int dj = -1; dj <= 1; ++dj)
+                            for (int di = -1; di <= 1; ++di)
+                            {
+                                if (!inGrid(i + di, j + dj)) continue;
+                                sum += low[wrap(j + dj) * N + wrap(i + di)];
+                                ++count;
+                            }
+                        base[index] = std::fmin(grid.ground[index], count ? sum / count : low[index]);
+                    }
 
             static std::vector<float>   cellRgb(N * N * 3);
             static std::vector<uint8_t> cellHas(N * N), cellPooled(N * N);
@@ -459,7 +477,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                     // Each kind splits by its Weight: the light share is a layer thinning upward
                     // (density, thickness); the heavy share is a pool with a flat top at the ground +
                     // its depth (amount x thickness), drawn with the heavy density (c13).
-                    float density = 0.0f, weighted = 0.0f, pool = 0.0f;
+                    float density = 0.0f, weighted = 0.0f, pool = 0.0f, floorSum = 0.0f;
                     float mix[3] = {}, mixWeight = 0.0f; // colour: the kinds' colours by their share of the fog here
                     for (int k = 0; k < fog::kKindCount; ++k)
                     {
@@ -469,6 +487,11 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                         const float d = a * ks.density * (1.0f - ks.weight);
                         density += d;
                         weighted += d * ks.thickness;
+                        // Where this kind's layer starts: the fog floor, or (water fog, steam) the
+                        // height it came from, never above the ground here (blown down a slope, it
+                        // settles on the surface).
+                        const float kindFloor = grid.floor[k] ? std::fmin(grid.floor[k][index], grid.ground[index]) : base[index];
+                        floorSum += d * kindFloor;
                         pool += a * ks.weight * ks.thickness;
                         heavyWeight += a * ks.weight;
                         heavyDensity += a * ks.weight * ks.density;
@@ -478,9 +501,10 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                     }
                     const bool blocked = grid.block && grid.block[index] == 3;
                     const float thickness = density > 0.0f ? weighted / density : 1.0f;
+                    const float layerFloor = density > 0.0f ? floorSum / density : base[index]; // the kinds' floors by their density
                     texel[0] = ToHalf(blocked ? 0.0f : density);
                     texel[1] = ToHalf(thickness);
-                    texel[2] = ToHalf(base[index] - g_groundRef);
+                    texel[2] = ToHalf(layerFloor - g_groundRef);
                     // The pool as a surface: a flat level (the real ground + its depth) with fog below it.
                     // Below the terrain it's hidden anyway, since the march ends at the scene depth. Cells
                     // without a pool sit just under the lowest ground around them, so filtering toward a
@@ -497,7 +521,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                     if (!blocked && (density > 1.0e-4f || pooled))
                     {
                         const float top = std::fmax(pooled ? grid.ground[index] + pool + 0.5f : -1.0e9f,
-                                                    density > 1.0e-4f ? base[index] + thickness * 4.0f : -1.0e9f);
+                                                    density > 1.0e-4f ? layerFloor + thickness * 4.0f : -1.0e9f);
                         if (top > ceiling) ceiling = top;
                         cellTop[index] = top - g_groundRef;
                     }
@@ -770,17 +794,23 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             g_seenM32 = proj[14];
             if (!vp.Width || !vp.Height || vp.MaxZ <= vp.MinZ) { g_inactive = "unexpected viewport"; return; }
 
-            // Noise drift with the wind at the camera (and a slow rise), in tiles.
+            // The noise drifts with the fog itself: the area's steady ground wind at the speed the
+            // field moves (env/Fog Advect: 4 yd/s x wind x WindDrift, the drifting kinds' largest), and a
+            // slow rise, in tiles. (It used the gusty wind at the camera at its own speed, so the fog
+            // moved through a pattern moving otherwise.)
             const ULONGLONG now = GetTickCount64();
             const float dt = g_lastTick ? static_cast<float>(now - g_lastTick) / 1000.0f : 0.0f;
             g_lastTick = now;
-            if (dt > 0.0f && dt < 1.0f)
+            if (dt > 0.0f && dt < 1.0f && !fog::Paused()) // paused, the field holds still: so does its noise
             {
-                const wind::Sample w = wind::At(cam);
-                const float speed = 0.5f + 6.0f * w.strength; // yd/s
+                const fog::RulesInputs& in = fog::Inputs();
+                float drift = 0.0f;
+                for (int k = 0; k < fog::kKindCount; ++k)
+                    if (fog::Settings(k).enabled && fog::Current().maxAmount[k] > 0.0f) drift = std::fmax(drift, fog::Settings(k).windDrift);
+                const float speed = 4.0f * in.wind * drift; // yd/s
                 const float tile = g_settings.noiseTileYards > 1.0f ? g_settings.noiseTileYards : 1.0f;
-                g_noiseOffset[0] = std::fmod(g_noiseOffset[0] - w.dirX * speed * dt / tile, 64.0f);
-                g_noiseOffset[1] = std::fmod(g_noiseOffset[1] - w.dirY * speed * dt / tile, 64.0f);
+                g_noiseOffset[0] = std::fmod(g_noiseOffset[0] - in.windDirX * speed * dt / tile, 64.0f);
+                g_noiseOffset[1] = std::fmod(g_noiseOffset[1] - in.windDirY * speed * dt / tile, 64.0f);
                 g_noiseOffset[2] = std::fmod(g_noiseOffset[2] - 0.05f * dt / tile, 64.0f);
             }
 
@@ -958,6 +988,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
         g_api->UiSliderInt("march step budget##gfsteps", &g_settings.steps, 4, 128);
         g_api->UiSliderFloat("step length in the fog (yd)##gfstep", &g_settings.fogStep, 0.25f, 4.0f);
         g_api->UiSliderFloat("dither (0 smooth .. 1 grainy)##gfdither", &g_settings.dither, 0.0f, 1.0f);
+        g_api->UiSliderInt("fog floor reach (cells of 2 yd; 0 = follows every cell)##gffloor", &g_settings.floorReach, 0, 4);
         g_api->UiSliderFloat("max distance (yd)##gfdist", &g_settings.maxDistance, 30.0f, 600.0f);
         g_api->UiSliderFloat("density scale##gfdens", &g_settings.densityScale, 0.0f, 4.0f);
         g_api->UiSliderFloat("patchiness (noise)##gfnoise", &g_settings.noiseAmount, 0.0f, 1.0f);
