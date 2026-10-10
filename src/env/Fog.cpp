@@ -99,6 +99,11 @@ namespace wxl_livingazeroth::fog
         float    g_progress[kKindCount] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
         RulesInputs g_inputs;
         int      g_rulesRow = 0;         // the next grid row the rules evaluate (a quarter per step)
+        // After a table reload (AreaClimate, FogSettings): this many rows still jump straight to their
+        // new targets as the rules reach them, like a fresh grid (else a changed Fogginess shows only
+        // after the kind's build-up, 10 min for area fog). 0 in play.
+        int      g_reseedRows = 0;
+        uint32_t g_seenClimate = 0, g_seenFogSettings = 0;
         int      g_fieldMoisture = -2, g_fieldTemperature = -2;
         float    g_groundFallback = 0.0f;  // the ground under the player, for cells not known yet
         int      g_groundCursor = 0;
@@ -426,6 +431,8 @@ namespace wxl_livingazeroth::fog
             {
                 const int j = g_grid.firstJ + g_rulesRow;
                 g_rulesRow = (g_rulesRow + 1) % kGridSize;
+                const bool reseed = g_reseedRows > 0;
+                if (reseed) --g_reseedRows;
                 for (int i = g_grid.firstI; i < g_grid.firstI + kGridSize; ++i)
                 {
                     const int index = Index(i, j);
@@ -435,8 +442,13 @@ namespace wxl_livingazeroth::fog
                     for (int k = 0; k < kKindCount; ++k)
                     {
                         g_target[k][index] = static_cast<uint8_t>(t[k] * 255.0f + 0.5f);
+                        if (reseed)
+                        {
+                            g_amount[k][index] = t[k];
+                            if (kAnchored[k]) g_floor[k][index] = g_ground[index];
+                        }
                         // A cell that just scrolled in starts where the fog around the player has got.
-                        if (g_fresh[index])
+                        else if (g_fresh[index])
                         {
                             const float before = g_amount[k][index];
                             g_amount[k][index] = std::fmax(before, t[k] * g_progress[k]);
@@ -670,6 +682,17 @@ namespace wxl_livingazeroth::fog
         if (!snap.inWorld) { Reset(); return; }
         EnsureStorage();
         ResolveForPlace(snap);
+        if (climate::Generation() != g_seenClimate || fogsettings::Generation() != g_seenFogSettings)
+        {
+            // A reload (not the first read): the next full round of the rules re-seeds the grid.
+            if (g_seenClimate || g_seenFogSettings)
+            {
+                g_reseedRows = kGridSize;
+                for (int k = 0; k < kKindCount; ++k) g_progress[k] = 1.0f;
+            }
+            g_seenClimate = climate::Generation();
+            g_seenFogSettings = fogsettings::Generation();
+        }
         if (snap.mapId != g_map) { ClearAll(); g_map = snap.mapId; g_placed = false; }
         g_px = snap.playerPos[0];
         g_py = snap.playerPos[1];
