@@ -23,8 +23,9 @@ namespace wxl_livingazeroth::climate
             {"Humidity",        7, WXL_CDBC_FIELD_VALUE},
             {"Flags",           8, WXL_CDBC_FIELD_VALUE},
             {"Fogginess",       9, WXL_CDBC_FIELD_VALUE}, // appended 2026-10-08 (ground fog)
+            {"Comment",        10, WXL_CDBC_FIELD_STRING}, // appended 2026-10-11: for the editor, not read
         };
-        constexpr WXL_SeyrisCdbcDefinition kDef = { "AreaClimate", "DBFilesClient\\AreaClimate.cdbc", kFields, 10 };
+        constexpr WXL_SeyrisCdbcDefinition kDef = { "AreaClimate", "DBFilesClient\\AreaClimate.cdbc", kFields, 11 };
 
         enum Scope : uint32_t { kGlobal = 0, kMap = 1, kArea = 2 };
         enum Field { kDay, kNight, kAmplitude, kOffset, kHumidity, kFogginess, kFieldCount };

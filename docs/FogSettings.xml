@@ -19,4 +19,5 @@
     <Field Name="Saturation" Type="float" />
     <Field Name="Brightness" Type="float" />
     <Field Name="Flags" Type="int" />
+    <Field Name="Comment" Type="string" />
   </Table>

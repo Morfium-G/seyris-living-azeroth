@@ -1,5 +1,6 @@
 #include "Wind.hpp"
 
+#include "CdbcLoad.hpp"
 #include "Shelter.hpp"
 
 #include <cmath>
@@ -41,6 +42,7 @@ namespace wxl_livingazeroth::wind
             {"LockedDirection",  12, WXL_CDBC_FIELD_VALUE},
             {"LockStrength",     13, WXL_CDBC_FIELD_VALUE},
             {"Flags",            14, WXL_CDBC_FIELD_VALUE},
+            {"Comment",          15, WXL_CDBC_FIELD_STRING}, // appended 2026-10-11: for the editor, not read
         };
         constexpr WXL_SeyrisCdbcDefinition kProfileDef = {
             "WindProfile", "DBFilesClient\\WindProfile.cdbc", kProfileFields,
@@ -189,7 +191,7 @@ namespace wxl_livingazeroth::wind
         }
 
         char err[256] = {};
-        void* table = cdbc->Load(&kProfileDef, err, sizeof(err));
+        void* table = cdbcload::LoadAppendOnly(cdbc, kProfileDef, err, sizeof(err)); // older files lack Comment
         if (!table)
         {
             std::snprintf(g_error, sizeof(g_error), "WindProfile.cdbc: %s", err);

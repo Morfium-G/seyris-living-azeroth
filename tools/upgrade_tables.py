@@ -14,7 +14,6 @@ Usage:  python upgrade_tables.py <DBFilesClient folder or .cdbc file> [...]
 
 import struct
 import sys
-import time
 from pathlib import Path
 
 import cdbc_io as io
@@ -43,7 +42,7 @@ def upgrade(path: Path) -> None:
     for i in range(count):
         out += records[i * record_size:(i + 1) * record_size] + pad
     header = struct.pack("<4sIIII", magic, count, len(columns), len(columns) * 4, len(strings))
-    backup = path.with_name(f"{path.name}.{time.strftime('%Y%m%d-%H%M%S')}.bak")
+    backup = io.backup_path(path)
     backup.write_bytes(data)
     path.write_bytes(header + bytes(out) + strings)
     print(f"{path}: {fields} -> {len(columns)} columns ({count} rows); backup {backup.name}")

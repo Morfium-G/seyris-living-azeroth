@@ -31,6 +31,7 @@ field by field. **A negative value inherits** from the scope above. No Global ro
 | LockedDirection | compass degrees the wind blows **toward** (0 north, 90 east) |
 | LockStrength | 0..1, pull toward LockedDirection (0 = no lock) |
 | Flags | reserved, 0 |
+| Comment | free text for the editor (which place the row is); never read. `tools/fill_comments.py` fills empty ones with the place's name. Appended 2026-10-11 |
 
 Test data generator: `tools/gen_test_wind.py`.
 
@@ -308,6 +309,7 @@ ground moisture (drying) now; later by snow melting and freezing, frost, fog and
 | Humidity | 0 = dry air .. 1 = saturated: humid places dry slowly (later: fog, dust) |
 | Flags | reserved, 0 |
 | Fogginess | 0 .. 1: how foggy the place is by nature; drives area fog, boosts mist. −1 inherits. Appended 2026-10-08 |
+| Comment | free text for the editor (which place the row is); never read. `tools/fill_comments.py` fills empty ones with the place's name. Appended 2026-10-11 |
 
 Lookup: Global < Map < Area (zone) < Area (sub-area); the more specific row wins **field by field**.
 No row at all: 18 °C day, 8 °C night, ±6 °C over the year, humidity 0.5, fogginess 0.
@@ -344,6 +346,7 @@ any field no row sets) the module's built-in values for the kind apply.
 | Saturation | 0 = grey .. 1 = as is (on top of the mode) |
 | Brightness | multiplier |
 | Flags | reserved, 0 |
+| Comment | free text for the editor (which place and kind the row is); never read. `tools/fill_comments.py` fills empty ones ("Duskwood - area fog"). Appended 2026-10-11 |
 
 All floats: −1 takes the field from the next row. Lookup (workspace rule, most specific wins):
 place first -- the area, its parent zones, the map, global -- and within each place the kind's

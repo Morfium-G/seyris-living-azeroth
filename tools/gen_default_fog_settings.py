@@ -4,7 +4,8 @@
 Columns: ID, ScopeType (0 global / 1 map / 2 area), ScopeID (Map or AreaTable ID, 0 for global),
 Kind (0 all kinds, 1 mist, 2 water fog, 3 steam, 4 area fog, 5 haze), then Strength, Density,
 Thickness, BuildUp, BurnOff, WindThin, WindDrift, Patchiness, Weight, ColorMode (0 stock, 1 hue,
-2 replace; -1 inherit), ColorR, ColorG, ColorB, Saturation, Brightness, Flags (0).
+2 replace; -1 inherit), ColorR, ColorG, ColorB, Saturation, Brightness, Flags (0), Comment (free
+text for the editor; never read by the module).
 -1 = take this field from the next, less specific row.
 
 Resolution (orchestration docs/principles.md, "scoped override tables"): place first -- the area,
@@ -32,19 +33,20 @@ STOCK, HUE, REPLACE = 0, 1, 2
 
 def row(id, scope, scope_id=0, kind=ALL, strength=I, density=I, thickness=I, build_up=I, burn_off=I,
         wind_thin=I, wind_drift=I, patchiness=I, weight=I, color_mode=-1, color=(I, I, I),
-        saturation=I, brightness=I, flags=0):
+        saturation=I, brightness=I, flags=0, comment=""):
     return (id, scope, scope_id, kind, strength, density, thickness, build_up, burn_off, wind_thin,
             wind_drift, patchiness, weight, color_mode, color[0], color[1], color[2], saturation,
-            brightness, flags)
+            brightness, flags, comment)
 
 
 DEFAULT_ROWS = []
 
 EXAMPLE_ROWS = [
     # Swamp of Sorrows: its stock fog is a strong orange; keep its brightness, a murky green-grey.
-    row(100, AREA, 8, color_mode=HUE, color=(0.55, 0.60, 0.50), saturation=0.5, strength=1.5),
+    row(100, AREA, 8, color_mode=HUE, color=(0.55, 0.60, 0.50), saturation=0.5, strength=1.5,
+        comment="Swamp of Sorrows: murky green-grey"),
     # Duskwood: cold blue-grey.
-    row(101, AREA, 10, color_mode=HUE, color=(0.60, 0.65, 0.75), saturation=0.6),
+    row(101, AREA, 10, color_mode=HUE, color=(0.60, 0.65, 0.75), saturation=0.6, comment="Duskwood: cold blue-grey"),
 ]
 
 

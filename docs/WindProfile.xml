@@ -14,4 +14,5 @@
     <Field Name="LockedDirection" Type="float" />
     <Field Name="LockStrength" Type="float" />
     <Field Name="Flags" Type="int" />
+    <Field Name="Comment" Type="string" />
   </Table>

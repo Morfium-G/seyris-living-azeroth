@@ -35,8 +35,9 @@ namespace wxl_livingazeroth::fogsettings
             {"Saturation", 17, WXL_CDBC_FIELD_VALUE},
             {"Brightness", 18, WXL_CDBC_FIELD_VALUE},
             {"Flags",      19, WXL_CDBC_FIELD_VALUE},
+            {"Comment",    20, WXL_CDBC_FIELD_STRING}, // appended 2026-10-11: for the editor, not read
         };
-        constexpr WXL_SeyrisCdbcDefinition kDef = { "FogSettings", "DBFilesClient\\FogSettings.cdbc", kFields, 20 };
+        constexpr WXL_SeyrisCdbcDefinition kDef = { "FogSettings", "DBFilesClient\\FogSettings.cdbc", kFields, 21 };
 
         enum Scope : uint32_t { kGlobal = 0, kMap = 1, kArea = 2 };
 
