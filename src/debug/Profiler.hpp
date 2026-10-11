@@ -38,6 +38,9 @@ namespace wxl_livingazeroth::prof
         kOursPost,        // this module: anti-aliasing
         kOursFogField,    // this module: ground fog field update (env/Fog)
         kOursFogDraw,     // this module: ground fog pass
+        kOursFogUpload,   // this module: ground fog textures (field, colour, top map, wake), inside the fog pass
+        kOursFogLights,   // this module: our lights in the fog (per-frame light pass), inside the fog pass
+        kOursCoverUpload, // this module: surface cover textures (fold + upload), inside the cover draw
         kCount
     };
 

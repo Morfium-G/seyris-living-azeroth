@@ -496,15 +496,35 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
             // day), and the "all kinds" colour for cells without fog.
             float kindColor[fog::kKindCount][3], placeColor[3];
             FogColor(-1, placeColor);
-            float signature = SettingsSignature() + placeColor[0] * 17.0f + placeColor[1] * 19.0f + placeColor[2] * 23.0f;
+            // Colours at the colour texture's own precision (stored halved in 8 bits): the stock fog
+            // colour drifts a little every frame with the time of day, and compared exactly it rebuilt
+            // the field every frame (~1.5 ms CPU + ~1 ms GPU of uploads).
+            auto stored = [](float v) { return std::floor(v * 127.5f + 0.5f); };
+            float signature = SettingsSignature() + stored(placeColor[0]) * 17.0f + stored(placeColor[1]) * 19.0f + stored(placeColor[2]) * 23.0f;
             for (int k = 0; k < fog::kKindCount; ++k)
             {
                 FogColor(k, kindColor[k]);
-                signature += (kindColor[k][0] * 29.0f + kindColor[k][1] * 31.0f + kindColor[k][2] * 37.0f) * (k + 1);
+                signature += (stored(kindColor[k][0]) * 29.0f + stored(kindColor[k][1]) * 31.0f + stored(kindColor[k][2]) * 37.0f) * (k + 1);
             }
-            if (grid.version == g_fieldVersion && grid.groundVersion == g_groundVersion && signature == g_fieldSignature &&
-                std::fabs(groundRef - g_groundRef) < 64.0f)
-                return true;
+            const bool sameField = grid.version == g_fieldVersion && grid.groundVersion == g_groundVersion &&
+                                   std::fabs(groundRef - g_groundRef) < 64.0f;
+            if (sameField && signature == g_fieldSignature) return true;
+            // Only the colours changed: the stock fog colour is blended from the light zones by the
+            // camera's position, so it shifts as the camera moves; that alone rebuilds at most twice a
+            // second (it rebuilt every frame while the camera moved, ~2 ms CPU + ~2 ms GPU).
+            // Anything else at most 8 times a second: the field itself steps 4 times a second, and while
+            // walking the ground fills in at the grid's far edge every frame (each batch bumped the
+            // ground version: a full rebuild per frame for cells 128 yd away).
+            static ULONGLONG s_lastColourOnly = 0, s_lastUpload = 0;
+            const ULONGLONG nowMs = GetTickCount64();
+            const bool haveTextures = g_fieldVersion != ~0u;
+            if (haveTextures && nowMs - s_lastUpload < 125) return true;
+            if (sameField)
+            {
+                if (nowMs - s_lastColourOnly < 500) return true;
+                s_lastColourOnly = nowMs;
+            }
+            s_lastUpload = nowMs;
 
             // The fog floor: the light layer starts here, not on each cell's own ground (a layer
             // following every cell drapes up cliffs and walls). The lowest ground within floorReach
@@ -515,7 +535,20 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
             static std::vector<float> base(N * N), low(N * N);
             auto wrap = [](int v) { const int m = v % N; return m < 0 ? m + N : m; };
             auto inGrid = [&](int i, int j) { return i >= grid.firstI && i < grid.firstI + N && j >= grid.firstJ && j < grid.firstJ + N; };
-            for (int pass = 0; pass < 2; ++pass)
+            // Only the ground, the grid's place and the reach change the floor: kept until one does
+            // (it was rebuilt with every field upload, a few times a second).
+            static uint32_t s_floorGround = ~0u;
+            static int s_floorI = 0x7FFFFFFF, s_floorJ = 0, s_floorReach = -1;
+            const bool floorStale = grid.groundVersion != s_floorGround || grid.firstI != s_floorI || grid.firstJ != s_floorJ ||
+                                    g_settings.floorReach != s_floorReach;
+            if (floorStale)
+            {
+                s_floorGround = grid.groundVersion;
+                s_floorI = grid.firstI;
+                s_floorJ = grid.firstJ;
+                s_floorReach = g_settings.floorReach;
+            }
+            for (int pass = 0; floorStale && pass < 2; ++pass)
                 for (int r = 0; r < N; ++r)
                     for (int c = 0; c < N; ++c)
                     {
@@ -984,7 +1017,12 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
             }
 
             const float groundRef = std::floor(invView[14] / 32.0f) * 32.0f;
-            if (!UploadField(dev, groundRef)) { g_inactive = "couldn't upload the fog field"; return; }
+            bool uploaded;
+            {
+                prof::Scope uploads(prof::kOursFogUpload);
+                uploaded = UploadField(dev, groundRef);
+            }
+            if (!uploaded) { g_inactive = "couldn't upload the fog field"; return; }
 
             if (!depth::Refresh(dev)) { g_inactive = "the depth copy failed"; return; }
             auto* depthTex = static_cast<IDirect3DTexture9*>(depth::Texture());
@@ -1027,10 +1065,18 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
             const int steps = g_settings.steps < 4 ? 4 : (g_settings.steps > 128 ? 128 : g_settings.steps);
 
             // Our lights in the fog (nullptr when off or nothing lit).
-            IDirect3DTexture9* lightTex = UploadLights(dev, cam);
+            IDirect3DTexture9* lightTex = nullptr;
+            {
+                prof::Scope lights(prof::kOursFogLights);
+                lightTex = UploadLights(dev, cam);
+            }
 
             // Units pushing the fog: their wake map (nullptr when off or none near).
-            IDirect3DTexture9* wake = fogwake::Texture(dev, g_groundRef);
+            IDirect3DTexture9* wake = nullptr;
+            {
+                prof::Scope uploads(prof::kOursFogUpload);
+                wake = fogwake::Texture(dev, g_groundRef);
+            }
             float wakePlace[3] = {};
             fogwake::Placement(wakePlace);
 

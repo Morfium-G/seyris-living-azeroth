@@ -152,6 +152,9 @@ namespace wxl_livingazeroth::cover
             int   gridI = 0, gridJ = 0;     // world cell index (of this level) of the grid's first vertex
             int   refreshRow = 0;
             bool  baseDirty = true, coverDirty = true;
+            bool  anyCover = true;          // its last cover pass found cover somewhere (else it isn't drawn)
+            int   coverCells = 0;           // cells with cover of their own (depth or painted snow), kept as they're sampled
+            int   snowCells = 0;            // cells where fallen snow could settle (snow share)
             unsigned holes = 0;
             double   fillMs = 0, firstFillMs = 0;
             IDirect3DTexture9* baseTex = nullptr;
@@ -963,6 +966,8 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 breakup != L.breakup[s] || drift != L.drift[s] || edge != L.edgeNoise[s] || stiff != L.stiff[s] ||
                 snowShare != L.snowShare[s] || paintedSnow != L.paintedSnow[s])
             {
+                L.coverCells += ((b.depth > 0.0f || paintedSnow) ? 1 : 0) - ((L.depth[s] > 0.0f || L.paintedSnow[s]) ? 1 : 0);
+                L.snowCells += (snowShare ? 1 : 0) - (L.snowShare[s] ? 1 : 0);
                 L.material[s] = material; L.depth[s] = b.depth; L.slope[s] = slopeF; L.driftAmp[s] = driftAmp;
                 L.breakup[s] = breakup; L.drift[s] = drift; L.edgeNoise[s] = edge; L.stiff[s] = stiff;
                 L.snowShare[s] = snowShare; L.paintedSnow[s] = paintedSnow;
@@ -1392,6 +1397,16 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
 
         bool UploadLevel(Level& L, bool isLevel0)
         {
+            // No cell with cover of its own, and no fallen snow to settle where it could: nothing to fold
+            // or upload. The dirty flags stay, so the textures catch up the moment cover appears (snow
+            // starting re-folds through the snow path). (A recentre marks everything dirty: walking
+            // re-folded and re-uploaded whole empty levels, ~3 ms CPU + ~4 ms GPU.)
+            if (L.coverCells <= 0 && (L.snowCells <= 0 || !fields::SnowActive()))
+            {
+                L.anyCover = false;
+                if (isLevel0) { g_changed.clear(); g_changedPending = false; } // no trenches without cover
+                return true;
+            }
             D3DLOCKED_RECT lr{};
             if (L.baseDirty)
             {
@@ -1441,6 +1456,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 float m = (coverage / 255.0f - 0.5f) * (1.0f + 2.0f * b) + 0.5f + 1.5f * b * (edgeNoise / 255.0f - 0.5f);
                 return m <= 0.0f ? 0.0f : (m >= 1.0f ? 1.0f : m * m * (3.0f - 2.0f * m));
             };
+            bool any = false;
             for (int row = 0; row < kTex; ++row)
             {
                 float* out = reinterpret_cast<float*>(static_cast<uint8_t*>(lr.pBits) + row * lr.Pitch);
@@ -1476,6 +1492,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                         }
                         if (L.snowShare[s] && fallen > 0.0f) cover += fallen * shape(L.snowShare[s], b, L.edgeNoise[s]) * slope * driftF;
                     }
+                    any = any || cover > 0.0f;
                     if (!isLevel0) { out[col] = cover > 0.0f ? cover : 0.0f; continue; }
                     g_static0[s] = cover > 0.0f ? cover : 0.0f;
                     if (cover <= 0.0f) { g_deformK[s] = 0.0f; out[col] = 0.0f; continue; }
@@ -1493,6 +1510,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             }
             L.coverTex->UnlockRect(0);
             L.coverDirty = false;
+            L.anyCover = any;
             L.foldMs = grassperf::Now() - foldStart;
             if (isLevel0) { g_changed.clear(); g_changedPending = false; } // the full pass included them
             return UploadLook(L);
@@ -1517,11 +1535,18 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             if (!graphics || !wxl::game::gfx::SceneMatrices(V, P)) { g_inactive = "no scene matrices"; return; }
             std::memcpy(P, static_cast<const uint8_t*>(graphics) + kDeviceRenderProjection, sizeof(P));
 
-            EnsureCoverTextures(dev);
             double t0 = grassperf::Now();
-            for (int k = 0; k < levels; ++k)
-                if (g_levels[k].haveGrid && !UploadLevel(g_levels[k], k == 0)) { g_inactive = "texture upload failed"; return; }
+            {
+                prof::Scope uploads(prof::kOursCoverUpload);
+                EnsureCoverTextures(dev);
+                for (int k = 0; k < levels; ++k)
+                    if (g_levels[k].haveGrid && !UploadLevel(g_levels[k], k == 0)) { g_inactive = "texture upload failed"; return; }
+            }
             g_uploadMs = grassperf::Now() - t0;
+            // No cover anywhere around (a zone without any, e.g. Duskwood): nothing to draw.
+            bool anyCover = false;
+            for (int k = 0; k < levels; ++k) anyCover = anyCover || (g_levels[k].haveGrid && g_levels[k].anyCover);
+            if (!anyCover) { g_inactive = "no cover around (nothing to draw)"; return; }
             t0 = grassperf::Now();
 
             // Right after the terrain stage its shader constants are still on the device: read them
@@ -1747,7 +1772,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
             for (int k = 0; k < levels; ++k)
             {
                 const Level& L = g_levels[k];
-                if (!L.haveGrid) continue;
+                if (!L.haveGrid || !L.anyCover) continue; // (an empty level still leaves its hole in the coarser one: no cover there either)
                 const bool outermost = k == lastDrawn;
                 dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, L.baseTex);
                 dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, L.coverTex);
@@ -2169,7 +2194,9 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
         }
 
         // New snow values (fallen snow, painted snow melting): one level re-folds its depth per frame.
-        // While there's no snow anywhere and the last fold had none either, there's nothing to redo.
+        // While there's no snow anywhere and the last fold had none either, there's nothing to redo;
+        // nor in a level without a single cell snow can change (its fold would come out the same:
+        // it re-folded every frame in zones without cover, ~2.8 ms CPU + GPU for nothing).
         {
             const uint32_t version = fields::SnowVersion();
             const bool active = fields::SnowActive();
@@ -2178,6 +2205,7 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
                 const int k = (g_snowCursor + n) % levels;
                 Level& L = g_levels[k];
                 if (!L.haveGrid || L.snowVersion == version) continue;
+                if (L.snowCells <= 0 && L.coverCells <= 0) { L.snowVersion = version; continue; } // nothing snow can change here
                 L.snowVersion = version;
                 if (active || L.snowFolded) L.coverDirty = true;
                 L.snowFolded = active;
