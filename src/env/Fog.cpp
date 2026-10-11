@@ -3,6 +3,7 @@
 #include "Climate.hpp"
 #include "Fields.hpp"
 #include "FogSettings.hpp"
+#include "Regional.hpp"
 #include "TerrainHeight.hpp"
 #include "Wind.hpp"
 
@@ -12,6 +13,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <unordered_map>
 #include <vector>
 
 namespace wxl_livingazeroth::fog
@@ -98,11 +101,38 @@ namespace wxl_livingazeroth::fog
         constexpr float kTraceFrom = 40.0f;      // yd above the terrain the ray starts
         constexpr float kMaxPool = 4.0f;         // amounts may pile up to this in hollows (heavy fog)
         std::vector<uint8_t> g_liquid;   // terrain liquid on the cell: 0 none, 1 water/ocean, 2 magma, 3 slime
+        std::vector<uint32_t> g_area;    // the cell's area (its terrain chunk's), 0 = not known: the player's place
         std::vector<uint8_t> g_fresh;    // scrolled in, not started yet (starts from its target x the area's progress)
         // How far the fog around the player has come toward its targets. 1 on a fresh grid (login,
         // teleport, new map): a place you arrive at shows its fog as if the conditions had held.
         float    g_progress[kKindCount] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
         RulesInputs g_inputs;
+        uint32_t    g_playerArea = 0;
+        /// A place's own climate inputs (per area: fogginess, humidity, temperatures) and its kinds'
+        /// Strength from FogSettings; time of day, wind and weather stay the player's (the weather is
+        /// the only one the client knows, and it rains around the player alike). Cached per area,
+        /// cleared with each GatherInputs.
+        struct AreaInputs
+        {
+            uint32_t zone = 0;
+            uint16_t slot = 0;   // its kind settings (g_slots)
+            float airNow = 0.0f, airHourAgo = 0.0f, water = 0.0f, humidity = 0.0f, fogginess = 0.0f, cooling = 0.0f;
+            float strength[kKindCount] = {};
+        };
+        std::unordered_map<uint32_t, AreaInputs> g_areaInputs;
+
+        // Each place's kind settings (its FogSettings rows: density, thickness, weight, rates, wind
+        // thinning, strength), so a cell's fog behaves like its own place's, not the player's. A slot
+        // per area seen this session; a cell keeps its slot number (g_areaSlot). Slot 0 = the
+        // player's place (the panel's g_settings): cells whose area isn't known yet. A kind switched to
+        // the panel's values uses them everywhere. Wind drift stays the player's (the field moves as one).
+        struct AreaSlot { uint32_t area = 0; KindSettings kind[kKindCount]; };
+        std::vector<AreaSlot> g_slots(1);
+        std::unordered_map<uint32_t, uint16_t> g_slotOfArea;
+        std::vector<uint16_t> g_areaSlot; // per cell
+        uint32_t g_slotsGeneration = ~0u;
+        int      g_slotsMap = -2;
+        uint16_t SlotOf(uint32_t area);
         int      g_rulesRow = 0;         // the next grid row the rules evaluate (a quarter per step)
         // After a table reload (AreaClimate, FogSettings): this many rows still jump straight to their
         // new targets as the rules reach them, like a fresh grid (else a changed Fogginess shows only
@@ -146,6 +176,9 @@ namespace wxl_livingazeroth::fog
             g_groundKnown.assign(kGridSize * kGridSize, 0);
             g_block.assign(kGridSize * kGridSize, kUntraced);
             g_liquid.assign(kGridSize * kGridSize, 0);
+            g_area.assign(kGridSize * kGridSize, 0);
+            g_areaSlot.assign(kGridSize * kGridSize, 0);
+            g_grid.area = g_area.data();
             g_fresh.assign(kGridSize * kGridSize, 1);
             g_steep.assign(kGridSize * kGridSize, 0);
             g_slope.assign(kGridSize * kGridSize, 0.0f);
@@ -153,7 +186,7 @@ namespace wxl_livingazeroth::fog
             g_grid.ground = g_ground.data();
             g_grid.groundKnown = g_groundKnown.data();
             g_grid.block = g_block.data();
-            g_stats.kilobytes = static_cast<unsigned>((kKindCount * (2 * sizeof(float) + 1) + 4 * sizeof(float) + 4) * kGridSize * kGridSize / 1024);
+            g_stats.kilobytes = static_cast<unsigned>((kKindCount * (2 * sizeof(float) + 1) + 4 * sizeof(float) + sizeof(uint32_t) + 4) * kGridSize * kGridSize / 1024);
         }
 
         void ForgetGround(int index)
@@ -162,6 +195,8 @@ namespace wxl_livingazeroth::fog
             g_ground[index] = g_terrain[index] = g_groundFallback;
             g_block[index] = kUntraced;
             g_liquid[index] = 0;
+            g_area[index] = 0;
+            g_areaSlot[index] = 0;
             g_steep[index] = 0;
             g_slope[index] = 0.0f;
             g_fresh[index] = 1;
@@ -223,6 +258,9 @@ namespace wxl_livingazeroth::fog
                     }
                 }
                 g_ground[index] = g_terrain[index] = z;
+                uint32_t area = 0;
+                g_area[index] = terrain::ChunkAreaAt(x, y, area) ? area : 0;
+                g_areaSlot[index] = SlotOf(g_area[index]);
                 g_groundKnown[index] = 1;
                 g_block[index] = kUntraced;
                 changed = true;
@@ -326,7 +364,9 @@ namespace wxl_livingazeroth::fog
         {
             RulesInputs in;
             const uint32_t area = snap.areaCount > 0 ? snap.areaChain[0] : 0;
-            const climate::Row& row = climate::For(area, snap.mapId);
+            g_playerArea = area;
+            g_areaInputs.clear(); // each place's inputs, computed again as the rules ask for them
+            const climate::Row row = climate::At(snap.playerPos[0], snap.playerPos[1]); // blended across borders
             in.airNow = climate::Temperature(row).total;
             in.airHourAgo = climate::TemperatureAtTime(row, climate::Now().dayFraction - 1.0f / 24.0f).total;
             in.water = climate::WaterTemperature(row);
@@ -349,11 +389,165 @@ namespace wxl_livingazeroth::fog
             g_inputs = in;
         }
 
-        /// How calm it is for a kind: 1 still air .. 0 at its WindThin and above.
-        float Calm(int kind)
+        /// One slot's kind settings: the place's FogSettings rows over the built-in values, except
+        /// kinds on the panel's values (those everywhere); on/off is always the panel's.
+        void ResolveSlot(AreaSlot& s)
         {
-            const float thin = g_settings[kind].windThin;
-            return thin <= 0.0f ? 0.0f : Clamp01(1.0f - g_inputs.wind / thin);
+            for (int k = 0; k < kKindCount; ++k)
+            {
+                if (g_settings[k].panelOverride || !s.area) { s.kind[k] = g_settings[k]; continue; }
+                s.kind[k] = MakeDefaults(k);
+                Apply(s.kind[k], fogsettings::Resolve(s.area, g_map, k));
+                s.kind[k].enabled = g_settings[k].enabled;
+            }
+        }
+
+        /// A place's slot (added on first use; 0 for an unknown area).
+        uint16_t SlotOf(uint32_t area)
+        {
+            if (!area) return 0;
+            auto found = g_slotOfArea.find(area);
+            if (found != g_slotOfArea.end()) return found->second;
+            if (g_slots.size() >= 0xFFFF) return 0;
+            AreaSlot s;
+            s.area = area;
+            ResolveSlot(s);
+            g_slots.push_back(s);
+            const uint16_t slot = static_cast<uint16_t>(g_slots.size() - 1);
+            g_slotOfArea.emplace(area, slot);
+            return slot;
+        }
+
+        /// Each field tick: slot 0 follows the player's place; every slot re-resolves when the table
+        /// is reloaded, a panel value changes or the map changes (cheap: compares a signature).
+        void RefreshSlots()
+        {
+            g_slots[0].area = 0;
+            for (int k = 0; k < kKindCount; ++k) g_slots[0].kind[k] = g_settings[k];
+            uint32_t signature = fogsettings::Generation() * 2654435761u;
+            for (int k = 0; k < kKindCount; ++k)
+            {
+                const KindSettings& p = g_settings[k];
+                if (!p.panelOverride && p.enabled) continue;
+                const float v[] = { p.strength, p.buildUpSeconds, p.burnOffSeconds, p.thickness, p.density, p.windThin, p.weight };
+                for (float f : v) { uint32_t b; std::memcpy(&b, &f, 4); signature = (signature ^ b) * 16777619u; }
+                signature = (signature ^ static_cast<uint32_t>(k * 7 + p.enabled * 3 + p.panelOverride)) * 16777619u;
+            }
+            if (signature == g_slotsGeneration && g_map == g_slotsMap) return;
+            // (Area IDs are global, only map rows depend on the map: a new map re-resolves, too.)
+            g_slotsGeneration = signature;
+            g_slotsMap = g_map;
+            for (size_t s = 1; s < g_slots.size(); ++s) ResolveSlot(g_slots[s]);
+        }
+
+        const KindSettings& CellSettings(int kind, int index) { return g_slots[g_areaSlot[index]].kind[kind]; }
+
+        /// How calm it is for a kind at a place: 1 still air .. 0 at its WindThin and above.
+        float CalmFor(const KindSettings& s)
+        {
+            return s.windThin <= 0.0f ? 0.0f : Clamp01(1.0f - g_inputs.wind / s.windThin);
+        }
+
+        /// The climate parts of a place's inputs, from a climate row.
+        void SetClimate(AreaInputs& a, const climate::Row& row)
+        {
+            a.airNow = climate::Temperature(row).total;
+            a.airHourAgo = climate::TemperatureAtTime(row, climate::Now().dayFraction - 1.0f / 24.0f).total;
+            a.water = climate::WaterTemperature(row);
+            a.humidity = row.humidity;
+            a.fogginess = row.fogginess;
+            a.cooling = Clamp01((a.airHourAgo - a.airNow) / 2.5f);
+        }
+
+        /// A place's inputs (see AreaInputs), cached per area until the next GatherInputs.
+        const AreaInputs& InputsFor(uint32_t area)
+        {
+            auto found = g_areaInputs.find(area);
+            if (found != g_areaInputs.end()) return found->second;
+            AreaInputs a;
+            SetClimate(a, climate::For(area, g_map)); // the area's own row: zones' typical fog (cells use At)
+            a.zone = area ? regional::ZoneOf(area) : 0;
+            a.slot = SlotOf(area);
+            for (int k = 0; k < kKindCount; ++k) a.strength[k] = g_slots[a.slot].kind[k].strength;
+            return g_areaInputs.emplace(area, a).first->second;
+        }
+
+        // --- each zone's typical fog (the memory; design doc "Phase 3 step 5") ---
+        // Kinds that are zone-wide by nature; water fog and steam need water or heat detail.
+        constexpr bool kZoneWide[kKindCount] = { true, false, false, true, true };
+        constexpr float kAverageHollow = 0.33f; // the average-ground factor for mist in a zone
+        struct ZoneFog
+        {
+            int      map = -1;
+            uint32_t zone = 0;
+            float    amount[kKindCount] = {};
+            float    target[kKindCount] = {};
+            bool     started = false;
+            double   lastInRange = 0.0;
+        };
+        std::vector<ZoneFog> g_zoneFog;
+
+        /// A zone's targets for the zone-wide kinds (an ordinary open spot there).
+        void ZoneTargets(uint32_t zone, float out[kKindCount])
+        {
+            for (int k = 0; k < kKindCount; ++k) out[k] = 0.0f;
+            const AreaInputs& a = InputsFor(zone);
+            const RulesInputs& in = g_inputs;
+            auto Calm = [&](int k) { return CalmFor(g_slots[a.slot].kind[k]); }; // the zone's own WindThin
+            const float wet = Clamp01(regional::RainSoak(g_map, zone));
+            const float humid = Clamp01(Smooth(0.4f, 0.95f, a.humidity) + 0.5f * wet);
+            const float still = std::fmax(a.cooling, 0.7f * in.night);
+            out[kMist] = humid * still * Calm(kMist) * (0.4f + 0.6f * kAverageHollow) * (1.0f + 0.5f * a.fogginess);
+            out[kAreaFog] = a.fogginess * (0.6f + 0.4f * in.night) * Calm(kAreaFog);
+            out[kHaze] = zone == regional::PlayerZone() ? (0.8f * in.rain + 0.4f * in.snow) * Calm(kHaze) : 0.0f; // others: weather unknown
+            for (int k = 0; k < kKindCount; ++k)
+                out[k] = g_settings[k].enabled && kZoneWide[k] ? Clamp01(out[k] * a.strength[k]) : 0.0f;
+        }
+
+        /// Every zone on the zone map (±1 km) and the player's: started at its target when it first
+        /// comes into range (it's far away then: nothing jumps), then toward its target at the kinds'
+        /// rates, also while out of range (session only).
+        void StepZones(float dt)
+        {
+            const regional::ZoneMap& map = regional::Map();
+            uint32_t seen[32];
+            int count = 0;
+            auto note = [&](uint32_t z) {
+                if (!z || count >= 32) return;
+                for (int n = 0; n < count; ++n) if (seen[n] == z) return;
+                seen[count++] = z;
+            };
+            note(regional::PlayerZone());
+            if (map.zone)
+                for (int n = 0; n < map.size * map.size; ++n) note(map.zone[n]);
+            const double now = regional::Now();
+            for (int n = 0; n < count; ++n)
+            {
+                ZoneFog* z = nullptr;
+                for (ZoneFog& f : g_zoneFog) if (f.map == g_map && f.zone == seen[n]) { z = &f; break; }
+                if (!z) { g_zoneFog.push_back(ZoneFog{}); z = &g_zoneFog.back(); z->map = g_map; z->zone = seen[n]; }
+                z->lastInRange = now;
+            }
+            for (ZoneFog& z : g_zoneFog)
+            {
+                if (z.map != g_map) continue;
+                ZoneTargets(z.zone, z.target);
+                for (int k = 0; k < kKindCount; ++k)
+                {
+                    if (!z.started) { z.amount[k] = z.target[k]; continue; }
+                    const KindSettings& s = g_slots[SlotOf(z.zone)].kind[k]; // the zone's own rates
+                    const float up = 1.0f - std::exp2(-dt / (s.buildUpSeconds > 0.1f ? s.buildUpSeconds : 0.1f));
+                    const float down = 1.0f - std::exp2(-dt / (s.burnOffSeconds > 0.1f ? s.burnOffSeconds : 0.1f));
+                    z.amount[k] += (z.target[k] - z.amount[k]) * (z.target[k] > z.amount[k] ? up : down);
+                }
+                z.started = true;
+            }
+        }
+
+        const ZoneFog* FindZoneFog(uint32_t zone)
+        {
+            for (const ZoneFog& z : g_zoneFog) if (z.map == g_map && z.zone == zone) return &z;
+            return nullptr;
         }
 
         /// Fresh wetness of world cell (i, j): the ground moisture above its material's rest (0..1),
@@ -386,9 +580,15 @@ namespace wxl_livingazeroth::fog
                 for (int k = 0; k < kKindCount; ++k) { note(k, "under/in a WMO structure", 1.0f, 0.0f); if (explain) explain[k].target = 0.0f; }
                 return;
             }
+            // The cell's own place (its chunk's area; the player's while not known yet): its kind
+            // settings and Strength. Its climate is the blended one at the cell (climate::At), so a
+            // border's change in temperature, humidity and fogginess spreads over ~100 yd.
             const float z = g_ground[index];
             const float pos[3] = { (i + 0.5f) * kCellSize, (j + 0.5f) * kCellSize, z + 0.5f };
-            float wet = 0.0f, groundTemp = g_inputs.airNow;
+            AreaInputs a = InputsFor(g_area[index] ? g_area[index] : g_playerArea);
+            SetClimate(a, climate::At(pos[0], pos[1]));
+            auto Calm = [&](int k) { return CalmFor(g_slots[a.slot].kind[k]); }; // the place's own WindThin
+            float wet = 0.0f, groundTemp = a.airNow;
             if (g_fieldMoisture >= 0) fields::Sample(g_fieldMoisture, pos, wet);
             if (g_fieldTemperature >= 0) fields::Sample(g_fieldTemperature, pos, groundTemp);
 
@@ -422,25 +622,25 @@ namespace wxl_livingazeroth::fog
                             if (g_liquid[Index(ni, nj)] == 1) { shore = 1.0f - r / 4.0f; break; }
                         }
 
-            const RulesInputs& in = g_inputs;
+            const RulesInputs& in = g_inputs; // the player's: time of day, wind, weather
             // Mist: humid air or wet ground, air cooling (or simply night), calm; pools in low ground.
-            const float humid = Clamp01(Smooth(0.4f, 0.95f, in.humidity) + 0.5f * wet);
-            const float still = std::fmax(in.cooling, 0.7f * in.night);
-            out[kMist] = humid * still * Calm(kMist) * (0.4f + 0.6f * hollow) * (1.0f + 0.5f * in.fogginess);
-            note(kMist, "humid air / wet ground (humidity)", in.humidity, humid);
+            const float humid = Clamp01(Smooth(0.4f, 0.95f, a.humidity) + 0.5f * wet);
+            const float still = std::fmax(a.cooling, 0.7f * in.night);
+            out[kMist] = humid * still * Calm(kMist) * (0.4f + 0.6f * hollow) * (1.0f + 0.5f * a.fogginess);
+            note(kMist, "humid air / wet ground (humidity)", a.humidity, humid);
             note(kMist, "  ... ground wetness", wet, -1.0f);
-            note(kMist, "cooling or night (cooling)", in.cooling, still);
+            note(kMist, "cooling or night (cooling)", a.cooling, still);
             note(kMist, "  ... night", in.night, -1.0f);
             note(kMist, "calm (wind)", in.wind, Calm(kMist));
             note(kMist, "low ground (hollow, 1 = 3 yd below)", hollow, 0.4f + 0.6f * hollow);
-            note(kMist, "the place's fogginess", in.fogginess, 1.0f + 0.5f * in.fogginess);
+            note(kMist, "the place's fogginess", a.fogginess, 1.0f + 0.5f * a.fogginess);
             // Water fog: over water and its shore, the water warmer than the air.
-            const float waterWarmer = Smooth(1.0f, 8.0f, in.water - in.airNow);
-            out[kWaterFog] = shore * waterWarmer * Calm(kWaterFog) * (0.5f + 0.5f * in.humidity);
+            const float waterWarmer = Smooth(1.0f, 8.0f, a.water - a.airNow);
+            out[kWaterFog] = shore * waterWarmer * Calm(kWaterFog) * (0.5f + 0.5f * a.humidity);
             note(kWaterFog, "water here / shore (1 on water)", shore, shore);
-            note(kWaterFog, "water warmer than air (degC)", in.water - in.airNow, waterWarmer);
+            note(kWaterFog, "water warmer than air (degC)", a.water - a.airNow, waterWarmer);
             note(kWaterFog, "calm (wind)", in.wind, Calm(kWaterFog));
-            note(kWaterFog, "humidity", in.humidity, 0.5f + 0.5f * in.humidity);
+            note(kWaterFog, "humidity", a.humidity, 0.5f + 0.5f * a.humidity);
             // Steam: rain or snow on hot ground or magma; hot water steams anyway; and drying ground:
             // fresh wetness (moisture above the ground's rest: recent rain, melt water) steams where
             // the ground is clearly warmer than the air (warm wet ground under cooler air: day or
@@ -448,18 +648,18 @@ namespace wxl_livingazeroth::fog
             const float hot = std::fmax(Smooth(35.0f, 80.0f, groundTemp), liquid == 2 ? 1.0f : 0.0f);
             const float hotSpring = liquid == 1 ? Smooth(35.0f, 60.0f, groundTemp) : 0.0f;
             const float sunWisps = Smooth(12.0f, 30.0f, groundTemp) * (1.0f - in.night) * (1.0f - in.precipitation);
-            const float warmer = Smooth(2.0f, 15.0f, groundTemp - in.airNow) * (1.0f - 0.5f * in.precipitation);
+            const float warmer = Smooth(2.0f, 15.0f, groundTemp - a.airNow) * (1.0f - 0.5f * in.precipitation);
             const float drying = 0.5f * ExcessAt(i, j) * std::fmax(sunWisps, warmer);
             out[kSteam] = std::fmax(std::fmax(in.precipitation * hot, hotSpring), drying) * Calm(kSteam);
             note(kSteam, "rain/snow on hot ground (ground degC)", groundTemp, in.precipitation * hot, true);
             note(kSteam, "hot spring (water, ground degC)", groundTemp, hotSpring, true);
             note(kSteam, "wet ground drying (moisture above rest)", ExcessAt(i, j), drying, true);
-            note(kSteam, "  ... warmer than the air (degC)", groundTemp - in.airNow, warmer);
+            note(kSteam, "  ... warmer than the air (degC)", groundTemp - a.airNow, warmer);
             note(kSteam, "  ... sun wisps (ground degC)", groundTemp, sunWisps);
             note(kSteam, "calm (wind)", in.wind, Calm(kSteam));
             // Area fog: the place's own fogginess, more at night.
-            out[kAreaFog] = in.fogginess * (0.6f + 0.4f * in.night) * Calm(kAreaFog);
-            note(kAreaFog, "the place's fogginess (AreaClimate)", in.fogginess, in.fogginess);
+            out[kAreaFog] = a.fogginess * (0.6f + 0.4f * in.night) * Calm(kAreaFog);
+            note(kAreaFog, "the place's fogginess (AreaClimate)", a.fogginess, a.fogginess);
             note(kAreaFog, "time of day (night)", in.night, 0.6f + 0.4f * in.night);
             note(kAreaFog, "calm (wind)", in.wind, Calm(kAreaFog));
             // Haze: rain (snow less).
@@ -468,11 +668,20 @@ namespace wxl_livingazeroth::fog
             note(kHaze, "  ... snow", in.snow, -1.0f);
             note(kHaze, "calm (wind)", in.wind, Calm(kHaze));
 
+            // Steep ground (SteepStart .. SteepFull): fog doesn't hang there, the ground-hugging kinds
+            // don't form (water fog and steam hang at their source's height instead).
+            const float clearOfSteep = 1.0f - g_steep[index] / 255.0f;
+            for (int k = 0; k < kKindCount; ++k)
+                if (!kAnchored[k])
+                {
+                    note(k, "steep ground (slope degrees)", g_slope[index], clearOfSteep);
+                    out[k] *= clearOfSteep;
+                }
             for (int k = 0; k < kKindCount; ++k)
             {
-                note(k, g_settings[k].enabled ? "Strength (FogSettings)" : "kind switched off", g_settings[k].strength,
-                     g_settings[k].enabled ? g_settings[k].strength : 0.0f);
-                out[k] = g_settings[k].enabled ? Clamp01(out[k] * g_settings[k].strength) : 0.0f;
+                note(k, g_settings[k].enabled ? "Strength (FogSettings, this place)" : "kind switched off", a.strength[k],
+                     g_settings[k].enabled ? a.strength[k] : 0.0f);
+                out[k] = g_settings[k].enabled ? Clamp01(out[k] * a.strength[k]) : 0.0f;
                 if (explain) explain[k].target = out[k];
             }
         }
@@ -523,11 +732,14 @@ namespace wxl_livingazeroth::fog
                             g_pool[k][index] = weight * t[k];
                             if (kAnchored[k]) g_floor[k][index] = g_ground[index];
                         }
-                        // A cell that just scrolled in starts where the fog around the player has got.
+                        // A cell that just scrolled in starts at its zone's typical fog (the zone-wide
+                        // kinds: walking toward a foggy zone finds its fog there), else where the fog
+                        // around the player has got; then it follows its own rules.
                         else if (g_fresh[index])
                         {
                             const float before = g_amount[k][index];
-                            g_amount[k][index] = std::fmax(before, t[k] * g_progress[k]);
+                            const ZoneFog* zone = kZoneWide[k] ? FindZoneFog(InputsFor(g_area[index] ? g_area[index] : g_playerArea).zone) : nullptr;
+                            g_amount[k][index] = std::fmax(before, zone && zone->started ? zone->amount[k] : t[k] * g_progress[k]);
                             g_pool[k][index] = std::fmax(g_pool[k][index], weight * g_amount[k][index]);
                             AddFrom(k, index, before, g_amount[k][index], g_ground[index]);
                         }
@@ -618,7 +830,7 @@ namespace wxl_livingazeroth::fog
             for (int n = 0; n < kGridSize * kGridSize; ++n)
             {
                 float d = 0.0f;
-                for (int k = 0; k < kKindCount; ++k) d += g_pool[k][n] * g_settings[k].thickness;
+                for (int k = 0; k < kKindCount; ++k) d += g_pool[k][n] * CellSettings(k, n).thickness;
                 depth[n] = d;
             }
             const float rate = std::fmin(1.0f, dt * g_field.poolSpeed); // share of a surface difference that evens out per second
@@ -648,7 +860,7 @@ namespace wxl_livingazeroth::fog
                         const float moved = out[d] * scale; // yd of heavy depth
                         for (int k = 0; k < kKindCount; ++k)
                         {
-                            const KindSettings& s = g_settings[k];
+                            const KindSettings& s = CellSettings(k, c); // the source cell's place
                             if (g_pool[k][c] <= 0.0f || s.thickness <= 0.0f) continue;
                             const float share = g_pool[k][c] * s.thickness / depth[c];
                             const float amount = moved * share / s.thickness;
@@ -686,11 +898,18 @@ namespace wxl_livingazeroth::fog
             Flow(dt);
             for (int k = 0; k < kKindCount; ++k) poolFlow[k] = player ? g_pool[k][pIndex] : 0.0f;
             bool changed = false;
+            // Each place's build-up and burn-off rates for this step (per slot, so the cells look theirs up).
+            static std::vector<float> upOf, downOf;
+            upOf.resize(g_slots.size());
+            downOf.resize(g_slots.size());
             for (int k = 0; k < kKindCount; ++k)
             {
-                const KindSettings& s = g_settings[k];
-                const float up = 1.0f - std::exp2(-dt / (s.buildUpSeconds > 0.1f ? s.buildUpSeconds : 0.1f));
-                const float down = 1.0f - std::exp2(-dt / (s.burnOffSeconds > 0.1f ? s.burnOffSeconds : 0.1f));
+                for (size_t sl = 0; sl < g_slots.size(); ++sl)
+                {
+                    const KindSettings& s = g_slots[sl].kind[k];
+                    upOf[sl] = 1.0f - std::exp2(-dt / (s.buildUpSeconds > 0.1f ? s.buildUpSeconds : 0.1f));
+                    downOf[sl] = 1.0f - std::exp2(-dt / (s.burnOffSeconds > 0.1f ? s.burnOffSeconds : 0.1f));
+                }
                 float most = 0.0f, sumAmount = 0.0f, sumTarget = 0.0f;
                 unsigned cells = 0;
                 const uint8_t* target = g_target[k].data();
@@ -701,7 +920,8 @@ namespace wxl_livingazeroth::fog
                     const float t = target[n] * (1.0f / 255.0f);
                     if (a == 0.0f && t == 0.0f) continue;
                     const float before = a;
-                    a += (t - a) * (t > a ? up : down);
+                    const uint16_t sl = g_areaSlot[n];
+                    a += (t - a) * (t > a ? upOf[sl] : downOf[sl]);
                     if (a < kGone && t == 0.0f) a = 0.0f;
                     amount[n] = a;
                     AddFrom(k, n, before, a, g_ground[n]); // forming here: from this cell's surface
@@ -723,7 +943,8 @@ namespace wxl_livingazeroth::fog
                     float p = pool[n];
                     const float t = HeavyShare(k, n) * amount[n];
                     if (p == 0.0f && t == 0.0f) continue;
-                    p += (t - p) * (t > p ? up : down);
+                    const uint16_t sl = g_areaSlot[n];
+                    p += (t - p) * (t > p ? upOf[sl] : downOf[sl]);
                     if (p < kGone && t == 0.0f) p = 0.0f;
                     pool[n] = p;
                     if (p > mostPool) mostPool = p;
@@ -791,12 +1012,49 @@ namespace wxl_livingazeroth::fog
     const Explanation& Explain(int kind) { return g_explain[kind >= 0 && kind < kKindCount ? kind : 0]; }
     FieldSettings& Field() { return g_field; }
 
+    unsigned ZoneStates(ZoneState* out, unsigned max)
+    {
+        unsigned n = 0;
+        const double now = regional::Now();
+        for (const ZoneFog& z : g_zoneFog)
+        {
+            if (z.map != g_map || n >= max) continue;
+            ZoneState& s = out[n++];
+            s.zone = z.zone;
+            for (int k = 0; k < kKindCount; ++k) { s.amount[k] = z.amount[k]; s.target[k] = z.target[k]; }
+            s.inRange = now - z.lastInRange < 1.0;
+        }
+        return n;
+    }
+
+    float ZoneAmount(uint32_t zone, int kind)
+    {
+        const ZoneFog* z = FindZoneFog(zone);
+        return z && z->started && kind >= 0 && kind < kKindCount ? z->amount[kind] : 0.0f;
+    }
+
+    bool ZoneWide(int kind) { return kind >= 0 && kind < kKindCount && kZoneWide[kind]; }
+
+    const KindSettings& SettingsAt(int kind, int index)
+    {
+        if (kind < 0 || kind >= kKindCount) kind = 0;
+        return g_areaSlot.empty() ? g_settings[kind] : CellSettings(kind, index);
+    }
+
+    const KindSettings& SettingsOfArea(int kind, uint32_t area)
+    {
+        if (kind < 0 || kind >= kKindCount) kind = 0;
+        return g_slots[SlotOf(area)].kind[kind];
+    }
+
     float HeavyShare(int kind, int index)
     {
-        const float weight = g_settings[kind].weight;
-        if (kAnchored[kind] || g_steep.empty()) return weight;
-        return weight + (1.0f - weight) * (g_steep[index] / 255.0f);
+        // Just the place's Weight: steep ground now keeps fog from forming (CellTargets). Turning its
+        // light share heavy there formed thin pools on cliffs faster than they drained, drawn as flat
+        // slices per cell: contour stripes and flickering rings (owner-confirmed 2026-10-11).
+        return SettingsAt(kind, index).weight;
     }
+
     float Progress(int kind) { return kind >= 0 && kind < kKindCount ? g_progress[kind] : 0.0f; }
 
     float TargetAt(int kind, float x, float y)
@@ -820,6 +1078,7 @@ namespace wxl_livingazeroth::fog
             {
                 g_reseedRows = kGridSize;
                 for (int k = 0; k < kKindCount; ++k) g_progress[k] = 1.0f;
+                for (ZoneFog& z : g_zoneFog) z.started = false; // the zones start over at their new targets too
             }
             g_seenClimate = climate::Generation();
             g_seenFogSettings = fogsettings::Generation();
@@ -839,7 +1098,9 @@ namespace wxl_livingazeroth::fog
         if (g_paused) return;
 
         const double t0 = grassperf::Now();
+        RefreshSlots();
         GatherInputs(snap);
+        StepZones(step);
         RulesPass();
         Step(step);
         g_stats.tickMs = grassperf::Now() - t0;

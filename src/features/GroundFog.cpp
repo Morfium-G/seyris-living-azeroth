@@ -4,10 +4,12 @@
 #include "../env/Fog.hpp"
 #include "../env/FogSettings.hpp"
 #include "../env/Lights.hpp"
+#include "../env/Regional.hpp"
 #include "../env/TerrainHeight.hpp"
 #include "../env/WorldQuery.hpp"
 #include "../render/GxState.hpp"
 #include "../render/SceneDepth.hpp"
+#include "FogFar.hpp"
 #include "FogWake.hpp"
 #include "GrassPerf.hpp"
 
@@ -22,6 +24,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 namespace wxl_livingazeroth::groundfog
@@ -114,6 +117,9 @@ sampler2D lightTex : register(s6);   // our lights' light reaching the fog per f
 sampler2D wakeTex : register(s5);   // units pushing the fog (features/FogWake): r = push (< 0 at the rim), g = its top z - cCam.w, ba = pattern displacement (yd)
 float4 cWake   : register(c15); // xy = the wake map's origin (world), z = 1 / its extent (yd), w = on
 float4 cHalf   : register(c16); // xy = uv shift onto full-resolution texel centres (half resolution; 0 at full)
+float4 cFar    : register(c18); // the far map (features/FogFar): xy = its window's corner (world), z = 1 / its extent (yd), w = on
+sampler2D farTex      : register(s8); // r density per yd, g thickness, b ground - cCam.w, a top - cCam.w (block + neighbours); wraps
+sampler2D farColorTex : register(s9); // rgb colour / 2
 
 // The wake at a step (its middle pm, height zm): how much of the fog stays (the push reaches up to
 // the unit's height, softly), and the patch pattern's displacement there.
@@ -146,31 +152,60 @@ float PoolAverage(float S, float za, float zb, float s)
     return (RampIntegral(ua) - RampIntegral(ub)) / (ua - ub);
 }
 
-// The field and the colour texture at a point (xy), our lights' light reaching the fog there (added to
-// the colour), and the fade at the field's edge.
-float4 SampleField(float2 xy, out float4 col, out float edge)
+// The fog at a point (xy): the near field (+ its colour, with our lights' light added, and the fade
+// at its edge) and, where that fades out, the far map (each zone's typical fog per terrain chunk).
+struct FogSample
 {
+    float4 f;      // near field (fieldTex)
+    float4 col;    // near colour (rgb, light added), a = the pool mask
+    float  edge;   // 1 inside the near field .. 0 past its edge
+    float4 far;    // far map: r density, g thickness, b ground - ref, a top - ref
+    float3 farCol;
+};
+
+FogSample SampleField(float2 xy)
+{
+    FogSample s;
     float4 uvw = float4(xy * cGrid.x, 0, 0);
-    col = tex2Dlod(colorTex, uvw);
-    col.rgb = col.rgb * 2;
-    if (cColor.x > 0.5) col.rgb += tex2Dlod(lightTex, uvw).rgb;
-    edge = saturate(min(min(xy.x - cBox.x, cBox.z - xy.x), min(xy.y - cBox.y, cBox.w - xy.y)) * cNoise2.y);
-    return tex2Dlod(fieldTex, uvw);
+    s.col = tex2Dlod(colorTex, uvw);
+    s.col.rgb = s.col.rgb * 2;
+    if (cColor.x > 0.5) s.col.rgb += tex2Dlod(lightTex, uvw).rgb;
+    s.edge = saturate(min(min(xy.x - cBox.x, cBox.z - xy.x), min(xy.y - cBox.y, cBox.w - xy.y)) * cNoise2.y);
+    s.f = tex2Dlod(fieldTex, uvw);
+    s.far = float4(0, 1, 0, 0);
+    s.farCol = 0;
+    [branch] if (cFar.w > 0.5 && s.edge < 1)
+    {
+        float4 fu = float4(xy * cFar.z, 0, 0);   // wraps like the zone map
+        s.far = tex2Dlod(farTex, fu);
+        s.farCol = tex2Dlod(farColorTex, fu).rgb * 2;
+        float2 rel = (xy - cFar.xy) * cFar.z;    // outside the map's window: nothing
+        if (rel.x < 0 || rel.y < 0 || rel.x > 1 || rel.y > 1) s.far.r = 0;
+    }
+    return s;
 }
 
 // Extinction per yd, averaged over the step's height range [za, zb], with the field read at one
-// point. Light layer: falls off above the ground. Heavy fog: everything below the pool's flat
-// surface f.a (the terrain hides what's under it), with a soft top, gated by the pool mask (an
-// empty cell's level, just under its ground, only kept fog off the banks where the field's ground
-// matched the drawn surface; elsewhere, ungated, empty cells filled with fog).
-float Sigma(float4 f, float poolMask, float edge, float za, float zb)
+// point: x near, y far. Light layer: falls off above the ground. Heavy fog: everything below the
+// pool's flat surface f.a (the terrain hides what's under it), with a soft top, gated by the pool
+// mask (an empty cell's level, just under its ground, only kept fog off the banks where the field's
+// ground matched the drawn surface; elsewhere, ungated, empty cells filled with fog). Far: the
+// zones' typical light layer on each chunk's lowest ground, where the near field fades out.
+float2 Sigma(FogSample s, float za, float zb)
 {
-    float light = f.r * LightAverage(f.b + cCam.w, max(f.g, 0.25), za, zb);
-    float pool = cPool.x * PoolAverage(f.a + cCam.w, za, zb, cPool.y);
-    if (cPool.w > 0.5) pool *= poolMask;
+    float light = s.f.r * LightAverage(s.f.b + cCam.w, max(s.f.g, 0.25), za, zb);
+    float pool = cPool.x * PoolAverage(s.f.a + cCam.w, za, zb, cPool.y);
+    if (cPool.w > 0.5) pool *= s.col.a;
+    float far = s.far.r * LightAverage(s.far.b + cCam.w, max(s.far.g, 0.25), za, zb);
     if (cView.x > 0.5 && cView.x < 1.5) pool = 0;
-    if (cView.x > 1.5 && cView.x < 2.5) light = 0;
-    return (light + pool) * edge;
+    if (cView.x > 1.5 && cView.x < 2.5) { light = 0; far = 0; }
+    return float2((light + pool) * s.edge, far * (1 - s.edge));
+}
+
+// A sample's colour: near and far by their share of its fog.
+float3 SampleColour(FogSample s, float2 sigma)
+{
+    return (sigma.x * s.col.rgb + sigma.y * s.farCol) / max(sigma.x + sigma.y, 1e-6);
 }
 
 // `stepLen`: a step much longer than a patch (~1/8 of the tile) averages over many of them, so the
@@ -254,63 +289,69 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
     float t = t0;
     float T = 1;
     float3 scatter = 0;
-    // The field at the step's start, carried over from the previous step's end (each step reads the
-    // field at both ends and averages them: one reading per step, edges follow smoothly instead of
-    // the bands one reading in the middle gave).
-    bool haveStart = false;
-    float4 fA = 0, cA = 0;
-    float edgeA = 0;
+    // Each step reads the field at both ends and averages them (edges follow smoothly instead of the
+    // bands one reading in the middle gave). Every iteration samples once, at its own point, and
+    // closes the step from the previous point with it: one sampling in the code (it's large: near
+    // field, far map), the previous reading carried over. A jump through air breaks the chain.
+    bool havePrev = false;
+    FogSample P = (FogSample)0;
+    float tPrev = 0, zPrev = 0;
+    bool fresh = false;
     [loop] for (int i = 0; i < 128; ++i)
     {
-        if (i >= budget || t >= t1 || T < 0.005) break;
+        if (i >= budget || T < 0.005) break;
         float3 p = cCam.xyz + dir * t;
-        float top = tex2Dlod(topTex, float4(p.xy * cGrid.x, 0, 0)).r + cCam.w;
+        // The fog's top here: the near top map inside the near field, the far map's where that fades
+        // out (both hold the highest top among a block and its neighbours).
+        float box = saturate(min(min(p.x - cBox.x, cBox.z - p.x), min(p.y - cBox.y, cBox.w - p.y)) * cNoise2.y);
+        float top = box > 0 ? tex2Dlod(topTex, float4(p.xy * cGrid.x, 0, 0)).r + cCam.w : -1e5;
+        if (cFar.w > 0.5 && box < 1) top = max(top, tex2Dlod(farTex, float4(p.xy * cFar.z, 0, 0)).a + cCam.w);
         float gap = p.z - top;
-        [branch] if (gap > 0)
+        bool above = gap > 0;
+        // Above the fog here, and nothing to close: on to where the ray reaches the top, at most one
+        // block on (the top maps' neighbours cover that far).
+        float jump = cView.z / horizontal;
+        if (dir.z < -1e-4) jump = min(jump, gap / -dir.z);
+        jump = max(jump, 0.05);
+        [branch] if (above && !havePrev)
         {
-            // Above the fog here: on to where the ray reaches the top, at most one block on (the
-            // top map's neighbours cover that far).
-            float jump = cView.z / horizontal;
-            if (dir.z < -1e-4) jump = min(jump, gap / -dir.z);
-            t += max(jump, 0.05);
-            haveStart = false;
+            if (t >= t1) break;
+            t = min(t + jump, t1);
             continue;
         }
+
+        FogSample S = SampleField(p.xy);
+        [branch] if (havePrev)
+        {
+            float2 gA = Sigma(P, zPrev, p.z), gB = Sigma(S, zPrev, p.z);
+            float sA = gA.x + gA.y, sB = gB.x + gB.y;
+            float sigma = 0.5 * (sA + sB);
+            [branch] if (sigma > 1e-5)
+            {
+                // The step's fog in its own colour (the kinds' mix at both ends, by their fog), seen
+                // through what's in front.
+                float3 pm = cCam.xyz + dir * (0.5 * (tPrev + t));
+                // Units: the fog pushed out around them and their trail, its pattern dragged along
+                // (sampled where the pattern would have come from).
+                float2 displace;
+                sigma *= WakeKeep(pm, 0.5 * (zPrev + p.z), displace);
+                float a = 1 - exp(-sigma * Patchiness(pm - float3(displace, 0), t - tPrev) * (t - tPrev) * cColor.a);
+                float3 c = cNoise2.z > 0.5 ? float3(1, 0, 1) : (sA * SampleColour(P, gA) + sB * SampleColour(S, gB)) / (sA + sB);
+                scatter += T * a * c;
+                T *= 1 - a;
+            }
+        }
+        if (t >= t1) break;
+        if (above) { havePrev = false; t = min(t + jump, t1); continue; } // out of the fog again
+        fresh = !havePrev;
+        P = S; tPrev = t; zPrev = p.z; havePrev = true;
         // At least the step the rest of the budget needs to reach the end evenly (a far ray that ran
         // out used to put everything left into one last step, sampled at one point: scattered dots).
         // The dither (cGrid.y) shortens the first step in the fog per pixel, shifting the steps:
         // grain instead of banding (there's no frame-to-frame smoothing to hide grain).
-        float ds = max(max(cView.y, t * cView.w), (t1 - t) / max(budget - i, 1));
-        if (!haveStart) ds *= lerp(1, max(jitter, 0.05), cGrid.y);
-        float tb = min(t + ds, t1);
-        float za = p.z, zb = cCam.z + dir.z * tb;
-        if (!haveStart)
-        {
-            fA = SampleField(p.xy, cA, edgeA);
-            haveStart = true;
-        }
-        float3 pb = cCam.xyz + dir * tb;
-        float4 cB;
-        float edgeB;
-        float4 fB = SampleField(pb.xy, cB, edgeB);
-        float sA = Sigma(fA, cA.a, edgeA, za, zb), sB = Sigma(fB, cB.a, edgeB, za, zb);
-        float sigma = 0.5 * (sA + sB);
-        [branch] if (sigma > 1e-5)
-        {
-            // Each step's fog in its own colour (the kinds' mix at both ends, by their fog), seen
-            // through what's in front.
-            float3 pm = cCam.xyz + dir * (0.5 * (t + tb));
-            // Units: the fog pushed out around them and their trail, its pattern dragged along
-            // (sampled where the pattern would have come from).
-            float2 displace;
-            sigma *= WakeKeep(pm, 0.5 * (za + zb), displace);
-            float a = 1 - exp(-sigma * Patchiness(pm - float3(displace, 0), tb - t) * (tb - t) * cColor.a);
-            float3 c = cNoise2.z > 0.5 ? float3(1, 0, 1) : (sA * cA.rgb + sB * cB.rgb) / (sA + sB);
-            scatter += T * a * c;
-            T *= 1 - a;
-        }
-        fA = fB; cA = cB; edgeA = edgeB;
-        t = tb;
+        float ds = max(max(cView.y, t * cView.w), (t1 - t) / max(budget - i - 1, 1));
+        if (fresh) ds *= lerp(1, max(jitter, 0.05), cGrid.y);
+        t = min(t + ds, t1);
     }
     return float4(scatter, T);
 }
@@ -388,6 +429,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
             if (g_topTex) { g_topTex->Release(); g_topTex = nullptr; }
             if (g_lightTex) { g_lightTex->Release(); g_lightTex = nullptr; }
             fogwake::Release();
+            fogfar::Release();
             if (g_noise) { g_noise->Release(); g_noise = nullptr; }
             g_fieldVersion = g_groundVersion = ~0u;
             g_fieldSignature = -1.0f;
@@ -459,7 +501,9 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
 
         float SettingsSignature()
         {
-            float s = g_settings.densityScale * 7.0f + g_settings.floorReach * 0.731f;
+            // (Other places' rows change only with a reload: the table's generation stands for them.)
+            float s = g_settings.densityScale * 7.0f + g_settings.floorReach * 0.731f + g_settings.debugPlaces * 5.3f +
+                      static_cast<float>(fogsettings::Generation() % 1000) * 0.0137f;
             for (int k = 0; k < fog::kKindCount; ++k)
             {
                 const fog::KindSettings& ks = fog::Settings(k);
@@ -469,7 +513,8 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
             return s;
         }
 
-        void FogColor(int kind, float out[3]);
+        void FogColor(int kind, float out[3], uint32_t area = 0);
+        void FarColour(int kind, uint32_t area, float out[3]) { FogColor(kind, out, area); } // for the far map
 
         /// The field texture: per cell, density (the enabled kinds' amount x density, summed), their
         /// density-weighted layer thickness, and the ground relative to a reference height.
@@ -589,6 +634,28 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
             if (FAILED(g_field->LockRect(0, &lr, nullptr, 0))) return false;
             if (FAILED(g_colorTex->LockRect(0, &lc, nullptr, 0))) { g_field->UnlockRect(0); return false; }
             g_groundRef = groundRef;
+
+            // Each place's kind colours (its FogSettings colour rows), resolved once per place per upload;
+            // area 0 (not known yet) = the player's place.
+            struct PlaceColours { float kind[fog::kKindCount][3]; };
+            static std::unordered_map<uint32_t, PlaceColours> placeColours;
+            placeColours.clear();
+            auto coloursOf = [&](uint32_t area) -> const PlaceColours& {
+                auto found = placeColours.find(area);
+                if (found != placeColours.end()) return found->second;
+                PlaceColours pc;
+                for (int k = 0; k < fog::kKindCount; ++k)
+                    if (area) FogColor(k, pc.kind[k], area);
+                    else for (int ch = 0; ch < 3; ++ch) pc.kind[k][ch] = kindColor[k][ch];
+                return placeColours.emplace(area, pc).first->second;
+            };
+            // Debug: every zone's (or area's) fog in its own colour, the first seen red, then green, ...
+            static const float kPalette[8][3] = { { 1.0f, 0.15f, 0.15f }, { 0.2f, 1.0f, 0.2f }, { 0.25f, 0.4f, 1.0f }, { 1.0f, 0.95f, 0.2f },
+                                                  { 1.0f, 0.3f, 1.0f },  { 0.2f, 1.0f, 1.0f }, { 1.0f, 0.6f, 0.15f }, { 1.0f, 1.0f, 1.0f } };
+            static std::unordered_map<uint32_t, int> placeIndex; // place -> palette slot, kept while the map stays
+            static int placeIndexMap = -2;
+            if (placeIndexMap != world::Current().mapId) { placeIndex.clear(); placeIndexMap = world::Current().mapId; }
+
             for (int r = 0; r < fog::kGridSize; ++r)
             {
                 auto* texel = reinterpret_cast<uint16_t*>(static_cast<uint8_t*>(lr.pBits) + r * lr.Pitch);
@@ -601,9 +668,11 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
                     // its depth (amount x thickness), drawn with the heavy density (c13).
                     float density = 0.0f, weighted = 0.0f, pool = 0.0f, floorSum = 0.0f;
                     float mix[3] = {}, mixWeight = 0.0f; // colour: the kinds' colours by their share of the fog here
+                    const uint32_t area = grid.area ? grid.area[index] : 0;
+                    const PlaceColours& colours = coloursOf(area);
                     for (int k = 0; k < fog::kKindCount; ++k)
                     {
-                        const fog::KindSettings& ks = fog::Settings(k);
+                        const fog::KindSettings& ks = fog::SettingsAt(k, index); // the cell's own place's
                         if (!ks.enabled) continue;
                         const float a = grid.amount[k][index];
                         const float heavy = grid.pool[k] ? grid.pool[k][index] : 0.0f; // the heavy share, where it has flowed to
@@ -620,8 +689,15 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
                         heavyWeight += heavy;
                         heavyDensity += heavy * ks.density;
                         const float share = (a * lightShare + heavy) * ks.density; // its fog here, light and heavy
-                        for (int ch = 0; ch < 3; ++ch) mix[ch] += share * kindColor[k][ch];
+                        for (int ch = 0; ch < 3; ++ch) mix[ch] += share * colours.kind[k][ch];
                         mixWeight += share;
+                    }
+                    if (g_settings.debugPlaces && mixWeight > 0.0f)
+                    {
+                        const uint32_t place = g_settings.debugPlaces == 1 ? (area ? regional::ZoneOf(area) : 0) : area;
+                        auto slot = placeIndex.find(place);
+                        if (slot == placeIndex.end()) slot = placeIndex.emplace(place, static_cast<int>(placeIndex.size()) % 8).first;
+                        for (int ch = 0; ch < 3; ++ch) mix[ch] = kPalette[slot->second][ch] * mixWeight;
                     }
                     const bool blocked = grid.block && grid.block[index] == 3;
                     const float thickness = density > 0.0f ? weighted / density : 1.0f;
@@ -863,16 +939,18 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
 
         float Luminance(const float c[3]) { return 0.299f * c[0] + 0.587f * c[1] + 0.114f * c[2]; }
 
-        /// A fog kind's colour where the player is (kind -1: the "all kinds" colour): the zone's stock
-        /// fog colour (it follows the time of day), changed by FogSettings -- the kind's own row first,
-        /// then the "all kinds" row. Hue mode keeps the stock colour's brightness and takes Color's hue
-        /// and saturation, so day and night still show. The panel's colour test overrides every kind.
-        void FogColor(int kind, float out[3])
+        /// A fog kind's colour at a place (area 0: where the player is; kind -1: the "all kinds"
+        /// colour): the stock fog colour where the camera is (it follows the time of day), changed by
+        /// the place's FogSettings -- the kind's own row first, then the "all kinds" row. Hue mode
+        /// keeps the stock colour's brightness and takes Color's hue and saturation, so day and night
+        /// still show. The panel's colour test overrides every kind everywhere.
+        void FogColor(int kind, float out[3], uint32_t area)
         {
             const uint32_t argb = *reinterpret_cast<const uint32_t*>(kFogColor);
             const float stock[3] = { ((argb >> 16) & 0xFF) / 255.0f, ((argb >> 8) & 0xFF) / 255.0f, (argb & 0xFF) / 255.0f };
             const world::Snapshot& s = world::Current();
-            fogsettings::Values v = fogsettings::Resolve(s.areaCount > 0 ? s.areaChain[0] : 0, s.mapId, kind);
+            if (!area) area = s.areaCount > 0 ? s.areaChain[0] : 0;
+            fogsettings::Values v = fogsettings::Resolve(area, s.mapId, kind);
             if (g_settings.colorTest)
             {
                 v.colorMode = g_settings.colorMode;
@@ -955,7 +1033,17 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
         {
             const fog::Grid& grid = fog::Current();
             for (int k = 0; k < fog::kKindCount; ++k)
-                if (fog::Settings(k).enabled && grid.maxAmount[k] > 0.0f && fog::Settings(k).density > 0.0f) return true;
+                if (fog::Settings(k).enabled && grid.maxAmount[k] > 0.0f) return true;
+            // Nothing near, but a zone around with fog (the far map shows it: a clear zone looking
+            // at a foggy one).
+            if (g_settings.farFog)
+            {
+                fog::ZoneState zones[32];
+                const unsigned n = fog::ZoneStates(zones, 32);
+                for (unsigned z = 0; z < n; ++z)
+                    for (int k = 0; k < fog::kKindCount; ++k)
+                        if (zones[z].inRange && fog::Settings(k).enabled && zones[z].amount[k] > 0.0f) return true;
+            }
             return false;
         }
 
@@ -1071,6 +1159,16 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
                 lightTex = UploadLights(dev, cam);
             }
 
+            // The far map: each zone's typical fog beyond the near field (none when off or no fog around).
+            fogfar::Maps farMaps;
+            bool haveFar = false;
+            if (g_settings.farFog)
+            {
+                prof::Scope uploads(prof::kOursFogUpload);
+                haveFar = fogfar::Update(dev, g_groundRef, &FarColour, farMaps);
+            }
+            const float ceiling = haveFar ? std::fmax(g_ceiling, farMaps.highestTop) : g_ceiling;
+
             // Units pushing the fog: their wake map (nullptr when off or none near).
             IDirect3DTexture9* wake = nullptr;
             {
@@ -1103,7 +1201,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
                 half = g_halfTex != nullptr;
             }
 
-            const float c[18 * 4] = {
+            const float c[19 * 4] = {
                 vp.MinZ, 1.0f / (vp.MaxZ - vp.MinZ), vp.MaxZ + 1.0e-4f, g_settings.maxDistance,
                 proj[0], proj[5], proj[8], proj[9],
                 proj[10], proj[14], static_cast<float>(steps), g_settings.depthDecode ? 1.0f : 0.0f,
@@ -1120,12 +1218,13 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
                 g_settings.noiseAmount, 1.0f / 16.0f, g_settings.debugColour ? 1.0f : 0.0f, g_settings.heightBands ? 1.0f : 0.0f,
                 static_cast<float>(vp.X) / rtDesc.Width, static_cast<float>(vp.Y) / rtDesc.Height,
                 static_cast<float>(vp.Width) / rtDesc.Width, static_cast<float>(vp.Height) / rtDesc.Height,
-                g_poolDensity, 0.3f, g_ceiling, g_settings.poolGate ? 1.0f : 0.0f,
+                g_poolDensity, 0.3f, ceiling, g_settings.poolGate ? 1.0f : 0.0f,
                 static_cast<float>(g_settings.debugView), g_settings.fogStep > 0.1f ? g_settings.fogStep : 0.1f,
                 kTopBlock * fog::kCellSize, 0.04f,
                 wakePlace[0], wakePlace[1], wakePlace[2], wake ? 1.0f : 0.0f,
                 half ? 0.5f / vp.Width : 0.0f, half ? 0.5f / vp.Height : 0.0f, 0.0f, 0.0f,
                 static_cast<float>(vp.Width), static_cast<float>(vp.Height), static_cast<float>(g_halfW), static_cast<float>(g_halfH),
+                farMaps.originX, farMaps.originY, farMaps.invExtent, haveFar ? 1.0f : 0.0f,
             };
 
             // Everything the pass changes goes back through the state block, so the client's own cache
@@ -1156,7 +1255,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
 
             dev->SetVertexShader(nullptr);
             dev->SetPixelShader(g_ps);
-            dev->SetPixelShaderConstantF(0, c, 18);
+            dev->SetPixelShaderConstantF(0, c, 19);
 
             dev->SetTexture(0, depthTex);
             dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
@@ -1201,6 +1300,16 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
             dev->SetSamplerState(6, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
             dev->SetSamplerState(6, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
             dev->SetSamplerState(6, D3DSAMP_SRGBTEXTURE, FALSE);
+            for (int s = 8; s <= 9; ++s)
+            {
+                dev->SetTexture(s, haveFar ? (s == 8 ? farMaps.field : farMaps.colour) : nullptr);
+                dev->SetSamplerState(s, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+                dev->SetSamplerState(s, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+                dev->SetSamplerState(s, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+                dev->SetSamplerState(s, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+                dev->SetSamplerState(s, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+                dev->SetSamplerState(s, D3DSAMP_SRGBTEXTURE, FALSE);
+            }
             dev->SetTexture(5, wake);
             dev->SetSamplerState(5, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
             dev->SetSamplerState(5, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
@@ -1358,6 +1467,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
             g_api->UiSliderFloat("patchiness##gfnoise", &g_settings.noiseAmount, 0.0f, 1.0f);
             g_api->UiSliderFloat("patch size (tile, yd)##gftile", &g_settings.noiseTileYards, 8.0f, 256.0f);
             g_api->UiSliderInt("fog floor reach (2 yd cells; 0 = follows every cell)##gffloor", &g_settings.floorReach, 0, 4);
+            g_api->UiCheckbox("far fog (beyond 128 yd: each zone's typical fog)##gffar", &g_settings.farFog);
             g_api->UiSliderFloat("dither (0 smooth .. 1 grainy)##gfdither", &g_settings.dither, 0.0f, 1.0f);
         }
         if (g_api->UiCollapsingHeader("Quality##gfquality"))
@@ -1399,6 +1509,8 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
         char line[256];
         g_api->UiCheckbox("water writes depth while fog draws##gfwater", &g_settings.forceWaterDepth);
         g_api->UiCheckbox("debug: magenta fog##gfdebug", &g_settings.debugColour);
+        static const char* const kPlaces[] = { "off", "by zone", "by area (subzones)" };
+        g_api->UiCombo("debug: fog coloured by place (red, green, blue, yellow, ...)##gfplaces", &g_settings.debugPlaces, kPlaces, 3);
         g_api->UiCheckbox("debug: height bands (must stay on the terrain when the camera turns)##gfbands", &g_settings.heightBands);
         static const char* const kDecode[] = { "OpenGL-style (-1..1)", "D3D-style (0..1)" };
         g_api->UiCombo("depth decoding##gfdecode", &g_settings.depthDecode, kDecode, 2);

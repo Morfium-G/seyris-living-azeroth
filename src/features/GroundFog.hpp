@@ -19,8 +19,9 @@ namespace wxl_livingazeroth::groundfog
     {
         int   enabled = 1;
         int   steps = 48;               // the march's step budget per pixel (jumps through air + steps in the fog)
-        int   halfResolution = 1;       // march at half resolution, upscaled by depth (about a quarter of the GPU cost)
-        float fogStep = 1.0f;          // yd: step length inside the fog near the camera (grows 4% of the distance)
+        int   farFog = 1;               // beyond the near field (128 yd): each zone's typical fog per 33 yd chunk (no edge wall)
+        int   halfResolution = 1;      // march at half resolution, upscaled by depth (about a quarter of the GPU cost)
+        float fogStep = 0.25f;         // yd: step length inside the fog near the camera (grows 4% of the distance)
         int   fogLights = 1;            // our lights (torches, braziers...) light the fog around them
         float lightStrength = 1.0f;     // x their light in the fog
         float lightRange = 128.0f;      // yd from the camera: lights farther away don't light the fog
@@ -33,6 +34,7 @@ namespace wxl_livingazeroth::groundfog
         float brightness = 1.0f;        // multiplies the stock fog colour
         int   forceWaterDepth = 1;      // the water writes depth while there's fog to draw
         int   debugColour = 0;          // draw the fog magenta, to see where it is
+        int   debugPlaces = 0;          // debug: the fog coloured by place: 0 off, 1 by zone, 2 by area (subzones)
         int   heightBands = 0;          // debug: paint the reconstructed world height as bands (they must stay on the terrain)
         int   depthDecode = 0;          // 0 OpenGL-style depth (-1..1), 1 D3D-style (0..1): which one keeps the bands still
         int   poolGate = 1;             // heavy pool fog only in and around cells that hold a pool (off: the old behaviour, for comparison)

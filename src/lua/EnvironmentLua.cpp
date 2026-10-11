@@ -38,7 +38,7 @@ namespace wxl_livingazeroth::envlua
         {
             const world::Snapshot& s = world::Current();
             if (!s.inWorld) { sc::PushNil(L); sc::PushNil(L); return 2; }
-            const float air = climate::TemperatureAt(PlayerArea(s), s.mapId);
+            const float air = climate::Temperature(climate::Here()).total; // blended across area borders
             float ground = air;
             fields::Sample(fields::Find("temperature"), s.playerPos, ground);
             sc::PushNumber(L, ground);
@@ -51,7 +51,7 @@ namespace wxl_livingazeroth::envlua
         {
             const world::Snapshot& s = world::Current();
             if (!s.inWorld) { sc::PushNil(L); return 1; }
-            sc::PushNumber(L, climate::For(PlayerArea(s), s.mapId).humidity);
+            sc::PushNumber(L, climate::Here().humidity);
             return 1;
         }
 

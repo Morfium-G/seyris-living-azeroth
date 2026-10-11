@@ -1,12 +1,15 @@
 #include "Climate.hpp"
 
 #include "CdbcLoad.hpp"
+#include "TerrainHeight.hpp"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace wxl_livingazeroth::climate
 {
@@ -145,6 +148,8 @@ namespace wxl_livingazeroth::climate
         return g_cache.emplace(key, r).first->second;
     }
 
+    namespace { void UpdateBlend(const world::Snapshot& snap); } // the blend map (below, with At)
+
     void Update(const world::Snapshot& snap)
     {
         Clock c;
@@ -166,6 +171,7 @@ namespace wxl_livingazeroth::climate
         }
         if (g_timeOverride >= 0.0f) c.dayFraction = g_timeOverride;
         g_clock = c;
+        UpdateBlend(snap);
 
         // The sun. Daylight from the time of day (0 at 06:00 and 18:00, full from ~08:00 to ~16:00),
         // so the moon (the active light at night) never warms anything.
@@ -230,6 +236,150 @@ namespace wxl_livingazeroth::climate
     }
 
     float TemperatureAt(uint32_t areaId, int mapId) { return Temperature(For(areaId, mapId)).total; }
+
+    // --- the blend map (At) -----------------------------------------------------------------------
+    namespace
+    {
+        // One entry per terrain chunk in a window around the player, world-aligned and toroidal (like
+        // the regional zone map): the chunk's area's row, and that averaged with its 8 neighbours.
+        // A slice of chunks is (re)read per frame; a known chunk's blur is redone when it or a
+        // neighbour changes.
+        constexpr int   kBlendSize = 48;            // chunks per side: +-800 yd
+        constexpr float kChunk = 100.0f / 3.0f;
+        constexpr int   kBlendRecentre = 4;         // chunks moved before the window follows
+        constexpr int   kBlendPerFrame = 96;        // chunk lookups per frame (a full window in ~24 frames)
+        struct BlendCell
+        {
+            int      i = 0x7FFFFFFF, j = 0;          // world chunk held
+            bool     known = false;
+            uint32_t area = 0;
+            Row      raw, blurred;
+        };
+        std::vector<BlendCell> g_blend(kBlendSize * kBlendSize);
+        int      g_blendFirstI = 0, g_blendFirstJ = 0, g_blendCursor = 0, g_blendMap = -2;
+        bool     g_blendPlaced = false;
+        uint32_t g_blendGeneration = 0;
+        uint32_t g_playerArea = 0;
+        float    g_playerPos[2] = {};
+
+        int BlendMod(int v) { const int m = v % kBlendSize; return m < 0 ? m + kBlendSize : m; }
+        BlendCell& BlendAt(int i, int j) { return g_blend[BlendMod(j) * kBlendSize + BlendMod(i)]; }
+        bool InWindow(int i, int j)
+        {
+            return i >= g_blendFirstI && i < g_blendFirstI + kBlendSize && j >= g_blendFirstJ && j < g_blendFirstJ + kBlendSize;
+        }
+
+        /// A chunk's blur: the mean of the known rows among it and its 8 neighbours (its own row if
+        /// none is known), flags its own.
+        void Blur(int i, int j)
+        {
+            BlendCell& c = BlendAt(i, j);
+            if (c.i != i || c.j != j || !c.known) return;
+            Row sum;
+            sum.dayTemp = sum.nightTemp = sum.seasonAmplitude = sum.seasonOffset = sum.humidity = sum.fogginess = 0.0f;
+            int n = 0;
+            for (int dj = -1; dj <= 1; ++dj)
+                for (int di = -1; di <= 1; ++di)
+                {
+                    if (!InWindow(i + di, j + dj)) continue;
+                    const BlendCell& o = BlendAt(i + di, j + dj);
+                    if (o.i != i + di || o.j != j + dj || !o.known) continue;
+                    sum.dayTemp += o.raw.dayTemp; sum.nightTemp += o.raw.nightTemp;
+                    sum.seasonAmplitude += o.raw.seasonAmplitude; sum.seasonOffset += o.raw.seasonOffset;
+                    sum.humidity += o.raw.humidity; sum.fogginess += o.raw.fogginess;
+                    ++n;
+                }
+            const float inv = 1.0f / n;
+            c.blurred.dayTemp = sum.dayTemp * inv; c.blurred.nightTemp = sum.nightTemp * inv;
+            c.blurred.seasonAmplitude = sum.seasonAmplitude * inv; c.blurred.seasonOffset = sum.seasonOffset * inv;
+            c.blurred.humidity = sum.humidity * inv; c.blurred.fogginess = sum.fogginess * inv;
+            c.blurred.flags = c.raw.flags;
+        }
+
+        void UpdateBlend(const world::Snapshot& snap)
+        {
+            if (!snap.inWorld) return;
+            g_playerArea = snap.areaCount > 0 ? snap.areaChain[0] : 0;
+            g_playerPos[0] = snap.playerPos[0]; g_playerPos[1] = snap.playerPos[1];
+            if (snap.mapId != g_blendMap || g_generation != g_blendGeneration)
+            {
+                for (BlendCell& c : g_blend) c = BlendCell{};
+                g_blendMap = snap.mapId;
+                g_blendGeneration = g_generation;
+                g_blendPlaced = false;
+            }
+            const int fi = static_cast<int>(std::floor(snap.playerPos[0] / kChunk)) - kBlendSize / 2;
+            const int fj = static_cast<int>(std::floor(snap.playerPos[1] / kChunk)) - kBlendSize / 2;
+            if (!g_blendPlaced || std::abs(fi - g_blendFirstI) >= kBlendRecentre || std::abs(fj - g_blendFirstJ) >= kBlendRecentre)
+            {
+                g_blendFirstI = fi; g_blendFirstJ = fj;
+                g_blendPlaced = true;
+            }
+            for (int n = 0; n < kBlendPerFrame; ++n)
+            {
+                const int k = g_blendCursor;
+                g_blendCursor = (g_blendCursor + 1) % (kBlendSize * kBlendSize);
+                const int i = g_blendFirstI + k % kBlendSize, j = g_blendFirstJ + k / kBlendSize;
+                BlendCell& c = BlendAt(i, j);
+                const bool moved = c.i != i || c.j != j;
+                if (!moved && c.known) continue;
+                c.i = i; c.j = j; c.known = false;
+                uint32_t area = 0;
+                if (terrain::ChunkAreaAt((i + 0.5f) * kChunk, (j + 0.5f) * kChunk, area) && area)
+                {
+                    c.area = area;
+                    c.raw = For(area, snap.mapId);
+                    c.known = true;
+                }
+                for (int dj = -1; dj <= 1; ++dj)
+                    for (int di = -1; di <= 1; ++di)
+                        if (InWindow(i + di, j + dj)) Blur(i + di, j + dj);
+            }
+        }
+
+        // A chunk's blended row, or nullptr (outside the window, not read yet, not loaded).
+        const Row* Blended(int i, int j)
+        {
+            if (!InWindow(i, j)) return nullptr;
+            const BlendCell& c = BlendAt(i, j);
+            return c.i == i && c.j == j && c.known ? &c.blurred : nullptr;
+        }
+    }
+
+    Row At(float x, float y)
+    {
+        // Between the four nearest chunk centres; chunks not known yet drop out of the mix.
+        const float fx = x / kChunk - 0.5f, fy = y / kChunk - 0.5f;
+        const int i0 = static_cast<int>(std::floor(fx)), j0 = static_cast<int>(std::floor(fy));
+        const float tx = fx - i0, ty = fy - j0;
+        const Row* r[4] = { Blended(i0, j0), Blended(i0 + 1, j0), Blended(i0, j0 + 1), Blended(i0 + 1, j0 + 1) };
+        const float w[4] = { (1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty };
+        Row out;
+        out.dayTemp = out.nightTemp = out.seasonAmplitude = out.seasonOffset = out.humidity = out.fogginess = 0.0f;
+        float total = 0.0f, best = -1.0f;
+        for (int k = 0; k < 4; ++k)
+        {
+            if (!r[k]) continue;
+            out.dayTemp += w[k] * r[k]->dayTemp; out.nightTemp += w[k] * r[k]->nightTemp;
+            out.seasonAmplitude += w[k] * r[k]->seasonAmplitude; out.seasonOffset += w[k] * r[k]->seasonOffset;
+            out.humidity += w[k] * r[k]->humidity; out.fogginess += w[k] * r[k]->fogginess;
+            total += w[k];
+            if (w[k] > best) { best = w[k]; out.flags = r[k]->flags; }
+        }
+        if (total > 1.0e-4f)
+        {
+            const float inv = 1.0f / total;
+            out.dayTemp *= inv; out.nightTemp *= inv; out.seasonAmplitude *= inv; out.seasonOffset *= inv;
+            out.humidity *= inv; out.fogginess *= inv;
+            return out;
+        }
+        // Nothing known around: the area's own row there (else the player's).
+        uint32_t area = 0;
+        if (!terrain::ChunkAreaAt(x, y, area) || !area) area = g_playerArea;
+        return For(area, g_blendMap);
+    }
+
+    Row Here() { return At(g_playerPos[0], g_playerPos[1]); }
 
     const Sun& SunNow() { return g_sun; }
 

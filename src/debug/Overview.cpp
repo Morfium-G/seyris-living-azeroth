@@ -57,7 +57,7 @@ namespace wxl_livingazeroth::debug
 
             // When and the air.
             const climate::Clock& c = climate::Now();
-            const climate::Row& row = climate::For(PlayerArea(s), s.mapId);
+            const climate::Row row = climate::Here(); // blended across area borders
             const climate::Breakdown t = climate::Temperature(row);
             const float hourAgo = climate::TemperatureAtTime(row, c.dayFraction - 1.0f / 24.0f).total;
             const float hourAhead = climate::TemperatureAtTime(row, c.dayFraction + 1.0f / 24.0f).total;

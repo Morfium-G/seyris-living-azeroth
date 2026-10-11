@@ -79,6 +79,7 @@ namespace wxl_livingazeroth::fog
         // too and runs off (HeavyShare). Water fog and steam keep their own weight (they hang at the
         // height they formed at).
         const uint8_t* steep = nullptr;
+        const uint32_t* area = nullptr;       // per cell, its terrain chunk's area (0 = not known yet: the player's place)
         unsigned       groundMissing = 0;
         uint32_t       groundVersion = 0;
     };
@@ -139,6 +140,28 @@ namespace wxl_livingazeroth::fog
         float steepFull = 45.0f;  // ... and from here all of it
     };
     FieldSettings& Field();
+
+    /// Each zone's typical fog (the memory): per zone on the current map, the zone-wide kinds' amount
+    /// on an ordinary open spot there and where it's heading. A zone starts at its target when it
+    /// first comes into the zone map's range (±1 km, far away: nothing jumps), then follows its own
+    /// climate, also while you're away (session only). Water fog and steam aren't zone-wide (0).
+    struct ZoneState
+    {
+        uint32_t zone = 0;
+        float    amount[kKindCount] = {};
+        float    target[kKindCount] = {};
+        bool     inRange = false;   // on the zone map right now
+    };
+    unsigned ZoneStates(ZoneState* out, unsigned max);
+    float    ZoneAmount(uint32_t zone, int kind); // 0 for a zone not tracked
+    bool     ZoneWide(int kind);
+
+    /// A kind's settings in a cell (storage index): its place's FogSettings rows (density, thickness,
+    /// weight, rates, wind thinning, strength), the panel's values for a kind switched to them, the
+    /// player's place where the cell's area isn't known yet. Settings() is the player's place.
+    const KindSettings& SettingsAt(int kind, int index);
+    /// The same for a place by its area (e.g. a zone, for the far fog map).
+    const KindSettings& SettingsOfArea(int kind, uint32_t area);
 
     /// The share of a kind's fog that runs off as heavy fog in a cell (storage index): its Weight, or
     /// more on steep ground (ground-hugging kinds). The renderer draws the rest as the light layer.

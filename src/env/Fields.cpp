@@ -465,10 +465,10 @@ namespace wxl_livingazeroth::fields
             const float snowing = weather.type == 2 ? weather.intensity : 0.0f;
             const float wind = wind::SteadyGround();
 
-            // Temperature and humidity per area, once per tick.
+            // Temperature and humidity per cell, blended across area borders (climate::At), once per tick.
             double ringSum = 0.0, ringTypical = 0.0;
             unsigned ringCount = 0;
-            uint32_t lastArea = 0xFFFFFFFFu, lastZone = 0xFFFFFFFFu;
+            uint32_t lastZone = 0xFFFFFFFFu;
             float temperature = 0.0f, humidity = 0.5f, zoneT = 0.0f, zoneKeep = 1.0f;
             for (int b = 0; b < kSize; ++b)
                 for (int a = 0; a < kSize; ++a)
@@ -479,12 +479,10 @@ namespace wxl_livingazeroth::fields
                     Cell& c = *live;
                     g_normal[s * 2] = static_cast<uint8_t>(Clamp01(c.nx * 0.5f + 0.5f) * 255.0f + 0.5f);
                     g_normal[s * 2 + 1] = static_cast<uint8_t>(Clamp01(c.ny * 0.5f + 0.5f) * 255.0f + 0.5f);
-                    if (c.area != lastArea)
                     {
-                        const climate::Row& row = climate::For(c.area, g_map);
+                        const climate::Row row = climate::At((c.i + 0.5f) * kCell, (c.j + 0.5f) * kCell);
                         temperature = climate::Temperature(row).total;
                         humidity = row.humidity;
-                        lastArea = c.area;
                     }
                     if (c.zone != lastZone)
                     {
@@ -629,9 +627,7 @@ namespace wxl_livingazeroth::fields
         if (field == kTemperature)
         {
             if (const Cell* c = CellAt(pos); c && c->started) { out = c->temperature; return true; }
-            terrain::Surface sf;
-            const uint32_t area = terrain::SurfaceAt(pos[0], pos[1], sf) ? sf.area : 0;
-            out = climate::TemperatureAt(area, g_map);
+            out = climate::Temperature(climate::At(pos[0], pos[1])).total;
             return true;
         }
         if (field == kMoisture)
@@ -724,7 +720,7 @@ namespace wxl_livingazeroth::fields
         MoistureDetail d;
         const Cell* c = CellAt(pos);
         if (!c) return d;
-        const climate::Row& row = climate::For(c->area, g_map);
+        const climate::Row row = climate::At((c->i + 0.5f) * kCell, (c->j + 0.5f) * kCell);
         d.known = c->started;
         d.rest = c->rest; d.absorbency = c->absorbency; d.open = c->open; d.submerged = c->submerged;
         d.waterDistance = c->waterDist; d.heightAboveWater = c->aboveWater; d.shore = c->shore;

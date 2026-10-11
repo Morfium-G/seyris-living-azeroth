@@ -6,6 +6,7 @@
 #include "../env/Climate.hpp"
 #include "../env/Fog.hpp"
 #include "../env/FogSettings.hpp"
+#include "../env/Regional.hpp"
 #include "../features/GroundFog.hpp"
 #include "../env/WorldQuery.hpp"
 
@@ -73,6 +74,23 @@ namespace wxl_livingazeroth::debug
                 if (g_api->UiCheckbox("pause (no build-up, burn-off, wind or flow)", &paused)) fog::SetPaused(paused != 0);
             }
             groundfog::DrawPanelSection();
+            if (g_api->UiCollapsingHeader("Zones (each zone's typical fog: the memory)##fogzones"))
+            {
+                fog::ZoneState zones[32];
+                const unsigned n = fog::ZoneStates(zones, 32);
+                g_api->UiText("zone                      mist         area fog     haze");
+                for (unsigned z = 0; z < n; ++z)
+                {
+                    const fog::ZoneState& s = zones[z];
+                    const char* name = regional::AreaName(s.zone);
+                    std::snprintf(line, sizeof(line), "%-24.24s  %.2f->%.2f    %.2f->%.2f    %.2f->%.2f%s%s",
+                                  name[0] ? name : "?", s.amount[fog::kMist], s.target[fog::kMist], s.amount[fog::kAreaFog], s.target[fog::kAreaFog],
+                                  s.amount[fog::kHaze], s.target[fog::kHaze], s.zone == regional::PlayerZone() ? "   (you)" : "",
+                                  s.inRange ? "" : "   (out of range)");
+                    g_api->UiText(line);
+                }
+                if (!n) g_api->UiText("(none yet)");
+            }
             if (g_api->UiCollapsingHeader("Why (where you stand)##fogwhy"))
             {
                 const fog::RulesInputs& in = fog::Inputs();

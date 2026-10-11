@@ -29,8 +29,18 @@ namespace wxl_livingazeroth::climate
         uint32_t flags = 0;               // reserved
     };
 
-    /// The resolved row for a place (area chain + map), cached per (area, map).
+    /// The resolved row for a place (area chain + map), cached per (area, map). A hard step at every
+    /// area border: for "the climate here", use At().
     const Row& For(uint32_t areaId, int mapId);
+
+    /// The climate at a world position, blended across area borders: each terrain chunk (33 yd)
+    /// takes its area's row, averaged with its 8 neighbours, interpolated between chunk centres, so
+    /// crossing a border changes temperature, humidity and fogginess over ~100 yd instead of at
+    /// once. Within ~800 yd of the player (the blend map follows); beyond it, or before its chunks
+    /// are known, the area's own row. Flags are the chunk's own.
+    Row At(float x, float y);
+    /// At() where the player is.
+    Row Here();
 
     /// The clock the climate runs on: game date and time from the client (the server's), the time of
     /// day from the day-night system (what the sky shows).
