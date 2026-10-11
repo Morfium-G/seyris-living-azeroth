@@ -51,6 +51,7 @@ Where fog forms, and each kind's density, thickness, colour and so on, come from
 | Enabled | 1 | Draw the ground fog. |
 | DensityScale | 1 | Your multiplier on every fog kind's density (1 = as `FogSettings.cdbc` says). |
 | MaxDistance | 250 | How far the fog is drawn, in yards. |
+| HalfResolution | 1 | Draw the fog at half resolution, upscaled by depth (sharp at silhouettes): about a quarter of the GPU time. |
 | StepBudget | 48 | Steps per pixel through the fog (quality, not the look): more = smoother far away, slower. |
 | StepLength | 1 | Step length inside the fog near you, in yards (grows with distance). Smaller = finer, slower. |
 | Dither | 0 | 0 = smooth (may show faint bands) .. 1 = grainy. |

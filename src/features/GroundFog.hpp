@@ -19,7 +19,8 @@ namespace wxl_livingazeroth::groundfog
     {
         int   enabled = 1;
         int   steps = 48;               // the march's step budget per pixel (jumps through air + steps in the fog)
-        float fogStep = 1.0f;           // yd: step length inside the fog near the camera (grows 4% of the distance)
+        int   halfResolution = 1;       // march at half resolution, upscaled by depth (about a quarter of the GPU cost)
+        float fogStep = 1.0f;          // yd: step length inside the fog near the camera (grows 4% of the distance)
         int   fogLights = 1;            // our lights (torches, braziers...) light the fog around them
         float lightStrength = 1.0f;     // x their light in the fog
         float lightRange = 128.0f;      // yd from the camera: lights farther away don't light the fog

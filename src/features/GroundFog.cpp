@@ -63,6 +63,10 @@ namespace wxl_livingazeroth::groundfog
         // GPU resources (D3DPOOL_MANAGED: they survive a reset; dropped when the device changes).
         IDirect3DDevice9*        g_device = nullptr;
         IDirect3DPixelShader9*   g_ps = nullptr;
+        IDirect3DPixelShader9*   g_psUpscale = nullptr; // half resolution: the depth-aware upscale
+        IDirect3DTexture9*       g_halfTex = nullptr;   // half resolution: the march's target (D3DPOOL_DEFAULT: dropped on a reset)
+        UINT                     g_halfW = 0, g_halfH = 0;
+        bool                     g_halfFailed = false;  // couldn't make the target: full resolution
         IDirect3DTexture9*       g_field = nullptr;
         IDirect3DTexture9*       g_colorTex = nullptr; // A8R8G8B8: the fog's colour per cell / 2, alpha the pool mask
         IDirect3DTexture9*       g_topTex = nullptr;   // R32F kTopSize^2: the highest fog top per block and its neighbours
@@ -109,6 +113,7 @@ sampler2D topTex : register(s4);     // r = the highest fog top in the block and
 sampler2D lightTex : register(s6);   // our lights' light reaching the fog per field cell (rgb, linear), on when cColor.x
 sampler2D wakeTex : register(s5);   // units pushing the fog (features/FogWake): r = push (< 0 at the rim), g = its top z - cCam.w, ba = pattern displacement (yd)
 float4 cWake   : register(c15); // xy = the wake map's origin (world), z = 1 / its extent (yd), w = on
+float4 cHalf   : register(c16); // xy = uv shift onto full-resolution texel centres (half resolution; 0 at full)
 
 // The wake at a step (its middle pm, height zm): how much of the fog stays (the push reaches up to
 // the unit's height, softly), and the patch pattern's displacement there.
@@ -182,6 +187,9 @@ float Patchiness(float3 p, float stepLen)
 
 float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
 {
+    // Half resolution: the quad's uv lands between two full-resolution texels; cHalf.xy moves it onto
+    // the first one's centre, so this pixel is exactly full pixel (2i, 2j) (the upscale relies on it).
+    uv -= cHalf.xy;
     float d = tex2Dlod(depthTex, float4(cUv.xy + uv * cUv.zw, 0, 0)).r;
     // The client's projection is OpenGL-style (0x6BF370: m22 = (f + n) / (f - n), m32 = -2fn / (f - n),
     // depth -1..1); the D3D backend maps that to 0..1 within the viewport. So back to -1..1 first:
@@ -308,6 +316,54 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
 }
 )";
 
+        // The upscale: the fog was marched at half resolution, half-res pixel (i, j) = full pixel
+        // (2i, 2j). Each full pixel blends its 4 nearest half-res samples by distance and by how close
+        // each one's depth is to its own (so fog from the background doesn't bleed onto a silhouette in
+        // front of it, nor the other way); when none is close, the closest in depth wins. Blended like
+        // the full-resolution pass: dst x transmittance + scatter.
+        const char* const kUpscaleHlsl = R"(
+sampler2D depthTex : register(s0);
+sampler2D halfTex  : register(s7);
+float4 cDepth : register(c0);   // x = viewport min z, y = 1 / (max z - min z)
+float4 cProj2 : register(c2);   // projection m22, m32, -, depth decode switch
+float4 cUv    : register(c12);  // depth texture uv = xy + viewport uv * zw
+float4 cSize  : register(c17);  // xy = the viewport in pixels, zw = the half-res target in pixels
+
+float Distance(float2 vuv)
+{
+    float d = tex2Dlod(depthTex, float4(cUv.xy + vuv * cUv.zw, 0, 0)).r;
+    float d01 = saturate((d - cDepth.x) * cDepth.y);
+    float ndc = cProj2.w > 0.5 ? d01 : d01 * 2 - 1;
+    return abs(cProj2.y / min(ndc - cProj2.x, -1e-6));
+}
+
+void Tap(float2 i, float bilinear, float z0, inout float4 sum, inout float weights, inout float4 nearest, inout float nearestGap)
+{
+    i = clamp(i, 0, cSize.zw - 1);
+    float4 v = tex2Dlod(halfTex, float4((i + 0.5) / cSize.zw, 0, 0));
+    float gap = abs(Distance((2 * i + 0.5) / cSize.xy) - z0);
+    float w = bilinear * saturate(1 - gap / (0.05 * z0 + 0.25));
+    sum += v * w;
+    weights += w;
+    if (gap < nearestGap) { nearestGap = gap; nearest = v; }
+}
+
+float4 main(float2 uv : TEXCOORD0) : COLOR
+{
+    float z0 = Distance(uv);
+    float2 l = (uv * cSize.xy - 0.5) * 0.5;
+    float2 i0 = floor(l);
+    float2 t = l - i0;
+    float4 sum = 0, nearest = float4(0, 0, 0, 1);
+    float weights = 0, nearestGap = 1e9;
+    Tap(i0,                 (1 - t.x) * (1 - t.y), z0, sum, weights, nearest, nearestGap);
+    Tap(i0 + float2(1, 0),  t.x * (1 - t.y),       z0, sum, weights, nearest, nearestGap);
+    Tap(i0 + float2(0, 1),  (1 - t.x) * t.y,       z0, sum, weights, nearest, nearestGap);
+    Tap(i0 + float2(1, 1),  t.x * t.y,             z0, sum, weights, nearest, nearestGap);
+    return weights > 1e-3 ? sum / weights : nearest;
+}
+)";
+
         // ------------------------------------------------------------------ helpers
         uint16_t ToHalf(float f)
         {
@@ -324,6 +380,9 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
         void ReleaseGpu()
         {
             if (g_ps) { g_ps->Release(); g_ps = nullptr; }
+            if (g_psUpscale) { g_psUpscale->Release(); g_psUpscale = nullptr; }
+            if (g_halfTex) { g_halfTex->Release(); g_halfTex = nullptr; }
+            g_halfFailed = false;
             if (g_field) { g_field->Release(); g_field = nullptr; }
             if (g_colorTex) { g_colorTex->Release(); g_colorTex = nullptr; }
             if (g_topTex) { g_topTex->Release(); g_topTex = nullptr; }
@@ -334,7 +393,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             g_fieldSignature = -1.0f;
         }
 
-        IDirect3DPixelShader9* Compile(IDirect3DDevice9* dev)
+        IDirect3DPixelShader9* Compile(IDirect3DDevice9* dev, const char* source)
         {
             HMODULE m = GetModuleHandleA("d3dcompiler_47.dll");
             if (!m) m = LoadLibraryA("d3dcompiler_47.dll");
@@ -342,7 +401,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             if (!compile) return nullptr;
             ID3DBlob* code = nullptr;
             ID3DBlob* err = nullptr;
-            const HRESULT hr = compile(kPsHlsl, std::strlen(kPsHlsl), nullptr, nullptr, nullptr, "main", "ps_3_0", 0, 0, &code, &err);
+            const HRESULT hr = compile(source, std::strlen(source), nullptr, nullptr, nullptr, "main", "ps_3_0", 0, 0, &code, &err);
             if (err)
             {
                 g_api->Log(WXL_LOG_WARN, kTag, "ground fog: shader compile: %s", static_cast<const char*>(err->GetBufferPointer()));
@@ -900,7 +959,12 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             const double t0 = grassperf::Now();
 
             if (dev != g_device) { ReleaseGpu(); g_shaderFailed = false; g_device = dev; }
-            if (!g_ps && !g_shaderFailed) { g_ps = Compile(dev); g_shaderFailed = !g_ps; }
+            if (!g_ps && !g_shaderFailed)
+            {
+                g_ps = Compile(dev, kPsHlsl);
+                g_psUpscale = g_ps ? Compile(dev, kUpscaleHlsl) : nullptr;
+                g_shaderFailed = !g_ps;
+            }
             if (!g_ps) { g_inactive = "the fog shader failed to compile (see the log)"; return; }
             if (!g_noise) g_noise = MakeNoise(dev);
             if (!g_noise) { g_inactive = "couldn't create the noise volume"; return; }
@@ -970,7 +1034,30 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             float wakePlace[3] = {};
             fogwake::Placement(wakePlace);
 
-            const float c[16 * 4] = {
+            // Half resolution: the march goes into a target half the viewport's size (rounded up), then
+            // the upscale draws it onto the screen. Falls back to full resolution if the target can't
+            // be made.
+            bool half = g_settings.halfResolution && g_psUpscale && !g_halfFailed;
+            if (half)
+            {
+                const UINT w = (vp.Width + 1) / 2, h = (vp.Height + 1) / 2;
+                if (g_halfTex && (w != g_halfW || h != g_halfH)) { g_halfTex->Release(); g_halfTex = nullptr; }
+                if (!g_halfTex)
+                {
+                    if (FAILED(dev->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &g_halfTex, nullptr)) &&
+                        FAILED(dev->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_halfTex, nullptr)))
+                    {
+                        g_halfTex = nullptr;
+                        g_halfFailed = true;
+                        g_api->Log(WXL_LOG_WARN, kTag, "ground fog: couldn't create the half-resolution target (%ux%u); drawing at full resolution.", w, h);
+                    }
+                    g_halfW = w;
+                    g_halfH = h;
+                }
+                half = g_halfTex != nullptr;
+            }
+
+            const float c[18 * 4] = {
                 vp.MinZ, 1.0f / (vp.MaxZ - vp.MinZ), vp.MaxZ + 1.0e-4f, g_settings.maxDistance,
                 proj[0], proj[5], proj[8], proj[9],
                 proj[10], proj[14], static_cast<float>(steps), g_settings.depthDecode ? 1.0f : 0.0f,
@@ -991,6 +1078,8 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                 static_cast<float>(g_settings.debugView), g_settings.fogStep > 0.1f ? g_settings.fogStep : 0.1f,
                 kTopBlock * fog::kCellSize, 0.04f,
                 wakePlace[0], wakePlace[1], wakePlace[2], wake ? 1.0f : 0.0f,
+                half ? 0.5f / vp.Width : 0.0f, half ? 0.5f / vp.Height : 0.0f, 0.0f, 0.0f,
+                static_cast<float>(vp.Width), static_cast<float>(vp.Height), static_cast<float>(g_halfW), static_cast<float>(g_halfH),
             };
 
             // Everything the pass changes goes back through the state block, so the client's own cache
@@ -1021,7 +1110,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
 
             dev->SetVertexShader(nullptr);
             dev->SetPixelShader(g_ps);
-            dev->SetPixelShaderConstantF(0, c, 16);
+            dev->SetPixelShaderConstantF(0, c, 18);
 
             dev->SetTexture(0, depthTex);
             dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
@@ -1074,17 +1163,67 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
             dev->SetSamplerState(5, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
             dev->SetSamplerState(5, D3DSAMP_SRGBTEXTURE, FALSE);
 
-            // The viewport, in pixels; the half-pixel offset lines pixels up with D3D9 pixel centres.
-            const float x0 = vp.X - 0.5f, y0 = vp.Y - 0.5f, x1 = x0 + vp.Width, y1 = y0 + vp.Height;
+            // A quad over (x, y, w, h) pixels with uv 0..(u1, v1); the half-pixel offset lines pixels up
+            // with D3D9 pixel centres.
             struct Vtx { float x, y, z, rhw, u, v; };
-            const Vtx quad[4] = {
-                { x0, y0, 0.0f, 1.0f, 0.0f, 0.0f },
-                { x1, y0, 0.0f, 1.0f, 1.0f, 0.0f },
-                { x0, y1, 0.0f, 1.0f, 0.0f, 1.0f },
-                { x1, y1, 0.0f, 1.0f, 1.0f, 1.0f },
+            auto drawQuad = [&](float x, float y, float w, float h, float u1, float v1) {
+                const float x0 = x - 0.5f, y0 = y - 0.5f, x1 = x0 + w, y1 = y0 + h;
+                const Vtx quad[4] = {
+                    { x0, y0, 0.0f, 1.0f, 0.0f, 0.0f },
+                    { x1, y0, 0.0f, 1.0f, u1, 0.0f },
+                    { x0, y1, 0.0f, 1.0f, 0.0f, v1 },
+                    { x1, y1, 0.0f, 1.0f, u1, v1 },
+                };
+                dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(Vtx));
             };
             dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-            dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(Vtx));
+
+            if (!half)
+                drawQuad(static_cast<float>(vp.X), static_cast<float>(vp.Y), static_cast<float>(vp.Width), static_cast<float>(vp.Height), 1.0f, 1.0f);
+            else
+            {
+                // 1. The march into the half-size target, unblended (rgb = scatter, a = transmittance).
+                //    Its uv runs to 2 x size / viewport, so half pixel i sits at full pixel 2i + 1 before
+                //    the shader's shift (cHalf) onto 2i. No depth surface: a multisampled one wouldn't
+                //    match the target (the march doesn't depth-test anyway).
+                IDirect3DSurface9* screen = nullptr;
+                IDirect3DSurface9* halfSurface = nullptr;
+                IDirect3DSurface9* depthNow = nullptr;
+                dev->GetRenderTarget(0, &screen);
+                g_halfTex->GetSurfaceLevel(0, &halfSurface);
+                dev->GetDepthStencilSurface(&depthNow);
+                if (screen && halfSurface)
+                {
+                    dev->SetRenderTarget(0, halfSurface);
+                    dev->SetDepthStencilSurface(nullptr);
+                    D3DVIEWPORT9 hv = { 0, 0, g_halfW, g_halfH, 0.0f, 1.0f };
+                    dev->SetViewport(&hv);
+                    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+                    dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0F);
+                    drawQuad(0.0f, 0.0f, static_cast<float>(g_halfW), static_cast<float>(g_halfH),
+                             2.0f * g_halfW / vp.Width, 2.0f * g_halfH / vp.Height);
+
+                    // 2. Back on the screen: the depth-aware upscale, blended like the full pass.
+                    dev->SetRenderTarget(0, screen); // (resets the viewport: put the world's back)
+                    dev->SetDepthStencilSurface(depthNow);
+                    dev->SetViewport(&vp);
+                    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+                    dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x07);
+                    dev->SetPixelShader(g_psUpscale);
+                    dev->SetTexture(7, g_halfTex);
+                    dev->SetSamplerState(7, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+                    dev->SetSamplerState(7, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                    dev->SetSamplerState(7, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+                    dev->SetSamplerState(7, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+                    dev->SetSamplerState(7, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+                    dev->SetSamplerState(7, D3DSAMP_SRGBTEXTURE, FALSE);
+                    drawQuad(static_cast<float>(vp.X), static_cast<float>(vp.Y), static_cast<float>(vp.Width), static_cast<float>(vp.Height), 1.0f, 1.0f);
+                    dev->SetTexture(7, nullptr);
+                }
+                if (halfSurface) halfSurface->Release();
+                if (screen) screen->Release();
+                if (depthNow) depthNow->Release();
+            }
 
             saved->Apply();
             saved->Release();
@@ -1177,6 +1316,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
         }
         if (g_api->UiCollapsingHeader("Quality##gfquality"))
         {
+            g_api->UiCheckbox("half resolution (upscaled by depth; about a quarter of the GPU time)##gfhalf", &g_settings.halfResolution);
             g_api->UiSliderInt("march step budget##gfsteps", &g_settings.steps, 4, 128);
             g_api->UiSliderFloat("step length in the fog (yd)##gfstep", &g_settings.fogStep, 0.25f, 4.0f);
         }
@@ -1273,7 +1413,10 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
 
     void OnDeviceLost()
     {
-        // Managed resources survive a reset; only the shader is tied to the device object, and a
-        // reset keeps the same device. Nothing to drop here.
+        // Managed resources survive a reset; the half-resolution target is a render target
+        // (D3DPOOL_DEFAULT) and has to go before it. It's made again on the next draw.
+        if (g_halfTex) { g_halfTex->Release(); g_halfTex = nullptr; }
+        g_halfW = g_halfH = 0;
+        g_halfFailed = false;
     }
 }

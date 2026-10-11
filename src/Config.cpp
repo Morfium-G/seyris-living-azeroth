@@ -130,6 +130,7 @@ namespace wxl_livingazeroth::config
             g.enabled = In(s, f, "Enabled", "Draw the ground fog.", g.enabled);
             g.densityScale = In(s, f, "DensityScale", "Your multiplier on every fog kind's density (1 = as FogSettings.cdbc says).", g.densityScale);
             g.maxDistance = In(s, f, "MaxDistance", "How far the fog is drawn, in yards.", g.maxDistance);
+            g.halfResolution = In(s, f, "HalfResolution", "Draw the fog at half resolution, upscaled by depth (sharp at silhouettes): about a quarter of the GPU time.", g.halfResolution);
             g.steps = Whole(s, f, "StepBudget", "Steps per pixel through the fog (quality, not the look): more = smoother far away, slower.", g.steps);
             g.fogStep = In(s, f, "StepLength", "Step length inside the fog near you, in yards (grows with distance). Smaller = finer, slower.", g.fogStep);
             g.dither = In(s, f, "Dither", "0 = smooth (may show faint bands) .. 1 = grainy.", g.dither);
