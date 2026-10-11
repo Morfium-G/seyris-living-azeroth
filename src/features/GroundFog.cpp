@@ -514,7 +514,9 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                         const fog::KindSettings& ks = fog::Settings(k);
                         if (!ks.enabled) continue;
                         const float a = grid.amount[k][index];
-                        const float d = a * ks.density * (1.0f - ks.weight);
+                        const float heavy = grid.pool[k] ? grid.pool[k][index] : 0.0f; // the heavy share, where it has flowed to
+                        const float lightShare = 1.0f - fog::HeavyShare(k, index);    // its weight, more on steep ground
+                        const float d = a * ks.density * lightShare;
                         density += d;
                         weighted += d * ks.thickness;
                         // Where this kind's layer starts: the fog floor, or (water fog, steam) the
@@ -522,10 +524,10 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                         // settles on the surface).
                         const float kindFloor = grid.floor[k] ? std::fmin(grid.floor[k][index], grid.ground[index]) : base[index];
                         floorSum += d * kindFloor;
-                        pool += a * ks.weight * ks.thickness;
-                        heavyWeight += a * ks.weight;
-                        heavyDensity += a * ks.weight * ks.density;
-                        const float share = a * ks.density;
+                        pool += heavy * ks.thickness;
+                        heavyWeight += heavy;
+                        heavyDensity += heavy * ks.density;
+                        const float share = (a * lightShare + heavy) * ks.density; // its fog here, light and heavy
                         for (int ch = 0; ch < 3; ++ch) mix[ch] += share * kindColor[k][ch];
                         mixWeight += share;
                     }
@@ -1145,29 +1147,70 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                  a, b, c, a ? "" : " (no draw point: the fog stays off)");
     }
 
+    void DrawStatusLine()
+    {
+        char line[256];
+        if (g_inactive)
+            std::snprintf(line, sizeof(line), "Fog: not drawing -- %s", g_inactive);
+        else
+            std::snprintf(line, sizeof(line), "Fog: drawing (%.2f ms CPU; GPU: profiler 'ours: fog draw')", g_lastMs);
+        g_api->UiTextWrapped(line);
+    }
+
+    void DrawMainControls()
+    {
+        g_api->UiCheckbox("draw the fog##gfon", &g_settings.enabled);
+        g_api->UiSliderFloat("density scale##gfdens", &g_settings.densityScale, 0.0f, 4.0f);
+        g_api->UiSliderFloat("colour brightness##gfbright", &g_settings.brightness, 0.0f, 3.0f);
+        g_api->UiSliderFloat("max distance (yd)##gfdist", &g_settings.maxDistance, 30.0f, 600.0f);
+    }
+
     void DrawPanelSection()
     {
         char line[256];
-        g_api->UiCheckbox("draw the fog##gfon", &g_settings.enabled);
-        g_api->UiSliderInt("march step budget##gfsteps", &g_settings.steps, 4, 128);
-        g_api->UiSliderFloat("step length in the fog (yd)##gfstep", &g_settings.fogStep, 0.25f, 4.0f);
-        g_api->UiSliderFloat("dither (0 smooth .. 1 grainy)##gfdither", &g_settings.dither, 0.0f, 1.0f);
-        g_api->UiSliderInt("fog floor reach (cells of 2 yd; 0 = follows every cell)##gffloor", &g_settings.floorReach, 0, 4);
+        if (g_api->UiCollapsingHeader("Look##gflook"))
+        {
+            g_api->UiSliderFloat("patchiness##gfnoise", &g_settings.noiseAmount, 0.0f, 1.0f);
+            g_api->UiSliderFloat("patch size (tile, yd)##gftile", &g_settings.noiseTileYards, 8.0f, 256.0f);
+            g_api->UiSliderInt("fog floor reach (2 yd cells; 0 = follows every cell)##gffloor", &g_settings.floorReach, 0, 4);
+            g_api->UiSliderFloat("dither (0 smooth .. 1 grainy)##gfdither", &g_settings.dither, 0.0f, 1.0f);
+        }
+        if (g_api->UiCollapsingHeader("Quality##gfquality"))
+        {
+            g_api->UiSliderInt("march step budget##gfsteps", &g_settings.steps, 4, 128);
+            g_api->UiSliderFloat("step length in the fog (yd)##gfstep", &g_settings.fogStep, 0.25f, 4.0f);
+        }
         if (g_api->UiCollapsingHeader("Units pushing the fog##gfwake")) fogwake::DrawPanelSection(g_api);
         if (g_api->UiCollapsingHeader("Lights in the fog##gflights"))
         {
             g_api->UiCheckbox("our lights light the fog##gflon", &g_settings.fogLights);
             g_api->UiSliderFloat("strength##gflstr", &g_settings.lightStrength, 0.0f, 4.0f);
             g_api->UiSliderFloat("range (yd from the camera)##gflrange", &g_settings.lightRange, 16.0f, 256.0f);
-            std::snprintf(line, sizeof(line), "%u lights reach the fog, %u cell hits, %.3f ms CPU (every frame: they flicker)",
-                          g_lightsUsed, g_lightCells, g_lightMs);
-            g_api->UiTextWrapped(line);
+            std::snprintf(line, sizeof(line), "%u lights reach the fog, %.2f ms CPU", g_lightsUsed, g_lightMs);
+            g_api->UiText(line);
         }
-        g_api->UiSliderFloat("max distance (yd)##gfdist", &g_settings.maxDistance, 30.0f, 600.0f);
-        g_api->UiSliderFloat("density scale##gfdens", &g_settings.densityScale, 0.0f, 4.0f);
-        g_api->UiSliderFloat("patchiness (noise)##gfnoise", &g_settings.noiseAmount, 0.0f, 1.0f);
-        g_api->UiSliderFloat("noise tile (yd)##gftile", &g_settings.noiseTileYards, 8.0f, 256.0f);
-        g_api->UiSliderFloat("colour brightness##gfbright", &g_settings.brightness, 0.0f, 3.0f);
+        if (g_api->UiCollapsingHeader("Colour test##gfcolour"))
+        {
+            const world::Snapshot& s = world::Current();
+            const fogsettings::Values& v = fogsettings::Resolve(s.areaCount > 0 ? s.areaChain[0] : 0, s.mapId, -1);
+            static const char* const kModes[] = { "stock", "hue", "replace" };
+            std::snprintf(line, sizeof(line), "here (FogSettings, all kinds): %s, colour %.2f %.2f %.2f, saturation %.2f, brightness %.2f",
+                          kModes[v.colorMode], v.color[0], v.color[1], v.color[2], v.saturation, v.brightness);
+            g_api->UiTextWrapped(line);
+            g_api->UiCheckbox("test a colour (instead of the table; not saved)##gfctest", &g_settings.colorTest);
+            if (g_settings.colorTest)
+            {
+                g_api->UiCombo("mode##gfcmode", &g_settings.colorMode, kModes, 3);
+                g_api->UiColorEdit("colour##gfccol", g_settings.color);
+                g_api->UiSliderFloat("saturation##gfcsat", &g_settings.saturation, 0.0f, 1.5f);
+                g_api->UiSliderFloat("brightness##gfcbright", &g_settings.colorBrightness, 0.0f, 3.0f);
+            }
+        }
+    }
+
+    void DrawDiagnostics()
+    {
+        char line[256];
         g_api->UiCheckbox("water writes depth while fog draws##gfwater", &g_settings.forceWaterDepth);
         g_api->UiCheckbox("debug: magenta fog##gfdebug", &g_settings.debugColour);
         g_api->UiCheckbox("debug: height bands (must stay on the terrain when the camera turns)##gfbands", &g_settings.heightBands);
@@ -1196,27 +1239,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                           m22, m32, m32 / (-1.0f - m22), m32 / (1.0f - m22), m22 != 0.0f ? -m32 / m22 : 0.0f, m32 / (1.0f - m22));
             g_api->UiTextWrapped(line);
         }
-        {
-            const world::Snapshot& s = world::Current();
-            const fogsettings::Values& v = fogsettings::Resolve(s.areaCount > 0 ? s.areaChain[0] : 0, s.mapId, -1);
-            static const char* const kModes[] = { "stock", "hue", "replace" };
-            std::snprintf(line, sizeof(line), "colour here (FogSettings, all kinds): %s, colour %.2f %.2f %.2f, saturation %.2f, brightness %.2f",
-                          kModes[v.colorMode], v.color[0], v.color[1], v.color[2], v.saturation, v.brightness);
-            g_api->UiTextWrapped(line);
-            g_api->UiCheckbox("colour test (instead of the table; not saved)##gfctest", &g_settings.colorTest);
-            if (g_settings.colorTest)
-            {
-                g_api->UiCombo("mode##gfcmode", &g_settings.colorMode, kModes, 3);
-                g_api->UiColorEdit("colour##gfccol", g_settings.color);
-                g_api->UiSliderFloat("saturation##gfcsat", &g_settings.saturation, 0.0f, 1.5f);
-                g_api->UiSliderFloat("brightness##gfcbright", &g_settings.colorBrightness, 0.0f, 3.0f);
-            }
-        }
-        if (g_inactive)
-            std::snprintf(line, sizeof(line), "renderer: not drawing -- %s", g_inactive);
-        else
-            std::snprintf(line, sizeof(line), "renderer: drawing, %.3f ms CPU (GPU time: frame profiler, 'ours: fog draw'); %u frames, %u field uploads",
-                          g_lastMs, g_draws, g_fieldUploads);
+        std::snprintf(line, sizeof(line), "renderer: %u frames drawn, %u field uploads; lights: %u cell hits", g_draws, g_fieldUploads, g_lightCells);
         g_api->UiTextWrapped(line);
         {
             // The fog's column where the player stands: is the player inside a pool, and how deep is it?
@@ -1229,7 +1252,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
                 const fog::KindSettings& ks = fog::Settings(k);
                 if (!ks.enabled) continue;
                 const float a = fog::AmountAt(k, s.playerPos[0], s.playerPos[1]);
-                pool += a * ks.weight * ks.thickness;
+                pool += fog::Explain(k).pool * ks.thickness; // the breakdown's pool is the player's cell
                 light += a * ks.density * (1.0f - ks.weight);
             }
             float cam[3];

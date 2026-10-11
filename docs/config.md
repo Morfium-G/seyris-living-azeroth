@@ -61,6 +61,9 @@ Where fog forms, and each kind's density, thickness, colour and so on, come from
 | Lights | 1 | Our lights (torches, braziers, lamps) light the fog around them. |
 | LightStrength | 1 | Your multiplier on our lights' light in the fog. |
 | LightRange | 128 | Lights farther than this from the camera (yards) don't light the fog. Lower = cheaper. |
+| PoolSpeed | 1 | How fast heavy fog (each kind's Weight share) runs downhill into hollows: 1 = default, 0 = it stays where it formed. The light share never runs off. |
+| SteepStart | 30 | Degrees: from this slope a growing share of the ground-hugging fog (mist, area fog, haze) runs off; it doesn't hang on steep ground. Water fog and steam keep their own weight. |
+| SteepFull | 45 | Degrees: from this slope all of it runs off. |
 | WaterWritesDepth | 1 | While fog is drawn, water writes depth so lakes are fogged at their surface (not their bed). |
 
 ## `[LivingAzeroth.FogWake]`: characters and creatures pushing the fog aside

@@ -1,6 +1,7 @@
 #include "Config.hpp"
 
 #include "debug/WindView.hpp"
+#include "env/Fog.hpp"
 #include "env/Shelter.hpp"
 #include "features/FogWake.hpp"
 #include "features/GroundFog.hpp"
@@ -139,6 +140,9 @@ namespace wxl_livingazeroth::config
             g.fogLights = In(s, f, "Lights", "Our lights (torches, braziers, lamps) light the fog around them.", g.fogLights);
             g.lightStrength = In(s, f, "LightStrength", "Your multiplier on our lights' light in the fog.", g.lightStrength);
             g.lightRange = In(s, f, "LightRange", "Lights farther than this from the camera (yards) don't light the fog. Lower = cheaper.", g.lightRange);
+            fog::Field().poolSpeed = In(s, f, "PoolSpeed", "How fast heavy fog (each kind's Weight share) runs downhill into hollows: 1 = default, 0 = it stays where it formed.", fog::Field().poolSpeed);
+            fog::Field().steepStart = In(s, f, "SteepStart", "Degrees: from this slope a growing share of the ground-hugging fog runs off (it doesn't hang on steep ground).", fog::Field().steepStart);
+            fog::Field().steepFull = In(s, f, "SteepFull", "Degrees: from this slope all of it runs off.", fog::Field().steepFull);
             g.forceWaterDepth = In(s, f, "WaterWritesDepth", "While fog is drawn, water writes depth so lakes are fogged at their surface (not their bed).", g.forceWaterDepth);
         }
         // Units pushing the ground fog aside.

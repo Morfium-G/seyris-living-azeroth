@@ -50,8 +50,12 @@ namespace wxl_livingazeroth::groundfog
     /// Hooks (from WXL_Load: they must be attached there).
     void Install(const WXL_Api* api);
 
-    /// The renderer's part of the fog panel.
+    /// The renderer's parts of the fog panel: a one-line status, the main controls (always shown),
+    /// the collapsed sections (look, quality, units, lights, colour test), and the diagnostics.
+    void DrawStatusLine();
+    void DrawMainControls();
     void DrawPanelSection();
+    void DrawDiagnostics();
 
     void OnDeviceLost();
 }

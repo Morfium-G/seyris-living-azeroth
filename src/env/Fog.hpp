@@ -68,6 +68,17 @@ namespace wxl_livingazeroth::fog
         // so steam blown onto a bank fades on it instead of draping up it. nullptr for the others
         // (their layer starts at the ground). Meaningless where the kind's amount is 0.
         const float*   floor[kKindCount] = {};
+        // Heavy fog, per kind with a Weight: the part that runs downhill and pools (in amount units,
+        // up to kMaxPool in hollows). It forms toward Weight x amount where the fog forms, drifts with
+        // the wind and flows; the amount itself never flows, so the light share (1 - Weight) stays
+        // spread where it formed. The renderer draws the light layer from the amount and the pools
+        // from this.
+        const float*   pool[kKindCount] = {};
+        // How steep each cell is, as a share 0..255 (FieldSettings steepStart..steepFull): fog doesn't
+        // hang on steep ground, so there the light share of the ground-hugging kinds counts as heavy
+        // too and runs off (HeavyShare). Water fog and steam keep their own weight (they hang at the
+        // height they formed at).
+        const uint8_t* steep = nullptr;
         unsigned       groundMissing = 0;
         uint32_t       groundVersion = 0;
     };
@@ -94,6 +105,44 @@ namespace wxl_livingazeroth::fog
     };
     const RulesInputs& Inputs();
     float TargetAt(int kind, float x, float y);
+
+    /// Why a kind's fog is what it is where the player stands (the fog panel's breakdown): the rule's
+    /// factors (they multiply; "alternative" ones: only the largest of them counts), the target they
+    /// give, and what moved the amount over the last step, per second: toward the target (build-up /
+    /// burn-off), the wind carrying the field, heavy fog flowing downhill.
+    struct Factor
+    {
+        const char* name = "";
+        float input = 0.0f;       // the input as the rule reads it (degC, 0..1, ...)
+        float factor = 1.0f;      // what it multiplies the target by (-1: an input of the factor above, none of its own)
+        bool  alternative = false;
+    };
+    struct Explanation
+    {
+        int    count = 0;
+        Factor factors[10];
+        float  target = 0.0f;     // after Strength and the 0..1 clamp
+        float  amount = 0.0f;
+        float  rules = 0.0f, wind = 0.0f;                      // the amount, per second, last step
+        float  slopeDegrees = 0.0f, heavyShare = 0.0f;         // the ground's slope here, and the share that runs off (Weight, more on steep ground)
+        float  pool = 0.0f, poolTarget = 0.0f;                 // its heavy pool here, and where it heads (heavy share x amount)
+        float  poolRules = 0.0f, poolWind = 0.0f, poolFlow = 0.0f; // the pool, per second, last step
+        bool   valid = false;
+    };
+    const Explanation& Explain(int kind);
+
+    /// Field settings that aren't per kind.
+    struct FieldSettings
+    {
+        float poolSpeed = 1.0f;   // how fast heavy fog runs downhill (1 = a surface step evens out in ~1 s; 0 = it stays put)
+        float steepStart = 30.0f; // degrees: from here a growing share of the ground-hugging fog runs off ...
+        float steepFull = 45.0f;  // ... and from here all of it
+    };
+    FieldSettings& Field();
+
+    /// The share of a kind's fog that runs off as heavy fog in a cell (storage index): its Weight, or
+    /// more on steep ground (ground-hugging kinds). The renderer draws the rest as the light layer.
+    float HeavyShare(int kind, int index);
     float Progress(int kind);
 
     /// Once per frame, after fields::Update(). Steps the field a few times a second.
