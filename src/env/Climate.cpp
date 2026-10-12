@@ -379,6 +379,50 @@ namespace wxl_livingazeroth::climate
         return For(area, g_blendMap);
     }
 
+    int AreaWeightsAt(float x, float y, uint32_t* areas, float* weights, int max)
+    {
+        const float fx = x / kChunk - 0.5f, fy = y / kChunk - 0.5f;
+        const int i0 = static_cast<int>(std::floor(fx)), j0 = static_cast<int>(std::floor(fy));
+        const float tx = fx - i0, ty = fy - j0;
+        const float w[4] = { (1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty };
+        int count = 0;
+        float total = 0.0f;
+        for (int c = 0; c < 4; ++c)
+        {
+            // A corner counts like in At(): only a known chunk, its share spread over the known
+            // chunks among it and its 8 neighbours (its blur).
+            const int ci = i0 + (c & 1), cj = j0 + (c >> 1);
+            if (!Blended(ci, cj)) continue;
+            uint32_t around[9];
+            int known = 0;
+            for (int dj = -1; dj <= 1; ++dj)
+                for (int di = -1; di <= 1; ++di)
+                {
+                    if (!InWindow(ci + di, cj + dj)) continue;
+                    const BlendCell& o = BlendAt(ci + di, cj + dj);
+                    if (o.i == ci + di && o.j == cj + dj && o.known) around[known++] = o.area;
+                }
+            for (int n = 0; n < known; ++n)
+            {
+                const float share = w[c] / known;
+                int at = 0;
+                while (at < count && areas[at] != around[n]) ++at;
+                if (at == count)
+                {
+                    if (count >= max) continue;
+                    areas[count] = around[n];
+                    weights[count] = 0.0f;
+                    ++count;
+                }
+                weights[at] += share;
+                total += share;
+            }
+        }
+        if (total > 1.0e-6f)
+            for (int n = 0; n < count; ++n) weights[n] /= total;
+        return total > 1.0e-6f ? count : 0;
+    }
+
     Row Here() { return At(g_playerPos[0], g_playerPos[1]); }
 
     const Sun& SunNow() { return g_sun; }

@@ -71,7 +71,7 @@ namespace wxl_livingazeroth::groundfog
         UINT                     g_halfW = 0, g_halfH = 0;
         bool                     g_halfFailed = false;  // couldn't make the target: full resolution
         IDirect3DTexture9*       g_field = nullptr;
-        IDirect3DTexture9*       g_colorTex = nullptr; // A8R8G8B8: the fog's colour per cell / 2, alpha the pool mask
+        IDirect3DTexture9*       g_colorTex = nullptr; // A8R8G8B8: the fog's colour per cell / 2, alpha the pool's depth / 4 yd
         IDirect3DTexture9*       g_topTex = nullptr;   // R32F kTopSize^2: the highest fog top per block and its neighbours
         constexpr int   kTopBlock = 4;                                 // cells per top-map block (8 yd)
         constexpr int   kTopSize = fog::kGridSize / kTopBlock;         // 32^2 = 4 KB
@@ -90,12 +90,23 @@ namespace wxl_livingazeroth::groundfog
         // What the last draw read (for the panel's depth diagnostics).
         D3DVIEWPORT9 g_seenViewport{};
         float        g_seenM22 = 0.0f, g_seenM32 = 0.0f;
+        // The probe ray (diagnostics): the shader's own march for one pixel, read back. Row m - 1 is
+        // probe mode m (see the shader's cProbe2); in modes 1 and 2 column k stops after k + 1 iterations.
+        constexpr int kProbeCols = 128, kProbeModes = 9, kConstRegs = 21;
+        IDirect3DTexture9*  g_probeTex = nullptr;  // D3DPOOL_DEFAULT render target
+        IDirect3DSurface9*  g_probeSys = nullptr;  // its system-memory copy for the readback
+        bool                g_probeFailed = false;
+        bool                g_probeHave = false;
+        float               g_probe[kProbeModes][kProbeCols][4];
+        float               g_probeConst[kConstRegs * 4];  // the constants it ran with
+        bool                g_probeHalf = false;
+        int                 g_probePx = 0, g_probePy = 0;
         // ------------------------------------------------------------------ shader
         const char* const kPsHlsl = R"(
 sampler2D depthTex : register(s0);
 sampler2D fieldTex : register(s1);   // r = light density per yd at the ground, g = its thickness (yd), b = ground z - cCam.w, a = heavy pool surface z - cCam.w
 sampler3D noiseTex : register(s2);
-sampler2D colorTex : register(s3);   // rgb = the fog's colour there / 2 (the kinds' colours, mixed by their share), a = 1 where a pool lies
+sampler2D colorTex : register(s3);   // rgb = the fog's colour there / 2 (the kinds' colours, mixed by their share), a = the pool's depth / 4 yd (0: none)
 float4 cDepth  : register(c0);  // x = viewport min z, y = 1 / (max z - min z), z = deepest world depth, w = max distance
 float4 cProj   : register(c1);  // projection m00, m11, m20, m21
 float4 cProj2  : register(c2);  // projection m22, m32, the march's step budget, depth decode switch
@@ -105,21 +116,32 @@ float4 cInv2   : register(c5);
 float4 cCam    : register(c6);  // xyz = r3 = the camera in world space, w = ground reference z
 float4 cGrid   : register(c7);  // x = 1 / the field's extent (yd), y = dither (0 none .. 1 the first step in the fog shortened per pixel)
 float4 cBox    : register(c8);  // the field's valid box: min x, min y, max x, max y
-float4 cColor  : register(c9);  // x = our lights in the fog (lightTex bound), a = density scale
+float4 cColor  : register(c9);  // x = our lights in the fog (lightTex bound), y = pool softness, a = density scale
 float4 cNoise  : register(c10); // xyz = drift offset (tiles), w = 1 / tile size (yd)
 float4 cNoise2 : register(c11); // x = noise amount, y = 1 / edge fade (yd), z = debug colour
 float4 cUv     : register(c12); // depth texture uv = xy + uv * zw
 float4 cPool   : register(c13); // x = heavy pool density per yd, y = the pools' soft top (yd), z = the fog's ceiling (world z), w = pool gate
-float4 cView   : register(c14); // x = debug view: 0 the fog, 1 light layer only, 2 pools only, 3 ground check;
+float4 cView   : register(c14); // x = debug view: 0 the fog, 1 light layer only, 2 pools only, 3 ground check, 4 near/far/budget;
                                 //   y = step in the fog (yd), z = the top map's block (yd), w = step growth per yd of distance
 sampler2D topTex : register(s4);     // r = the highest fog top in the block and its 8 neighbours - cCam.w (-1e5: none), point sampled
 sampler2D lightTex : register(s6);   // our lights' light reaching the fog per field cell (rgb, linear), on when cColor.x
 sampler2D wakeTex : register(s5);   // units pushing the fog (features/FogWake): r = push (< 0 at the rim), g = its top z - cCam.w, ba = pattern displacement (yd)
 float4 cWake   : register(c15); // xy = the wake map's origin (world), z = 1 / its extent (yd), w = on
-float4 cHalf   : register(c16); // xy = uv shift onto full-resolution texel centres (half resolution; 0 at full)
+float4 cHalf   : register(c16); // xy = uv shift onto full-resolution texel centres (half resolution; 0 at full), w = fog beyond the max distance (the long last step) on
 float4 cFar    : register(c18); // the far map (features/FogFar): xy = its window's corner (world), z = 1 / its extent (yd), w = on
 sampler2D farTex      : register(s8); // r density per yd, g thickness, b ground - cCam.w, a top - cCam.w (block + neighbours); wraps
 sampler2D farColorTex : register(s9); // rgb colour / 2
+float4 cProbe  : register(c19); // the probe ray: xy = its uv (a full-resolution pixel centre), zw = its pixel for the jitter
+float4 cProbe2 : register(c20); // x = probe on (draw its cross), yz = the viewport in pixels, w = probe mode (0: the fog)
+
+// The probe ray (the panel's diagnostics): this same shader, drawn into a small target with a probe
+// mode (cProbe2.w) per row. Every pixel then marches the probe's pixel (cProbe.xy) instead of its
+// own; in modes 1 and 2 pixel column k stops after k + 1 iterations, so reading the columns gives
+// the march's trajectory step by step. Modes: 1 t, tPrev (the last sample's t), zPrev, T;
+// 2 scatter rgb, done; 3 t0 t1 dist len; 4 dir, budget; 5 world, raw depth; 6 camera, ceiling;
+// 7 the full result (scatter, T); 8 self-check: vpos, the cap it gives, mode; 9 (column k: after k + 1
+// iterations) the near and far fog tops where the march stands, its z, its near-field weight (box). (A separate probe build of the shader didn't fit ps_3_0's 32
+// temporary registers: the march uses 30.)
 
 // The wake at a step (its middle pm, height zm): how much of the fog stays (the push reaches up to
 // the unit's height, softly), and the patch pattern's displacement there.
@@ -142,22 +164,16 @@ float LightAverage(float B, float T, float za, float zb)
     return (LayerIntegral(zb, B, T) - LayerIntegral(za, B, T)) / (zb - za);
 }
 
-// The pool's factor saturate((S - z) / s) (full below its surface S, a soft top s) averaged over z in
-// [za, zb]. With u = (S - z) / s, the antiderivative of saturate(u) is 0, u^2 / 2, u - 1/2.
+// The pool's factor saturate(u), u = (surface - z) / soft top, averaged over a range of u: the
+// antiderivative of saturate(u) is 0, u^2 / 2, u - 1/2.
 float RampIntegral(float u) { u = max(u, 0); return u < 1 ? 0.5 * u * u : u - 0.5; }
-float PoolAverage(float S, float za, float zb, float s)
-{
-    float ua = (S - za) / s, ub = (S - zb) / s;
-    if (abs(ua - ub) < 1e-3) return saturate(0.5 * (ua + ub));
-    return (RampIntegral(ua) - RampIntegral(ub)) / (ua - ub);
-}
 
 // The fog at a point (xy): the near field (+ its colour, with our lights' light added, and the fade
 // at its edge) and, where that fades out, the far map (each zone's typical fog per terrain chunk).
 struct FogSample
 {
     float4 f;      // near field (fieldTex)
-    float4 col;    // near colour (rgb, light added), a = the pool mask
+    float4 col;    // near colour (rgb, light added), a = the pool's depth / 4 yd
     float  edge;   // 1 inside the near field .. 0 past its edge
     float4 far;    // far map: r density, g thickness, b ground - ref, a top - ref
     float3 farCol;
@@ -172,6 +188,7 @@ FogSample SampleField(float2 xy)
     if (cColor.x > 0.5) s.col.rgb += tex2Dlod(lightTex, uvw).rgb;
     s.edge = saturate(min(min(xy.x - cBox.x, cBox.z - xy.x), min(xy.y - cBox.y, cBox.w - xy.y)) * cNoise2.y);
     s.f = tex2Dlod(fieldTex, uvw);
+    s.edge *= saturate(s.f.g * 4); // cells not started yet (thickness < 0): the far map stands in
     s.far = float4(0, 1, 0, 0);
     s.farCol = 0;
     [branch] if (cFar.w > 0.5 && s.edge < 1)
@@ -185,21 +202,48 @@ FogSample SampleField(float2 xy)
     return s;
 }
 
-// Extinction per yd, averaged over the step's height range [za, zb], with the field read at one
-// point: x near, y far. Light layer: falls off above the ground. Heavy fog: everything below the
-// pool's flat surface f.a (the terrain hides what's under it), with a soft top, gated by the pool
-// mask (an empty cell's level, just under its ground, only kept fog off the banks where the field's
-// ground matched the drawn surface; elsewhere, ungated, empty cells filled with fog). Far: the
-// zones' typical light layer on each chunk's lowest ground, where the near field fades out.
-float2 Sigma(FogSample s, float za, float zb)
+// The pool at a point, as u = (its surface - z) / its soft top (>= 1: full). Heavy fog: everything
+// below the pool's flat surface f.a (the terrain hides what's under it). Its top blurs over a share
+// of its depth (cColor.y), centred on the surface so the pool keeps its amount (with a fixed 0.3 yd
+// top and an on/off mask per cell, pools running down gullies showed sharp edges).
+float PoolU(FogSample s, float z)
 {
-    float light = s.f.r * LightAverage(s.f.b + cCam.w, max(s.f.g, 0.25), za, zb);
-    float pool = cPool.x * PoolAverage(s.f.a + cCam.w, za, zb, cPool.y);
-    if (cPool.w > 0.5) pool *= s.col.a;
-    float far = s.far.r * LightAverage(s.far.b + cCam.w, max(s.far.g, 0.25), za, zb);
+    float soft = clamp(s.col.a * 4 * cColor.y, cPool.y, 2.0);
+    return (s.f.a + cCam.w + 0.5 * (soft - cPool.y) - z) / soft;
+}
+// The pool's gate at a point: its depth (an empty cell's level, just under its ground, only kept fog
+// off the banks where the field's ground matched the drawn surface; elsewhere, ungated, empty cells
+// filled with fog); pools thinner than the softness in yd fade out.
+float PoolGate(FogSample s) { return cPool.w > 0.5 ? saturate(s.col.a * 4 / max(cColor.y, 0.02)) : 1; }
+
+// A step's extinction per yd at both its ends A and B (x near, y far each), the ray at heights za, zb
+// there. The fog's height profile (light layer: full below its floor, falling off above over its
+// thickness; pool: the ramp below its surface; far: the zones' typical layer on each chunk's lowest
+// ground) is averaged over the step with the ray's height ABOVE THE FOG'S FLOOR going linearly from
+// one end's value to the other's, and each end's density weighs it. Before, each end's floor counted
+// for the whole step: far away, a 5-10 yd step on a slope has floors yards apart at its ends, and
+// whether a step "met" the layer hung on where the step fell: lines along the terrain's height
+// contours at a distance (changing with Weight, dotted by the dither).
+void StepSigma(FogSample A, FogSample B, float za, float zb, out float2 gA, out float2 gB)
+{
+    float ref = cCam.w;
+    // An end in a cell not started yet (thickness < 0, its ground a placeholder) takes the other's
+    // near floor, thickness and pool; an end without far fog the other's far floor.
+    bool rA = A.f.g > 0, rB = B.f.g > 0;
+    float bA = rA || !rB ? A.f.b : B.f.b, bB = rB || !rA ? B.f.b : A.f.b; // near layer floor (empty cells hold their ground)
+    float tA = rA ? A.f.g : B.f.g, tB = rB ? B.f.g : A.f.g;
+    float fA = A.far.r > 0 ? A.far.b : B.far.b, fB = B.far.r > 0 ? B.far.b : A.far.b;
+    float light = LightAverage(0, max(0.5 * (tA + tB), 0.25), za - (bA + ref), zb - (bB + ref));
+    float far = LightAverage(0, max(max(A.far.g, B.far.g), 0.25), za - (fA + ref), zb - (fB + ref));
+    FogSample pA = A, pB = B;
+    if (!rA && rB) pA = B;
+    if (!rB && rA) pB = A;
+    float ua = PoolU(pA, za), ub = PoolU(pB, zb);
+    float pool = cPool.x * (abs(ua - ub) < 1e-3 ? saturate(0.5 * (ua + ub)) : (RampIntegral(ua) - RampIntegral(ub)) / (ua - ub));
     if (cView.x > 0.5 && cView.x < 1.5) pool = 0;
     if (cView.x > 1.5 && cView.x < 2.5) { light = 0; far = 0; }
-    return float2((light + pool) * s.edge, far * (1 - s.edge));
+    gA = float2((A.f.r * light + pool * PoolGate(A)) * A.edge, A.far.r * far * (1 - A.edge));
+    gB = float2((B.f.r * light + pool * PoolGate(B)) * B.edge, B.far.r * far * (1 - B.edge));
 }
 
 // A sample's colour: near and far by their share of its fog.
@@ -207,7 +251,7 @@ float3 SampleColour(FogSample s, float2 sigma)
 {
     return (sigma.x * s.col.rgb + sigma.y * s.farCol) / max(sigma.x + sigma.y, 1e-6);
 }
-
+)" R"(
 // `stepLen`: a step much longer than a patch (~1/8 of the tile) averages over many of them, so the
 // patchiness fades toward its mean there (one point read per step gave scattered dots far away).
 float Patchiness(float3 p, float stepLen)
@@ -222,9 +266,27 @@ float Patchiness(float3 p, float stepLen)
 
 float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
 {
-    // Half resolution: the quad's uv lands between two full-resolution texels; cHalf.xy moves it onto
-    // the first one's centre, so this pixel is exactly full pixel (2i, 2j) (the upscale relies on it).
-    uv -= cHalf.xy;
+    float mode = cProbe2.w;
+    int cap = 128; // the probe's trajectory rows stop here (only the loop; the steps still plan with the budget)
+    if (mode > 7.5 && mode < 8.5) return float4(vpos, (int)vpos.x + 1, mode); // probe self-check: which column computed what
+    if (mode > 0.5)
+    {
+        if (mode < 2.5 || mode > 8.5) cap = (int)vpos.x + 1;
+        uv = cProbe.xy;
+        vpos = cProbe.zw;
+    }
+    else
+    {
+        // Half resolution: the quad's uv lands between two full-resolution texels; cHalf.xy moves it
+        // onto the first one's centre, so this pixel is exactly full pixel (2i, 2j) (the upscale relies on it).
+        uv -= cHalf.xy;
+        // The probe's cross (a gap in the middle leaves its pixel visible).
+        if (cProbe2.x > 0.5)
+        {
+            float2 px = abs((uv - cProbe.xy) * cProbe2.yz);
+            if ((px.x < 1.5 && px.y > 4 && px.y < 16) || (px.y < 1.5 && px.x > 4 && px.x < 16)) return float4(1, 1, 0, 0);
+        }
+    }
     float d = tex2Dlod(depthTex, float4(cUv.xy + uv * cUv.zw, 0, 0)).r;
     // The client's projection is OpenGL-style (0x6BF370: m22 = (f + n) / (f - n), m32 = -2fn / (f - n),
     // depth -1..1); the D3D backend maps that to 0..1 within the viewport. So back to -1..1 first:
@@ -235,6 +297,8 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
     float2 ndc = float2(uv.x * 2 - 1, 1 - uv.y * 2);
     float3 v = float3((ndc.x - cProj.z) * viewZ / cProj.x, (ndc.y - cProj.w) * viewZ / cProj.y, viewZ);
     float3 world = v.x * cInv0.xyz + v.y * cInv1.xyz + v.z * cInv2.xyz + cCam.xyz;
+    if (mode > 4.5 && mode < 5.5) return float4(world, d);
+    if (mode > 5.5 && mode < 6.5) return float4(cCam.xyz, cPool.z);
     // Debug: the reconstructed world position as contour bands (height every 2 yd in red, x/y every
     // 8 yd in green/blue). Right decoding: they stay on the terrain while the camera turns.
     if (cNoise2.w > 0.5 && d <= cDepth.z)
@@ -243,14 +307,14 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
     // ungated pool term covers this surface without a pool (the drawn surface lies below the
     // field's empty-cell level), brighter the deeper. Green: the drawn surface is within 1 yd above
     // the field's ground. Blue: higher (objects, roofs). Grey: outside the field.
-    if (cView.x > 2.5 && d <= cDepth.z)
+    if (cView.x > 2.5 && cView.x < 3.5 && d <= cDepth.z)
     {
         float4 uvs = float4(world.xy * cGrid.x, 0, 0);
         float4 g = tex2Dlod(fieldTex, uvs);
         float pooled = tex2Dlod(colorTex, uvs).a;
         float under = g.a + cCam.w + cPool.y - world.z;
         float3 c = float3(0.2, 0.25, 0.45);
-        if (pooled > 0.5) c = float3(0.9, 0.9, 0.9);
+        if (pooled > 0.004) c = float3(0.9, 0.9, 0.9);
         else if (under > 0) c = float3(1, 0.1, 0.1) * (0.4 + 0.6 * saturate(under / 4));
         else if (world.z - (g.b + cCam.w) < 1) c = float3(0.1, 0.6, 0.1);
         if (min(min(world.x - cBox.x, cBox.z - world.x), min(world.y - cBox.y, cBox.w - world.y)) < 0) c = 0.15;
@@ -262,6 +326,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
     float3 dir = ray / max(dist, 1e-4);
     if (d > cDepth.z) dist = cDepth.w; // sky and the distant terrain beyond the world viewport
     float len = min(dist, cDepth.w);
+    if (mode > 3.5 && mode < 4.5) return float4(dir, cProj2.z);
 
     // Only the part of the ray below the fog's ceiling (the highest fog top in the field): the
     // steps fall inside the thin layer instead of spreading over the whole view, so a pool a yard
@@ -270,10 +335,11 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
     float t0 = 0, t1 = len;
     if (cCam.z > cPool.z)
     {
-        if (dir.z >= -1e-4) return float4(0, 0, 0, 1);
+        if (dir.z >= -1e-4) { if (mode > 2.5 && mode < 3.5) return float4(-1, -1, dist, len); return float4(0, 0, 0, 1); }
         t0 = (cCam.z - cPool.z) / -dir.z;
     }
     else if (dir.z > 1e-4) t1 = min(t1, (cPool.z - cCam.z) / dir.z);
+    if (mode > 2.5 && mode < 3.5) return float4(t0, t1, dist, len);
     if (t0 >= t1) return float4(0, 0, 0, 1);
 
     // The march: through air above every fog top it jumps (the top map: the highest fog top per
@@ -297,9 +363,11 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
     FogSample P = (FogSample)0;
     float tPrev = 0, zPrev = 0;
     bool fresh = false;
+    float done = 0; // the ray reached its end (or the fog turned opaque): for the debug view
     [loop] for (int i = 0; i < 128; ++i)
     {
-        if (i >= budget || T < 0.005) break;
+        if (T < 0.005) { done = 1; break; }
+        if (i >= budget || i >= cap) break;
         float3 p = cCam.xyz + dir * t;
         // The fog's top here: the near top map inside the near field, the far map's where that fades
         // out (both hold the highest top among a block and its neighbours).
@@ -313,46 +381,96 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
         float jump = cView.z / horizontal;
         if (dir.z < -1e-4) jump = min(jump, gap / -dir.z);
         jump = max(jump, 0.05);
+        if (box <= 0 && cFar.w < 0.5) jump = t1 - t; // left the near field, no far map: nothing more comes
+        // A skip shorter than a fog step here: step instead (fog steps are exact). A ray running
+        // nearly parallel to a falling top (the far map's, over a slope) landed just above it again
+        // and again: skips of 8, 3, 1.8 ... 0.15 yd until the budget ran out (probe, 2026-10-12).
+        if (above && jump < max(cView.y, t * cView.w)) above = false;
+        // No `continue` in this loop: fxc compiled the skip's `continue` without masking the rest of
+        // the body, so every skip also ran the "closed step ended in the air" skip below: it jumped twice
+        // (the second time unchecked, through the fog into the ground) and used up 3 iterations
+        // (disassembly + probe captures, 2026-10-12). Plain if/else instead.
         [branch] if (above && !havePrev)
         {
-            if (t >= t1) break;
+            if (t >= t1) { done = 1; break; }
             t = min(t + jump, t1);
-            continue;
         }
-
-        FogSample S = SampleField(p.xy);
-        [branch] if (havePrev)
+        else
         {
-            float2 gA = Sigma(P, zPrev, p.z), gB = Sigma(S, zPrev, p.z);
-            float sA = gA.x + gA.y, sB = gB.x + gB.y;
-            float sigma = 0.5 * (sA + sB);
-            [branch] if (sigma > 1e-5)
+            FogSample S = SampleField(p.xy);
+            [branch] if (havePrev)
             {
-                // The step's fog in its own colour (the kinds' mix at both ends, by their fog), seen
-                // through what's in front.
-                float3 pm = cCam.xyz + dir * (0.5 * (tPrev + t));
-                // Units: the fog pushed out around them and their trail, its pattern dragged along
-                // (sampled where the pattern would have come from).
-                float2 displace;
-                sigma *= WakeKeep(pm, 0.5 * (zPrev + p.z), displace);
-                float a = 1 - exp(-sigma * Patchiness(pm - float3(displace, 0), t - tPrev) * (t - tPrev) * cColor.a);
-                float3 c = cNoise2.z > 0.5 ? float3(1, 0, 1) : (sA * SampleColour(P, gA) + sB * SampleColour(S, gB)) / (sA + sB);
-                scatter += T * a * c;
-                T *= 1 - a;
+                float2 gA, gB;
+                StepSigma(P, S, zPrev, p.z, gA, gB);
+                float sA = gA.x + gA.y, sB = gB.x + gB.y;
+                float sigma = 0.5 * (sA + sB);
+                [branch] if (sigma > 1e-5)
+                {
+                    // The step's fog in its own colour (the kinds' mix at both ends, by their fog), seen
+                    // through what's in front.
+                    float3 pm = cCam.xyz + dir * (0.5 * (tPrev + t));
+                    // Units: the fog pushed out around them and their trail, its pattern dragged along
+                    // (sampled where the pattern would have come from).
+                    float2 displace;
+                    sigma *= WakeKeep(pm, 0.5 * (zPrev + p.z), displace);
+                    float a = 1 - exp(-sigma * Patchiness(pm - float3(displace, 0), t - tPrev) * (t - tPrev) * cColor.a);
+                    float3 c = cNoise2.z > 0.5 ? float3(1, 0, 1) : (sA * SampleColour(P, gA) + sB * SampleColour(S, gB)) / (sA + sB);
+                    if (cView.x > 3.5) c = float3(0, gA.x + gB.x, gA.y + gB.y) / (sA + sB); // debug: near green, far blue
+                    scatter += T * a * c;
+                    T *= 1 - a;
+                }
+            }
+            if (t >= t1) { done = 1; break; }
+            if (above) { havePrev = false; t = min(t + jump, t1); } // out of the fog again
+            else
+            {
+                fresh = !havePrev;
+                P = S; tPrev = t; zPrev = p.z; havePrev = true;
+                // At least the step the rest of the budget needs to reach the end evenly (a far ray that ran
+                // out used to put everything left into one last step, sampled at one point: scattered dots).
+                // The dither (cGrid.y) shortens the first step in the fog per pixel, shifting the steps:
+                // grain instead of banding (there's no frame-to-frame smoothing to hide grain).
+                float ds = max(max(cView.y, t * cView.w), (t1 - t) / max(budget - i - 1, 1));
+                if (fresh) ds *= lerp(1, max(jitter, 0.05), cGrid.y);
+                t = min(t + ds, t1);
             }
         }
-        if (t >= t1) break;
-        if (above) { havePrev = false; t = min(t + jump, t1); continue; } // out of the fog again
-        fresh = !havePrev;
-        P = S; tPrev = t; zPrev = p.z; havePrev = true;
-        // At least the step the rest of the budget needs to reach the end evenly (a far ray that ran
-        // out used to put everything left into one last step, sampled at one point: scattered dots).
-        // The dither (cGrid.y) shortens the first step in the fog per pixel, shifting the steps:
-        // grain instead of banding (there's no frame-to-frame smoothing to hide grain).
-        float ds = max(max(cView.y, t * cView.w), (t1 - t) / max(budget - i - 1, 1));
-        if (fresh) ds *= lerp(1, max(jitter, 0.05), cGrid.y);
-        t = min(t + ds, t1);
     }
+    if (mode > 0.5 && mode < 1.5) return float4(t, tPrev, zPrev, T);
+    if (mode > 1.5 && mode < 2.5) return float4(scatter, done);
+    if (mode > 8.5)
+    {
+        // Probe: the fog tops where the march stands now (what the next iteration would compare with).
+        float3 q = cCam.xyz + dir * t;
+        float qb = saturate(min(min(q.x - cBox.x, cBox.z - q.x), min(q.y - cBox.y, cBox.w - q.y)) * cNoise2.y);
+        float nearTop = qb > 0 ? tex2Dlod(topTex, float4(q.xy * cGrid.x, 0, 0)).r + cCam.w : -1e5;
+        float farTop = cFar.w > 0.5 ? tex2Dlod(farTex, float4(q.xy * cFar.z, 0, 0)).a + cCam.w : -1e5;
+        return float4(nearTop, farTop, q.z, qb);
+    }
+    // Beyond the march's reach (MaxDistance) to the terrain actually drawn there: one long step through
+    // the far map (each zone's typical fog), with the ray's height above its floor going linearly
+    // from one end to the other, so the fog covers the whole view distance (flying, the march ended in
+    // mid-air and the ground below had none). Not for the sky or a ray clipped by the fog's ceiling.
+    [branch] if (cHalf.w > 0.5 && done > 0.5 && cFar.w > 0.5 && dist > len + 1 && t1 >= len - 1e-3 && T >= 0.005)
+    {
+        float3 pa = cCam.xyz + dir * len;
+        FogSample A = SampleField(pa.xy), B = SampleField(world.xy);
+        float2 gA, gB;
+        StepSigma(A, B, pa.z, world.z, gA, gB);
+        float sA = gA.x + gA.y, sB = gB.x + gB.y;
+        float sigma = 0.5 * (sA + sB);
+        [branch] if (sigma > 1e-5)
+        {
+            float a = 1 - exp(-sigma * (dist - len) * cColor.a);
+            float3 c = cNoise2.z > 0.5 ? float3(1, 0, 1) : (sA * SampleColour(A, gA) + sB * SampleColour(B, gB)) / (sA + sB);
+            if (cView.x > 3.5) c = float3(0, gA.x + gB.x, gA.y + gB.y) / (sA + sB);
+            scatter += T * a * c;
+            T *= 1 - a;
+        }
+    }
+    // Debug: the march ran out of steps before the end of the ray (the fog beyond, or its last step,
+    // is missing): red.
+    if (cView.x > 3.5 && done < 0.5) return float4(scatter * 0.3 + float3(0.7, 0, 0), T * 0.3);
     return float4(scatter, T);
 }
 )";
@@ -418,8 +536,16 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
             return static_cast<uint16_t>(sign | (exp << 10) | ((mant + 0x1000u) >> 13 > 0x3FFu ? 0x3FFu : (mant + 0x1000u) >> 13));
         }
 
+        void ReleaseProbe()
+        {
+            if (g_probeTex) { g_probeTex->Release(); g_probeTex = nullptr; }
+            if (g_probeSys) { g_probeSys->Release(); g_probeSys = nullptr; }
+            g_probeFailed = false;
+        }
+
         void ReleaseGpu()
         {
+            ReleaseProbe();
             if (g_ps) { g_ps->Release(); g_ps = nullptr; }
             if (g_psUpscale) { g_psUpscale->Release(); g_psUpscale = nullptr; }
             if (g_halfTex) { g_halfTex->Release(); g_halfTex = nullptr; }
@@ -502,7 +628,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
         float SettingsSignature()
         {
             // (Other places' rows change only with a reload: the table's generation stands for them.)
-            float s = g_settings.densityScale * 7.0f + g_settings.floorReach * 0.731f + g_settings.debugPlaces * 5.3f +
+            float s = g_settings.densityScale * 7.0f + g_settings.floorReach * 0.731f + g_settings.debugPlaces * 5.3f + g_settings.poolSoftness * 2.9f +
                       static_cast<float>(fogsettings::Generation() % 1000) * 0.0137f;
             for (int k = 0; k < fog::kKindCount; ++k)
             {
@@ -655,6 +781,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
             static std::unordered_map<uint32_t, int> placeIndex; // place -> palette slot, kept while the map stays
             static int placeIndexMap = -2;
             if (placeIndexMap != world::Current().mapId) { placeIndex.clear(); placeIndexMap = world::Current().mapId; }
+            const bool haveFarTops = g_settings.farFog != 0;
 
             for (int r = 0; r < fog::kGridSize; ++r)
             {
@@ -669,7 +796,18 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
                     float density = 0.0f, weighted = 0.0f, pool = 0.0f, floorSum = 0.0f;
                     float mix[3] = {}, mixWeight = 0.0f; // colour: the kinds' colours by their share of the fog here
                     const uint32_t area = grid.area ? grid.area[index] : 0;
-                    const PlaceColours& colours = coloursOf(area);
+                    // The place's colours, blended toward the other place around like its settings
+                    // (env/Fog: with blended settings only the colours still changed at a border).
+                    PlaceColours colours = coloursOf(area); // (a copy: the next lookup may grow the cache)
+                    uint32_t otherArea = 0;
+                    const float otherShare = fog::BlendOf(index, otherArea);
+                    if (otherShare > 0.0f && otherArea != area)
+                    {
+                        const PlaceColours& other = coloursOf(otherArea);
+                        for (int k = 0; k < fog::kKindCount; ++k)
+                            for (int ch = 0; ch < 3; ++ch)
+                                colours.kind[k][ch] += (other.kind[k][ch] - colours.kind[k][ch]) * otherShare;
+                    }
                     for (int k = 0; k < fog::kKindCount; ++k)
                     {
                         const fog::KindSettings& ks = fog::SettingsAt(k, index); // the cell's own place's
@@ -700,7 +838,11 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
                         for (int ch = 0; ch < 3; ++ch) mix[ch] = kPalette[slot->second][ch] * mixWeight;
                     }
                     const bool blocked = grid.block && grid.block[index] == 3;
-                    const float thickness = density > 0.0f ? weighted / density : 1.0f;
+                    // Not started yet (scrolled in, ground or rules pending): no fog of its own, so the
+                    // far map stands in there (marked by a negative thickness). Moving fast, these
+                    // cells left a gap between the near fog and the far fog.
+                    const bool unready = !grid.groundKnown[index] || (grid.fresh && grid.fresh[index]);
+                    const float thickness = unready ? -1.0f : (density > 0.0f ? weighted / density : 1.0f);
                     const float layerFloor = density > 0.0f ? floorSum / density : base[index]; // the kinds' floors by their density
                     texel[0] = ToHalf(blocked ? 0.0f : density);
                     texel[1] = ToHalf(thickness);
@@ -713,14 +855,22 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
                     // on a lower base instead, the pool's slab reached over the bank, above the slope.)
                     const bool pooled = !blocked && pool >= 0.02f;
                     texel[3] = ToHalf((pooled ? grid.ground[index] + pool : base[index] - 1.0f) - g_groundRef);
-                    cellPooled[index] = pooled ? 255 : 0;
+                    // The pool's depth (/ 4 yd) for the shader's gate and soft top; at least 1 where a pool lies.
+                    cellPooled[index] = pooled ? static_cast<uint8_t>(std::fmax(1.0f, std::fmin(255.0f, pool / 4.0f * 255.0f + 0.5f))) : 0;
 
                     // The highest fog top in the field: the march only covers the height below it.
                     // Per cell too, for the top map (the march jumps through air above it).
                     cellTop[index] = kNoTop;
-                    if (!blocked && (density > 1.0e-4f || pooled))
+                    if (unready && haveFarTops)
                     {
-                        const float top = std::fmax(pooled ? grid.ground[index] + pool + 0.5f : -1.0e9f,
+                        const int i = grid.firstI + wrap(c - grid.firstI), j = grid.firstJ + wrap(r - grid.firstJ); // world cell
+                        const float farTop = fogfar::TopAt((i + 0.5f) * fog::kCellSize, (j + 0.5f) * fog::kCellSize);
+                        if (farTop > kNoTop) cellTop[index] = farTop - g_groundRef;
+                    }
+                    else if (!blocked && (density > 1.0e-4f || pooled))
+                    {
+                        // (The pool's soft top reaches up to half its width above the surface: <= 1 yd.)
+                        const float top = std::fmax(pooled ? grid.ground[index] + pool + 0.5f + std::fmin(0.5f * pool * g_settings.poolSoftness, 1.0f) : -1.0e9f,
                                                     density > 1.0e-4f ? layerFloor + thickness * 4.0f : -1.0e9f);
                         if (top > ceiling) ceiling = top;
                         cellTop[index] = top - g_groundRef;
@@ -1047,6 +1197,133 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
             return false;
         }
 
+        /// How many iterations the probe's march ran: the first column whose state equals the one
+        /// before (the loop had stopped), else all of them.
+        int ProbeIterations()
+        {
+            for (int k = 1; k < kProbeCols; ++k)
+                if (std::memcmp(g_probe[0][k], g_probe[0][k - 1], sizeof(g_probe[0][k])) == 0 &&
+                    std::memcmp(g_probe[1][k], g_probe[1][k - 1], sizeof(g_probe[1][k])) == 0)
+                    return k;
+            return kProbeCols;
+        }
+
+        const char* ProbeEnding()
+        {
+            const float* ray = g_probe[2][0];   // mode 3: t0 t1 dist len
+            if (ray[0] == -1.0f && ray[1] == -1.0f) return "not marched: camera above the fog's ceiling, looking level or up";
+            if (ray[0] >= ray[1]) return "not marched: the ray is above the fog's ceiling (t0 >= t1)";
+            const float done = g_probe[1][kProbeCols - 1][3];
+            const float T = g_probe[6][0][3];
+            if (done > 0.5f) return T < 0.005f ? "fog turned opaque" : "reached the end of the ray";
+            return "stopped before the end of the ray (out of steps)";
+        }
+
+        bool SaveProbe(char* where, size_t whereSize)
+        {
+            // Every save appends a numbered capture (one file name overwritten each time lost captures).
+            static int s_capture = 0;
+            ++s_capture;
+            const char* path = "Logs\\fog-probe.txt";
+            FILE* f = std::fopen(path, "a");
+            if (!f) return false;
+            if (where)
+            {
+                char full[MAX_PATH] = "";
+                GetFullPathNameA(path, sizeof(full), full, nullptr);
+                std::snprintf(where, whereSize, "capture #%d saved to %s", s_capture, full);
+            }
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            const float* c = g_probeConst;
+            std::fprintf(f, "\n==================== capture #%d ====================\n", s_capture);
+            std::fprintf(f, "ground fog probe ray, %04d-%02d-%02d %02d:%02d:%02d\n", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+            std::fprintf(f, "pixel %d, %d of %.0f x %.0f (%s resolution)\n", g_probePx, g_probePy, c[81], c[82], g_probeHalf ? "half" : "full");
+            std::fprintf(f, "settings: budget %.0f, step %.2f yd, growth %.3f/yd, top block %.1f yd, far jump %.1f yd, dither %.2f, max distance %.1f, "
+                            "density scale %.3f, pool softness %.2f, patchiness %.2f, far map %s, debug view %.0f, decode %s\n",
+                         c[10], c[57], c[59], c[58], c[66], c[29], c[3], c[39], c[37], c[44], c[75] > 0.5f ? "on" : "off", c[56],
+                         c[11] > 0.5f ? "D3D" : "OpenGL");
+            std::fprintf(f, "constants: depth range min %.4f scale %.4f deepest %.5f | ground ref %.2f | field box %.1f %.1f .. %.1f %.1f | "
+                            "pool density %.4f soft top %.2f ceiling %.2f gate %.0f\n",
+                         c[0], c[1], c[2], c[27], c[32], c[33], c[34], c[35], c[52], c[53], c[54], c[55]);
+            const float* m3 = g_probe[2][0]; const float* m4 = g_probe[3][0]; const float* m5 = g_probe[4][0]; const float* m6 = g_probe[5][0];
+            std::fprintf(f, "ray: t0 %.3f t1 %.3f dist %.3f len %.3f | dir %.4f %.4f %.4f | world %.2f %.2f %.2f, raw depth %.7f\n",
+                         m3[0], m3[1], m3[2], m3[3], m4[0], m4[1], m4[2], m5[0], m5[1], m5[2], m5[3]);
+            std::fprintf(f, "camera %.2f %.2f %.2f, ceiling %.2f\n", m6[0], m6[1], m6[2], m6[3]);
+            const float* m7 = g_probe[6][0];
+            std::fprintf(f, "result: scatter %.4f %.4f %.4f, light let through %.4f\n", m7[0], m7[1], m7[2], m7[3]);
+            std::fprintf(f, "march (panel's reading): %d iterations; %s\n\n", ProbeIterations(), ProbeEnding());
+            // Every column, raw; runs of identical columns collapsed. "check" is the probe's own
+            // self-check (mode 8): the pixel's vpos.x and the iteration cap it gives (must be col + 1).
+            std::fprintf(f, " col | check vpos.x cap |        t |  last sample t |  its z |  light through | scatter r g b          | done | t moved"
+                            " | then: z there | near top | far top | in field\n");
+            int same = 0;
+            for (int k = 0; k < kProbeCols; ++k)
+            {
+                const float* a = g_probe[0][k];
+                const float* b = g_probe[1][k];
+                const float* s = g_probe[7][k];
+                const bool repeat = k > 0 && std::memcmp(a, g_probe[0][k - 1], 16) == 0 && std::memcmp(b, g_probe[1][k - 1], 16) == 0;
+                if (repeat && k < kProbeCols - 1) { ++same; continue; }
+                if (same) { std::fprintf(f, "     | (%d more columns, same as above)\n", same); same = 0; }
+                const float moved = a[0] - (k ? g_probe[0][k - 1][0] : m3[0]);
+                const float* tp = g_probe[8][k];
+                std::fprintf(f, "%4d | %10.2f %5.0f | %8.3f | %14.3f | %6.2f | %14.5f | %6.4f %6.4f %6.4f | %4.0f | %7.3f | %13.2f | %8.2f | %7.2f | %8.2f\n",
+                             k, s[0], s[2], a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], moved, tp[2], tp[0], tp[1], tp[3]);
+            }
+
+            // The simulation's cells through the point under the cross: east-west and north-south, +-24 yd.
+            // Per cell its area and settings slot, and per kind target / amount / pool; then each slot's
+            // settings. (Seams that only grow while the field runs: which of these jumps at the border.)
+            const float hx = m5[0], hy = m5[1];
+            std::fprintf(f, "\nfield cross-section through %.1f, %.1f (cells of %.0f yd; per kind: target / amount / pool; '-' all zero)\n",
+                         hx, hy, fog::kCellSize);
+            int slotCount = 0;
+            int slotSeen[64];
+            uint32_t slotArea[64];
+            auto noteSlot = [&](int slot, uint32_t area) {
+                for (int n = 0; n < slotCount; ++n) if (slotSeen[n] == slot) return;
+                if (slotCount < 64) { slotSeen[slotCount] = slot; slotArea[slotCount] = area; ++slotCount; }
+            };
+            for (int line = 0; line < 2; ++line)
+            {
+                std::fprintf(f, "%s:\n   off | cell i, j     | area  slot | mix: toward share | known fresh block | ground  steep |", line ? "north-south (y)" : "east-west (x)");
+                for (int k = 0; k < fog::kKindCount; ++k) std::fprintf(f, " %-20s |", fog::KindName(k));
+                std::fprintf(f, "\n");
+                for (int o = -12; o <= 12; ++o)
+                {
+                    fog::CellState cs;
+                    const float x = hx + (line ? 0.0f : o * fog::kCellSize), y = hy + (line ? o * fog::kCellSize : 0.0f);
+                    if (!fog::CellAt(x, y, cs)) { std::fprintf(f, "  %+4d | outside the field\n", o * 2); continue; }
+                    std::fprintf(f, "  %+4d | %6d %6d | %5u %4d | %10d %6.2f | %5d %5d %5d | %6.2f %6.2f |", o * 2, cs.i, cs.j, cs.area, cs.slot,
+                                 cs.blendShare > 0.0f ? cs.blendSlot : -1, cs.blendShare,
+                                 cs.known ? 1 : 0, cs.fresh ? 1 : 0, cs.block, cs.ground, cs.steep);
+                    for (int k = 0; k < fog::kKindCount; ++k)
+                    {
+                        if (cs.target[k] == 0.0f && cs.amount[k] == 0.0f && cs.pool[k] == 0.0f) std::fprintf(f, " %-20s |", "-");
+                        else std::fprintf(f, " %.3f/%.3f/%.3f  |", cs.target[k], cs.amount[k], cs.pool[k]);
+                    }
+                    std::fprintf(f, "\n");
+                    noteSlot(cs.slot, cs.area);
+                    if (cs.blendShare > 0.0f) noteSlot(cs.blendSlot, cs.blendArea);
+                }
+            }
+            std::fprintf(f, "each place's own settings, unblended (per kind: density, thickness, weight, build-up s, burn-off s, strength, enabled):\n");
+            for (int n = 0; n < slotCount; ++n)
+            {
+                std::fprintf(f, "  slot %d (area %u):", slotSeen[n], slotArea[n]);
+                for (int k = 0; k < fog::kKindCount; ++k)
+                {
+                    const fog::KindSettings& ks = fog::SettingsOfArea(k, slotArea[n]);
+                    std::fprintf(f, " | %s %.3f %.1f %.2f %.0f %.0f %.2f %d", fog::KindName(k), ks.density, ks.thickness, ks.weight,
+                                 ks.buildUpSeconds, ks.burnOffSeconds, ks.strength, ks.enabled);
+                }
+                std::fprintf(f, "\n");
+            }
+            std::fclose(f);
+            return true;
+        }
+
         const char* FindConflict()
         {
             for (const char* dll : kConflicts)
@@ -1201,7 +1478,10 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
                 half = g_halfTex != nullptr;
             }
 
-            const float c[19 * 4] = {
+            // The probe's pixel: the screen centre, rounded to an even pixel (at half resolution a march
+            // pixel of its own: half pixel i = full pixel 2i).
+            const int probePx = static_cast<int>(vp.Width / 4) * 2, probePy = static_cast<int>(vp.Height / 4) * 2;
+            float c[kConstRegs * 4] = {
                 vp.MinZ, 1.0f / (vp.MaxZ - vp.MinZ), vp.MaxZ + 1.0e-4f, g_settings.maxDistance,
                 proj[0], proj[5], proj[8], proj[9],
                 proj[10], proj[14], static_cast<float>(steps), g_settings.depthDecode ? 1.0f : 0.0f,
@@ -1212,7 +1492,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
                 1.0f / extent, g_settings.dither, 0.0f, 0.0f,
                 grid.firstI * fog::kCellSize, grid.firstJ * fog::kCellSize,
                 (grid.firstI + fog::kGridSize) * fog::kCellSize, (grid.firstJ + fog::kGridSize) * fog::kCellSize,
-                lightTex ? 1.0f : 0.0f, 0.0f, 0.0f, // (colours come from the colour texture)
+                lightTex ? 1.0f : 0.0f, std::fmax(g_settings.poolSoftness, 0.0f), 0.0f, // (colours come from the colour texture)
                 g_settings.densityScale * (1.0f - (interior > 0.0f ? interior : 0.0f)),
                 g_noiseOffset[0], g_noiseOffset[1], g_noiseOffset[2], 1.0f / (g_settings.noiseTileYards > 1.0f ? g_settings.noiseTileYards : 1.0f),
                 g_settings.noiseAmount, 1.0f / 16.0f, g_settings.debugColour ? 1.0f : 0.0f, g_settings.heightBands ? 1.0f : 0.0f,
@@ -1222,9 +1502,12 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
                 static_cast<float>(g_settings.debugView), g_settings.fogStep > 0.1f ? g_settings.fogStep : 0.1f,
                 kTopBlock * fog::kCellSize, 0.04f,
                 wakePlace[0], wakePlace[1], wakePlace[2], wake ? 1.0f : 0.0f,
-                half ? 0.5f / vp.Width : 0.0f, half ? 0.5f / vp.Height : 0.0f, 0.0f, 0.0f,
+                half ? 0.5f / vp.Width : 0.0f, half ? 0.5f / vp.Height : 0.0f, 0.0f, g_settings.beyondMax ? 1.0f : 0.0f,
                 static_cast<float>(vp.Width), static_cast<float>(vp.Height), static_cast<float>(g_halfW), static_cast<float>(g_halfH),
                 farMaps.originX, farMaps.originY, farMaps.invExtent, haveFar ? 1.0f : 0.0f,
+                (probePx + 0.5f) / vp.Width, (probePy + 0.5f) / vp.Height,
+                static_cast<float>(half ? probePx / 2 : probePx), static_cast<float>(half ? probePy / 2 : probePy),
+                g_settings.probe ? 1.0f : 0.0f, static_cast<float>(vp.Width), static_cast<float>(vp.Height), 0.0f,
             };
 
             // Everything the pass changes goes back through the state block, so the client's own cache
@@ -1255,7 +1538,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
 
             dev->SetVertexShader(nullptr);
             dev->SetPixelShader(g_ps);
-            dev->SetPixelShaderConstantF(0, c, 19);
+            dev->SetPixelShaderConstantF(0, c, kConstRegs);
 
             dev->SetTexture(0, depthTex);
             dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
@@ -1380,6 +1663,68 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
                 if (depthNow) depthNow->Release();
             }
 
+            // The probe ray: the same shader, same constants, into a small target, one row per probe
+            // mode; read back right away (a stall, only while the probe is on).
+            if (g_settings.probe && !g_probeFailed)
+            {
+                if (!g_probeTex)
+                {
+                    if (FAILED(dev->CreateTexture(kProbeCols, kProbeModes, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A32B32G32R32F, D3DPOOL_DEFAULT, &g_probeTex, nullptr)) ||
+                        FAILED(dev->CreateOffscreenPlainSurface(kProbeCols, kProbeModes, D3DFMT_A32B32G32R32F, D3DPOOL_SYSTEMMEM, &g_probeSys, nullptr)))
+                    {
+                        ReleaseProbe();
+                        g_probeFailed = true;
+                        g_api->Log(WXL_LOG_WARN, kTag, "ground fog: couldn't create the probe's target (A32B32G32R32F); the probe stays off.");
+                    }
+                }
+                IDirect3DSurface9* screen = nullptr;
+                IDirect3DSurface9* probeSurface = nullptr;
+                IDirect3DSurface9* depthNow = nullptr;
+                if (g_probeTex)
+                {
+                    dev->GetRenderTarget(0, &screen);
+                    g_probeTex->GetSurfaceLevel(0, &probeSurface);
+                    dev->GetDepthStencilSurface(&depthNow);
+                }
+                if (screen && probeSurface)
+                {
+                    dev->SetRenderTarget(0, probeSurface);
+                    dev->SetDepthStencilSurface(nullptr);
+                    D3DVIEWPORT9 pv = { 0, 0, kProbeCols, kProbeModes, 0.0f, 1.0f };
+                    dev->SetViewport(&pv);
+                    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+                    dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0F);
+                    dev->SetPixelShader(g_ps);
+                    for (int m = 1; m <= kProbeModes; ++m)
+                    {
+                        float mode[4] = { c[80], c[81], c[82], static_cast<float>(m) };
+                        dev->SetPixelShaderConstantF(20, mode, 1);
+                        drawQuad(0.0f, static_cast<float>(m - 1), static_cast<float>(kProbeCols), 1.0f, 1.0f, 1.0f);
+                    }
+                    dev->SetRenderTarget(0, screen);
+                    dev->SetDepthStencilSurface(depthNow);
+                    dev->SetViewport(&vp);
+                    if (SUCCEEDED(dev->GetRenderTargetData(probeSurface, g_probeSys)))
+                    {
+                        D3DLOCKED_RECT lr{};
+                        if (SUCCEEDED(g_probeSys->LockRect(&lr, nullptr, D3DLOCK_READONLY)))
+                        {
+                            for (int r = 0; r < kProbeModes; ++r)
+                                std::memcpy(g_probe[r], static_cast<const uint8_t*>(lr.pBits) + r * lr.Pitch, sizeof(g_probe[r]));
+                            g_probeSys->UnlockRect();
+                            std::memcpy(g_probeConst, c, sizeof(g_probeConst));
+                            g_probeHalf = half;
+                            g_probePx = probePx;
+                            g_probePy = probePy;
+                            g_probeHave = true;
+                        }
+                    }
+                }
+                if (probeSurface) probeSurface->Release();
+                if (screen) screen->Release();
+                if (depthNow) depthNow->Release();
+            }
+
             saved->Apply();
             saved->Release();
             if (boundDepth)
@@ -1466,8 +1811,10 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
         {
             g_api->UiSliderFloat("patchiness##gfnoise", &g_settings.noiseAmount, 0.0f, 1.0f);
             g_api->UiSliderFloat("patch size (tile, yd)##gftile", &g_settings.noiseTileYards, 8.0f, 256.0f);
+            g_api->UiSliderFloat("heavy fog softness (0 crisp .. 1 soft edges)##gfpsoft", &g_settings.poolSoftness, 0.0f, 1.0f);
             g_api->UiSliderInt("fog floor reach (2 yd cells; 0 = follows every cell)##gffloor", &g_settings.floorReach, 0, 4);
             g_api->UiCheckbox("far fog (beyond 128 yd: each zone's typical fog)##gffar", &g_settings.farFog);
+            g_api->UiCheckbox("far fog past the max distance (to the terrain drawn there)##gfbeyond", &g_settings.beyondMax);
             g_api->UiSliderFloat("dither (0 smooth .. 1 grainy)##gfdither", &g_settings.dither, 0.0f, 1.0f);
         }
         if (g_api->UiCollapsingHeader("Quality##gfquality"))
@@ -1507,6 +1854,22 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
     void DrawDiagnostics()
     {
         char line[256];
+        g_api->UiCheckbox("probe ray: read the march at the yellow cross (screen centre)##gfprobe", &g_settings.probe);
+        if (g_settings.probe)
+        {
+            if (g_probeFailed) g_api->UiText("probe: couldn't create its target (see the log)");
+            else if (!g_probeHave) g_api->UiText("probe: waiting for the fog to draw");
+            else
+            {
+                std::snprintf(line, sizeof(line), "probe: %d iterations, %s; light let through %.3f",
+                              ProbeIterations(), ProbeEnding(), g_probe[6][0][3]);
+                g_api->UiTextWrapped(line);
+                static char saved[MAX_PATH] = "";
+                if (g_api->UiButton("Save the probe to Logs\\fog-probe.txt##gfprobesave"))
+                    if (!SaveProbe(saved, sizeof(saved))) std::snprintf(saved, sizeof(saved), "couldn't write Logs\\fog-probe.txt");
+                if (saved[0]) g_api->UiTextWrapped(saved);
+            }
+        }
         g_api->UiCheckbox("water writes depth while fog draws##gfwater", &g_settings.forceWaterDepth);
         g_api->UiCheckbox("debug: magenta fog##gfdebug", &g_settings.debugColour);
         static const char* const kPlaces[] = { "off", "by zone", "by area (subzones)" };
@@ -1516,8 +1879,9 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
         g_api->UiCombo("depth decoding##gfdecode", &g_settings.depthDecode, kDecode, 2);
         g_api->UiCheckbox("pool fog only where a pool lies (off: the old way, for comparison)##gfgate", &g_settings.poolGate);
         static const char* const kViews[] = { "the fog", "light layer only", "heavy pools only",
-                                              "ground check (white pool, red = pool fog without a pool, green ok, blue above)" };
-        g_api->UiCombo("debug view##gfview", &g_settings.debugView, kViews, 4);
+                                              "ground check (white pool, red = pool fog without a pool, green ok, blue above)",
+                                              "near fog green, far fog blue, red = march ran out of steps" };
+        g_api->UiCombo("debug view##gfview", &g_settings.debugView, kViews, 5);
         if (g_api->UiButton("Check the field's ground against the terrain##gfcheck")) CheckGround();
         if (g_check.done)
         {
@@ -1576,5 +1940,6 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
         if (g_halfTex) { g_halfTex->Release(); g_halfTex = nullptr; }
         g_halfW = g_halfH = 0;
         g_halfFailed = false;
+        ReleaseProbe();
     }
 }

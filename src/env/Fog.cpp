@@ -130,6 +130,11 @@ namespace wxl_livingazeroth::fog
         std::vector<AreaSlot> g_slots(1);
         std::unordered_map<uint32_t, uint16_t> g_slotOfArea;
         std::vector<uint16_t> g_areaSlot; // per cell
+        // Per cell, the blend toward the strongest other place around (climate::AreaWeightsAt, the
+        // climate's own ~100 yd blend): its slot and its share (0..255). Settings switched at every
+        // area border (area fog 0.15/2 yd vs 0.03/8 yd: a visible seam; probe, 2026-10-12). 3 bytes a cell.
+        std::vector<uint16_t> g_blendSlot;
+        std::vector<uint8_t>  g_blendShare;
         uint32_t g_slotsGeneration = ~0u;
         int      g_slotsMap = -2;
         uint16_t SlotOf(uint32_t area);
@@ -178,15 +183,18 @@ namespace wxl_livingazeroth::fog
             g_liquid.assign(kGridSize * kGridSize, 0);
             g_area.assign(kGridSize * kGridSize, 0);
             g_areaSlot.assign(kGridSize * kGridSize, 0);
+            g_blendSlot.assign(kGridSize * kGridSize, 0);
+            g_blendShare.assign(kGridSize * kGridSize, 0);
             g_grid.area = g_area.data();
             g_fresh.assign(kGridSize * kGridSize, 1);
+            g_grid.fresh = g_fresh.data();
             g_steep.assign(kGridSize * kGridSize, 0);
             g_slope.assign(kGridSize * kGridSize, 0.0f);
             g_grid.steep = g_steep.data();
             g_grid.ground = g_ground.data();
             g_grid.groundKnown = g_groundKnown.data();
             g_grid.block = g_block.data();
-            g_stats.kilobytes = static_cast<unsigned>((kKindCount * (2 * sizeof(float) + 1) + 4 * sizeof(float) + sizeof(uint32_t) + 4) * kGridSize * kGridSize / 1024);
+            g_stats.kilobytes = static_cast<unsigned>((kKindCount * (2 * sizeof(float) + 1) + 4 * sizeof(float) + sizeof(uint32_t) + 4 + 3) * kGridSize * kGridSize / 1024);
         }
 
         void ForgetGround(int index)
@@ -197,6 +205,7 @@ namespace wxl_livingazeroth::fog
             g_liquid[index] = 0;
             g_area[index] = 0;
             g_areaSlot[index] = 0;
+            g_blendShare[index] = 0;
             g_steep[index] = 0;
             g_slope[index] = 0.0f;
             g_fresh[index] = 1;
@@ -440,7 +449,52 @@ namespace wxl_livingazeroth::fog
             for (size_t s = 1; s < g_slots.size(); ++s) ResolveSlot(g_slots[s]);
         }
 
-        const KindSettings& CellSettings(int kind, int index) { return g_slots[g_areaSlot[index]].kind[kind]; }
+        /// Two places' settings mixed (share t of b): the numbers blend, on/off and the panel switch
+        /// come from the larger share.
+        KindSettings Mix(const KindSettings& a, const KindSettings& b, float t)
+        {
+            KindSettings r = t < 0.5f ? a : b;
+            auto lerp = [t](float x, float y) { return x + (y - x) * t; };
+            r.strength = lerp(a.strength, b.strength);
+            r.buildUpSeconds = lerp(a.buildUpSeconds, b.buildUpSeconds);
+            r.burnOffSeconds = lerp(a.burnOffSeconds, b.burnOffSeconds);
+            r.thickness = lerp(a.thickness, b.thickness);
+            r.density = lerp(a.density, b.density);
+            r.windThin = lerp(a.windThin, b.windThin);
+            r.windDrift = lerp(a.windDrift, b.windDrift);
+            r.patchiness = lerp(a.patchiness, b.patchiness);
+            r.weight = lerp(a.weight, b.weight);
+            return r;
+        }
+
+        /// A cell's kind settings: its place's, blended toward the strongest other place around.
+        KindSettings CellSettings(int kind, int index)
+        {
+            const KindSettings& own = g_slots[g_areaSlot[index]].kind[kind];
+            const uint8_t share = g_blendShare[index];
+            if (!share) return own;
+            return Mix(own, g_slots[g_blendSlot[index]].kind[kind], share / 255.0f);
+        }
+
+        /// The cell's blend (g_blendSlot / g_blendShare) from the climate's area weights at its centre:
+        /// toward the strongest other area, by its weight against its own area's.
+        void UpdateBlend(int i, int j, int index)
+        {
+            uint32_t areas[16];
+            float weights[16];
+            const int n = climate::AreaWeightsAt((i + 0.5f) * kCellSize, (j + 0.5f) * kCellSize, areas, weights, 16);
+            const uint32_t own = g_area[index];
+            float wOwn = 0.0f, wOther = 0.0f;
+            uint32_t other = 0;
+            for (int m = 0; m < n; ++m)
+            {
+                if (areas[m] == own) wOwn = weights[m];
+                else if (weights[m] > wOther) { wOther = weights[m]; other = areas[m]; }
+            }
+            if (!own || !other || wOther <= 0.0f) { g_blendShare[index] = 0; return; }
+            g_blendSlot[index] = SlotOf(other);
+            g_blendShare[index] = static_cast<uint8_t>(wOther / (wOwn + wOther) * 255.0f + 0.5f);
+        }
 
         /// How calm it is for a kind at a place: 1 still air .. 0 at its WindThin and above.
         float CalmFor(const KindSettings& s)
@@ -587,7 +641,10 @@ namespace wxl_livingazeroth::fog
             const float pos[3] = { (i + 0.5f) * kCellSize, (j + 0.5f) * kCellSize, z + 0.5f };
             AreaInputs a = InputsFor(g_area[index] ? g_area[index] : g_playerArea);
             SetClimate(a, climate::At(pos[0], pos[1]));
-            auto Calm = [&](int k) { return CalmFor(g_slots[a.slot].kind[k]); }; // the place's own WindThin
+            // The cell's settings (its place's, blended across borders like the climate): WindThin, Strength.
+            KindSettings cell[kKindCount];
+            for (int k = 0; k < kKindCount; ++k) cell[k] = CellSettings(k, index);
+            auto Calm = [&](int k) { return CalmFor(cell[k]); };
             float wet = 0.0f, groundTemp = a.airNow;
             if (g_fieldMoisture >= 0) fields::Sample(g_fieldMoisture, pos, wet);
             if (g_fieldTemperature >= 0) fields::Sample(g_fieldTemperature, pos, groundTemp);
@@ -679,9 +736,9 @@ namespace wxl_livingazeroth::fog
                 }
             for (int k = 0; k < kKindCount; ++k)
             {
-                note(k, g_settings[k].enabled ? "Strength (FogSettings, this place)" : "kind switched off", a.strength[k],
-                     g_settings[k].enabled ? a.strength[k] : 0.0f);
-                out[k] = g_settings[k].enabled ? Clamp01(out[k] * a.strength[k]) : 0.0f;
+                note(k, g_settings[k].enabled ? "Strength (FogSettings, this place, blended)" : "kind switched off", cell[k].strength,
+                     g_settings[k].enabled ? cell[k].strength : 0.0f);
+                out[k] = g_settings[k].enabled ? Clamp01(out[k] * cell[k].strength) : 0.0f;
                 if (explain) explain[k].target = out[k];
             }
         }
@@ -709,6 +766,8 @@ namespace wxl_livingazeroth::fog
             if (g_fieldMoisture == -2) g_fieldMoisture = fields::Find("moisture");
             if (g_fieldTemperature == -2) g_fieldTemperature = fields::Find("temperature");
             const double t0 = grassperf::Now();
+            static std::vector<int> startedNow;
+            startedNow.clear();
             for (int r = 0; r < kGridSize / 4; ++r)
             {
                 const int j = g_grid.firstJ + g_rulesRow;
@@ -719,6 +778,7 @@ namespace wxl_livingazeroth::fog
                 {
                     const int index = Index(i, j);
                     if (!g_groundKnown[index]) continue;
+                    UpdateBlend(i, j, index);
                     UpdateSlope(i, j, index);
                     float t[kKindCount];
                     CellTargets(i, j, index, t);
@@ -732,21 +792,56 @@ namespace wxl_livingazeroth::fog
                             g_pool[k][index] = weight * t[k];
                             if (kAnchored[k]) g_floor[k][index] = g_ground[index];
                         }
-                        // A cell that just scrolled in starts at its zone's typical fog (the zone-wide
-                        // kinds: walking toward a foggy zone finds its fog there), else where the fog
-                        // around the player has got; then it follows its own rules.
-                        else if (g_fresh[index])
+                        // A cell that just scrolled in continues its running neighbours: their progress
+                        // (amount / target, averaged) applied to its own target, so where the targets
+                        // match it starts at the neighbours' amount, and a hilltop next to a hollow still
+                        // starts at its own lower target. Where their targets have gone but fog lingers,
+                        // their amount (minus the steep share). Neighbours started in this same pass
+                        // don't count (after a teleport one row would be copied over the grid). Each new
+                        // strip at the field's edge used to start from an estimate (the zone's progress)
+                        // and then relax for minutes (mist: 300 s half-life): bands of rows at a
+                        // distance, differing while their targets were equal (probe cross-sections,
+                        // 2026-10-12). No running neighbour: the zone's progress (zone-wide kinds), else
+                        // the progress around the player.
+                        else if (g_fresh[index] == 1)
                         {
                             const float before = g_amount[k][index];
-                            const ZoneFog* zone = kZoneWide[k] ? FindZoneFog(InputsFor(g_area[index] ? g_area[index] : g_playerArea).zone) : nullptr;
-                            g_amount[k][index] = std::fmax(before, zone && zone->started ? zone->amount[k] : t[k] * g_progress[k]);
+                            float sumRatio = 0.0f, sumAmount = 0.0f;
+                            int ratios = 0, amounts = 0;
+                            for (int dj = -1; dj <= 1; ++dj)
+                                for (int di = -1; di <= 1; ++di)
+                                {
+                                    const int ni = i + di, nj = j + dj;
+                                    if ((di == 0 && dj == 0) || ni < g_grid.firstI || ni >= g_grid.firstI + kGridSize ||
+                                        nj < g_grid.firstJ || nj >= g_grid.firstJ + kGridSize) continue;
+                                    const int n = Index(ni, nj);
+                                    if (!g_groundKnown[n] || g_fresh[n] != 0) continue;
+                                    const float tn = g_target[k][n] / 255.0f;
+                                    if (tn > 0.01f) { sumRatio += g_amount[k][n] / tn; ++ratios; }
+                                    sumAmount += g_amount[k][n];
+                                    ++amounts;
+                                }
+                            float start;
+                            if (t[k] > 0.01f && ratios) start = t[k] * std::fmin(sumRatio / ratios, 2.0f);
+                            else if (amounts) start = sumAmount / amounts * (1.0f - g_steep[index] / 255.0f);
+                            else
+                            {
+                                const ZoneFog* zone = kZoneWide[k] ? FindZoneFog(InputsFor(g_area[index] ? g_area[index] : g_playerArea).zone) : nullptr;
+                                start = t[k] * g_progress[k];
+                                if (zone && zone->started)
+                                    start = zone->target[k] > 0.01f ? t[k] * std::fmin(zone->amount[k] / zone->target[k], 2.0f)
+                                                                    : zone->amount[k] * (1.0f - g_steep[index] / 255.0f);
+                            }
+                            g_amount[k][index] = std::fmax(before, Clamp01(start));
                             g_pool[k][index] = std::fmax(g_pool[k][index], weight * g_amount[k][index]);
                             AddFrom(k, index, before, g_amount[k][index], g_ground[index]);
                         }
                     }
-                    g_fresh[index] = 0;
+                    if (g_fresh[index]) { g_fresh[index] = 2; startedNow.push_back(index); } // 2: started in this pass
                 }
             }
+            for (int index : startedNow) g_fresh[index] = 0;
+            if (!startedNow.empty()) ++g_grid.version; // the renderer's far-map stand-in ends there
             g_stats.rulesMs = grassperf::Now() - t0;
         }
 
@@ -860,12 +955,18 @@ namespace wxl_livingazeroth::fog
                         const float moved = out[d] * scale; // yd of heavy depth
                         for (int k = 0; k < kKindCount; ++k)
                         {
-                            const KindSettings& s = CellSettings(k, c); // the source cell's place
-                            if (g_pool[k][c] <= 0.0f || s.thickness <= 0.0f) continue;
+                            // Pools are stored in amount units, depth = pool x the cell's own thickness:
+                            // the depth leaving converts with the source's thickness, the depth arriving
+                            // with the receiver's. (Both with the source's, depth wasn't kept across an
+                            // area border with another thickness: x4 one way, / 4 the other for area fog
+                            // 2 yd vs 8 yd; the pool jumped at the border and kept growing on one side,
+                            // probe cross-sections 2026-10-12.)
+                            const KindSettings& s = CellSettings(k, c);  // the source cell's place
+                            const KindSettings& sn = CellSettings(k, n); // the receiving cell's place
+                            if (g_pool[k][c] <= 0.0f || s.thickness <= 0.0f || sn.thickness <= 0.0f) continue;
                             const float share = g_pool[k][c] * s.thickness / depth[c];
-                            const float amount = moved * share / s.thickness;
-                            delta[k][c] -= amount;
-                            delta[k][n] += amount;
+                            delta[k][c] -= moved * share / s.thickness;
+                            delta[k][n] += moved * share / sn.thickness;
                         }
                     }
                 }
@@ -898,8 +999,14 @@ namespace wxl_livingazeroth::fog
             Flow(dt);
             for (int k = 0; k < kKindCount; ++k) poolFlow[k] = player ? g_pool[k][pIndex] : 0.0f;
             bool changed = false;
-            // Each place's build-up and burn-off rates for this step (per slot, so the cells look theirs up).
+            // Each place's build-up and burn-off rates for this step (per slot, so the cells look theirs up),
+            // blended like the cell's other settings.
             static std::vector<float> upOf, downOf;
+            auto Rate = [](const std::vector<float>& ofSlot, int n) {
+                const float own = ofSlot[g_areaSlot[n]];
+                const uint8_t share = g_blendShare[n];
+                return share ? own + (ofSlot[g_blendSlot[n]] - own) * (share / 255.0f) : own;
+            };
             upOf.resize(g_slots.size());
             downOf.resize(g_slots.size());
             for (int k = 0; k < kKindCount; ++k)
@@ -920,8 +1027,7 @@ namespace wxl_livingazeroth::fog
                     const float t = target[n] * (1.0f / 255.0f);
                     if (a == 0.0f && t == 0.0f) continue;
                     const float before = a;
-                    const uint16_t sl = g_areaSlot[n];
-                    a += (t - a) * (t > a ? upOf[sl] : downOf[sl]);
+                    a += (t - a) * Rate(t > a ? upOf : downOf, n);
                     if (a < kGone && t == 0.0f) a = 0.0f;
                     amount[n] = a;
                     AddFrom(k, n, before, a, g_ground[n]); // forming here: from this cell's surface
@@ -943,8 +1049,7 @@ namespace wxl_livingazeroth::fog
                     float p = pool[n];
                     const float t = HeavyShare(k, n) * amount[n];
                     if (p == 0.0f && t == 0.0f) continue;
-                    const uint16_t sl = g_areaSlot[n];
-                    p += (t - p) * (t > p ? upOf[sl] : downOf[sl]);
+                    p += (t - p) * Rate(t > p ? upOf : downOf, n);
                     if (p < kGone && t == 0.0f) p = 0.0f;
                     pool[n] = p;
                     if (p > mostPool) mostPool = p;
@@ -1035,7 +1140,7 @@ namespace wxl_livingazeroth::fog
 
     bool ZoneWide(int kind) { return kind >= 0 && kind < kKindCount && kZoneWide[kind]; }
 
-    const KindSettings& SettingsAt(int kind, int index)
+    KindSettings SettingsAt(int kind, int index)
     {
         if (kind < 0 || kind >= kKindCount) kind = 0;
         return g_areaSlot.empty() ? g_settings[kind] : CellSettings(kind, index);
@@ -1056,6 +1161,44 @@ namespace wxl_livingazeroth::fog
     }
 
     float Progress(int kind) { return kind >= 0 && kind < kKindCount ? g_progress[kind] : 0.0f; }
+
+    float BlendOf(int index, uint32_t& otherArea)
+    {
+        otherArea = 0;
+        if (g_blendShare.empty() || index < 0 || index >= kGridSize * kGridSize || !g_blendShare[index]) return 0.0f;
+        const uint16_t slot = g_blendSlot[index];
+        if (slot >= g_slots.size()) return 0.0f;
+        otherArea = g_slots[slot].area;
+        return g_blendShare[index] / 255.0f;
+    }
+
+    bool CellAt(float x, float y, CellState& out)
+    {
+        out = CellState{};
+        if (!g_placed || g_groundKnown.empty()) return false;
+        const int i = static_cast<int>(std::floor(x / kCellSize)), j = static_cast<int>(std::floor(y / kCellSize));
+        if (!InGrid(i, j)) return false;
+        const int index = Index(i, j);
+        out.i = i; out.j = j; out.index = index;
+        out.known = g_groundKnown[index] != 0;
+        out.fresh = g_fresh[index] != 0;
+        out.block = g_block[index];
+        out.ground = g_ground[index];
+        out.steep = g_steep[index] / 255.0f;
+        out.area = g_area[index];
+        out.slot = g_areaSlot[index];
+        out.blendSlot = g_blendSlot[index];
+        out.blendArea = g_blendSlot[index] < g_slots.size() ? g_slots[g_blendSlot[index]].area : 0;
+        out.blendShare = g_blendShare[index] / 255.0f;
+        for (int k = 0; k < kKindCount; ++k)
+        {
+            out.target[k] = g_target[k][index] / 255.0f;
+            out.amount[k] = g_amount[k][index];
+            out.pool[k] = g_pool[k][index];
+            out.heavyShare[k] = HeavyShare(k, index);
+        }
+        return true;
+    }
 
     float TargetAt(int kind, float x, float y)
     {

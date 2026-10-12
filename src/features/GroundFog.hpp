@@ -20,6 +20,7 @@ namespace wxl_livingazeroth::groundfog
         int   enabled = 1;
         int   steps = 48;               // the march's step budget per pixel (jumps through air + steps in the fog)
         int   farFog = 1;               // beyond the near field (128 yd): each zone's typical fog per 33 yd chunk (no edge wall)
+        int   beyondMax = 1;            // past the max distance to the terrain drawn there: one long step through the far fog
         int   halfResolution = 1;      // march at half resolution, upscaled by depth (about a quarter of the GPU cost)
         float fogStep = 0.25f;         // yd: step length inside the fog near the camera (grows 4% of the distance)
         int   fogLights = 1;            // our lights (torches, braziers...) light the fog around them
@@ -29,6 +30,7 @@ namespace wxl_livingazeroth::groundfog
         float dither = 0.0f;           // 0 sample each step's middle .. 1 anywhere in it, per pixel (grain instead of banding)
         float maxDistance = 250.0f;     // yd: the march ends here (and for sky pixels)
         float densityScale = 1.0f;      // multiplies every kind's density
+        float poolSoftness = 0.6f;      // heavy pools: the soft top's share of the pool's depth, and the depth (yd) below which a pool fades out
         float noiseAmount = 0.6f;       // 0 = smooth layers .. 1 = patchy
         float noiseTileYards = 64.0f;   // size of one noise tile (the patches are ~1/8 of it)
         float brightness = 1.0f;        // multiplies the stock fog colour
@@ -38,7 +40,9 @@ namespace wxl_livingazeroth::groundfog
         int   heightBands = 0;          // debug: paint the reconstructed world height as bands (they must stay on the terrain)
         int   depthDecode = 0;          // 0 OpenGL-style depth (-1..1), 1 D3D-style (0..1): which one keeps the bands still
         int   poolGate = 1;             // heavy pool fog only in and around cells that hold a pool (off: the old behaviour, for comparison)
-        int   debugView = 0;           // 0 the fog, 1 light layer only, 2 pools only, 3 ground check (field ground vs the drawn surface)
+        int   probe = 0;               // debug (panel, not saved): read back the march of the screen centre's pixel (yellow cross)
+        int   debugView = 0;           // 0 the fog, 1 light layer only, 2 pools only, 3 ground check (field ground vs the drawn surface),
+                                       // 4 near (green) / far (blue) fog, red where the march ran out of steps
 
         // Colour test (panel, not saved): these instead of FogSettings' colour columns, to find the
         // values for a place by eye before writing them into the table.

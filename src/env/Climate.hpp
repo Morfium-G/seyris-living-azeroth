@@ -39,6 +39,10 @@ namespace wxl_livingazeroth::climate
     /// once. Within ~800 yd of the player (the blend map follows); beyond it, or before its chunks
     /// are known, the area's own row. Flags are the chunk's own.
     Row At(float x, float y);
+    /// The areas At() mixes at a world position and their weights (summing to 1): the same four chunk
+    /// centres and 3x3 means, by area. For blending other per-area values (the fog's kind settings)
+    /// the same way. Returns how many were written (0: nothing known around).
+    int AreaWeightsAt(float x, float y, uint32_t* areas, float* weights, int max);
     /// At() where the player is.
     Row Here();
 

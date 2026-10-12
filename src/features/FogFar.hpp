@@ -31,5 +31,9 @@ namespace wxl_livingazeroth::fogfar
     /// yet, or no fog in any zone around).
     bool Update(IDirect3DDevice9* dev, float groundRef, ColourFn colour, Maps& out);
 
+    /// The far map's fog top at a world position (its chunk's, dilated; world z), as last built;
+    /// -1e5 where there's none. For the near field's top map where its cells stand in for the far map.
+    float TopAt(float x, float y);
+
     void Release();
 }

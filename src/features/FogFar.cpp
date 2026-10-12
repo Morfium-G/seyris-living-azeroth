@@ -30,6 +30,8 @@ namespace wxl_livingazeroth::fogfar
         float     g_lastRef = -1.0e9f;
         bool      g_any = false;
         float     g_highestTop = -1.0e9f;
+        float     g_chunk = 0.0f;
+        std::vector<float> g_topWorld; // per slot: the dilated top (world z) as uploaded, kNoTop for none
 
         IDirect3DTexture9* g_field = nullptr;
         IDirect3DTexture9* g_colour = nullptr;
@@ -98,7 +100,10 @@ namespace wxl_livingazeroth::fogfar
 
         const bool moved = map.firstI != g_firstI || map.firstJ != g_firstJ;
         const ULONGLONG now = GetTickCount64();
-        if (!moved && g_field && now - g_lastBuild < kRebuildMs && std::fabs(groundRef - g_lastRef) < 64.0f)
+        // Any change of the reference height rebuilds at once: the heights are stored relative to it,
+        // and the shader adds the current one. (A 32 yd change waited up to 500 ms: the far floor sat
+        // 32 yd off, above the terrain, and thick fog filled the distance for a moment.)
+        if (!moved && g_field && now - g_lastBuild < kRebuildMs && groundRef == g_lastRef)
         {
             if (!g_any) return false;
         }
@@ -162,6 +167,8 @@ namespace wxl_livingazeroth::fogfar
                     g_any = true;
                 }
             g_highestTop = -1.0e9f;
+            g_chunk = map.cellSize;
+            g_topWorld.assign(static_cast<size_t>(N) * N, kNoTop);
             D3DLOCKED_RECT lf{}, lc{};
             if (FAILED(g_field->LockRect(0, &lf, nullptr, 0))) return false;
             if (FAILED(g_colour->LockRect(0, &lc, nullptr, 0))) { g_field->UnlockRect(0); return false; }
@@ -204,6 +211,7 @@ namespace wxl_livingazeroth::fogfar
                     texel[1] = ToHalf(colourFrom->thickness);
                     texel[2] = ToHalf(g - groundRef);
                     texel[3] = ToHalf(most > kNoTop ? most - groundRef : kNoTop);
+                    g_topWorld[slot] = most;
                     rgb[0] = byteOf(colourFrom->rgb[2]);
                     rgb[1] = byteOf(colourFrom->rgb[1]);
                     rgb[2] = byteOf(colourFrom->rgb[0]);
@@ -225,6 +233,14 @@ namespace wxl_livingazeroth::fogfar
         out.invExtent = 1.0f / (g_size * map.cellSize);
         out.highestTop = g_highestTop;
         return true;
+    }
+
+    float TopAt(float x, float y)
+    {
+        if (!g_any || g_chunk <= 0.0f || g_topWorld.empty()) return kNoTop;
+        const int i = static_cast<int>(std::floor(x / g_chunk)), j = static_cast<int>(std::floor(y / g_chunk));
+        if (i < g_firstI || i >= g_firstI + g_size || j < g_firstJ || j >= g_firstJ + g_size) return kNoTop;
+        return g_topWorld[Mod(j) * g_size + Mod(i)];
     }
 
     void Release()

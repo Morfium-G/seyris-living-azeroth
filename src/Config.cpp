@@ -131,6 +131,7 @@ namespace wxl_livingazeroth::config
             g.densityScale = In(s, f, "DensityScale", "Your multiplier on every fog kind's density (1 = as FogSettings.cdbc says).", g.densityScale);
             g.maxDistance = In(s, f, "MaxDistance", "How far the fog is drawn, in yards.", g.maxDistance);
             g.farFog = In(s, f, "FarFog", "Beyond 128 yards the fog continues at each zone's typical level (no wall where the near fog ends).", g.farFog);
+            g.beyondMax = In(s, f, "BeyondMaxDistance", "Past MaxDistance, the far fog continues to the terrain drawn there (one long step, cheap).", g.beyondMax);
             g.halfResolution = In(s, f, "HalfResolution", "Draw the fog at half resolution, upscaled by depth (sharp at silhouettes): about a quarter of the GPU time.", g.halfResolution);
             g.steps = Whole(s, f, "StepBudget", "Steps per pixel through the fog (quality, not the look): more = smoother far away, slower.", g.steps);
             g.fogStep = In(s, f, "StepLength", "Step length inside the fog near you, in yards (grows with distance). Smaller = finer, slower.", g.fogStep);
@@ -142,6 +143,7 @@ namespace wxl_livingazeroth::config
             g.fogLights = In(s, f, "Lights", "Our lights (torches, braziers, lamps) light the fog around them.", g.fogLights);
             g.lightStrength = In(s, f, "LightStrength", "Your multiplier on our lights' light in the fog.", g.lightStrength);
             g.lightRange = In(s, f, "LightRange", "Lights farther than this from the camera (yards) don't light the fog. Lower = cheaper.", g.lightRange);
+            g.poolSoftness = In(s, f, "PoolSoftness", "How soft heavy fog's edges are, 0 (crisp top, sharp sides) .. 1: its top blurs over this share of its depth, thin pools fade out.", g.poolSoftness);
             fog::Field().poolSpeed = In(s, f, "PoolSpeed", "How fast heavy fog (each kind's Weight share) runs downhill into hollows: 1 = default, 0 = it stays where it formed.", fog::Field().poolSpeed);
             fog::Field().steepStart = In(s, f, "SteepStart", "Degrees: from this slope a growing share of the ground-hugging fog runs off (it doesn't hang on steep ground).", fog::Field().steepStart);
             fog::Field().steepFull = In(s, f, "SteepFull", "Degrees: from this slope all of it runs off.", fog::Field().steepFull);

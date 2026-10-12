@@ -80,6 +80,7 @@ namespace wxl_livingazeroth::fog
         // height they formed at).
         const uint8_t* steep = nullptr;
         const uint32_t* area = nullptr;       // per cell, its terrain chunk's area (0 = not known yet: the player's place)
+        const uint8_t* fresh = nullptr;       // 1: scrolled in, not started by the rules yet (no fog of its own so far)
         unsigned       groundMissing = 0;
         uint32_t       groundVersion = 0;
     };
@@ -157,9 +158,10 @@ namespace wxl_livingazeroth::fog
     bool     ZoneWide(int kind);
 
     /// A kind's settings in a cell (storage index): its place's FogSettings rows (density, thickness,
-    /// weight, rates, wind thinning, strength), the panel's values for a kind switched to them, the
+    /// weight, rates, wind thinning, strength), blended toward the strongest other place around like
+    /// the climate (~100 yd across a border); the panel's values for a kind switched to them; the
     /// player's place where the cell's area isn't known yet. Settings() is the player's place.
-    const KindSettings& SettingsAt(int kind, int index);
+    KindSettings SettingsAt(int kind, int index);
     /// The same for a place by its area (e.g. a zone, for the far fog map).
     const KindSettings& SettingsOfArea(int kind, uint32_t area);
 
@@ -167,6 +169,27 @@ namespace wxl_livingazeroth::fog
     /// more on steep ground (ground-hugging kinds). The renderer draws the rest as the light layer.
     float HeavyShare(int kind, int index);
     float Progress(int kind);
+
+    /// One cell's state, read-only, for diagnostics (the renderer's probe dumps cross-sections of
+    /// the field with it). False outside the grid.
+    struct CellState
+    {
+        int      i = 0, j = 0, index = 0; // world cell, storage index
+        bool     known = false, fresh = false;
+        int      block = 0;               // 0 not traced, 1 open, 2 WMO floor, 3 structure
+        float    ground = 0.0f, steep = 0.0f; // steep: 0..1 share
+        uint32_t area = 0;
+        int      slot = 0;                // its place's settings slot (SettingsAt)
+        int      blendSlot = 0;           // the other place (slot, area) its settings blend toward ...
+        uint32_t blendArea = 0;
+        float    blendShare = 0.0f;       // ... by this share (0: its own place's)
+        float    target[kKindCount] = {}, amount[kKindCount] = {}, pool[kKindCount] = {}, heavyShare[kKindCount] = {};
+    };
+    bool CellAt(float x, float y, CellState& out);
+
+    /// The other place a cell's settings blend toward (storage index), and its share (0: none). The
+    /// renderer blends the places' fog colours by it too.
+    float BlendOf(int index, uint32_t& otherArea);
 
     /// Once per frame, after fields::Update(). Steps the field a few times a second.
     void Update(float dt, const world::Snapshot& snap);
