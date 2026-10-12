@@ -242,6 +242,28 @@ namespace wxl_livingazeroth::debug
                         g_api->UiTextWrapped(line);
                     }
                     const grassinst::Stats st = grassinst::GetStats();
+                    int batchOn = is.batched ? 1 : 0;
+                    if (g_api->UiCheckbox("Batched draws (all layers together)", &batchOn)) is.batched = batchOn != 0;
+                    if (const char* why = grassinst::BatchProblem())
+                    {
+                        std::snprintf(line, sizeof(line), "batched draws UNAVAILABLE: %s", why);
+                        g_api->UiTextWrapped(line);
+                    }
+                    else if (st.batchedMode)
+                    {
+                        std::snprintf(line, sizeof(line), "last frame: %u layers in %u batched draws, %u textures%s",
+                                      st.batchedLayers, st.batchedDraws, st.batchedTextures,
+                                      st.textureMismatch ? " (TEXTURE CHECK MISMATCH)" : "");
+                        g_api->UiText(line);
+                    }
+                    int thinOn = is.thinEnabled ? 1 : 0;
+                    if (g_api->UiCheckbox("Thin far grass", &thinOn)) is.thinEnabled = thinOn != 0;
+                    g_api->UiSliderFloat("Thinning starts (yards)", &is.thinStart, 0.0f, 1000.0f);
+                    g_api->UiSliderFloat("Thinning ends (yards)", &is.thinEnd, 50.0f, 2000.0f);
+                    g_api->UiSliderFloat("Share drawn at the end", &is.thinMinShare, 0.01f, 1.0f);
+                    std::snprintf(line, sizeof(line), "last frame: %u of %u plants drawn (%.0f%%)", st.plantsDrawn, st.plantsPlaced,
+                                  st.plantsPlaced ? 100.0 * st.plantsDrawn / st.plantsPlaced : 100.0);
+                    g_api->UiText(line);
                     g_api->UiSliderFloat("Build budget (ms per frame)", &is.buildBudgetMs, 0.5f, 20.0f);
                     std::snprintf(line, sizeof(line), "last frame: %u layers instanced in %u draw calls; %u built in %.2f ms (%.2f ms in D3D); "
                                   "drawn stock: %u (over budget), %u (model loading), %u (failed)",

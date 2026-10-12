@@ -23,13 +23,15 @@ namespace wxl_livingazeroth::prof
 
         constexpr const char* kPanelTitle = "wxl-seyris-living-azeroth: frame profiler";
         const char* const kNames[kCount] = {
-            "other (game logic, unlisted)", "world: rest (sky, misc.)", "terrain", "grass (detail doodads)",
+            "other (game logic, unlisted)", "world: rest (sky, misc.)", "terrain", "grass: client rest",
             "M2 models", "M2 animation (main thread)", "particles", "ribbons", "WMOs", "liquids",
             "shadow maps", "weather", "UI + overlay",
             "ours: climate / wind / fields", "ours: lights (scan, grid, baking)", "ours: light textures",
             "ours: surface cover update", "ours: surface cover draw", "ours: anti-aliasing",
             "ours: fog field", "ours: fog draw",
             "ours: fog uploads", "ours: fog lights", "ours: surface cover uploads",
+            "grass: client re-bake", "ours: grass wind grid", "ours: grass chunk constants",
+            "ours: grass layer prepare", "ours: grass layer bind", "ours: grass layer draws",
         };
 
         const WXL_Api* g_api = nullptr;
@@ -53,6 +55,14 @@ namespace wxl_livingazeroth::prof
         } g_frame;
 
         int Current() { return g_depth > 0 ? g_stack[g_depth - 1] : kOther; }
+
+        // The category GPU time goes to: the innermost one that isn't CPU only.
+        int GpuCurrent()
+        {
+            for (int i = g_depth - 1; i >= 0; --i)
+                if (!CpuOnly(g_stack[i])) return g_stack[i];
+            return kOther;
+        }
 
         int64_t Now()
         {
@@ -117,14 +127,14 @@ namespace wxl_livingazeroth::prof
             ++f.used;
         }
 
-        // Charges the time since the last transition to the current category, then stamps the GPU.
-        void Transition()
+        // Charges the time since the last transition to the current category, then stamps the GPU
+        // (not when only a CPU-only category opens or closes: the GPU category doesn't change).
+        void Transition(bool stamp = true)
         {
             const int64_t now = Now();
-            const int cur = Current();
-            g_frame.cpu[cur] += now - g_last;
+            g_frame.cpu[Current()] += now - g_last;
             g_last = now;
-            Stamp(cur);
+            if (stamp) Stamp(GpuCurrent());
         }
 
         // --- the averaged results the panel shows ---------------------------------------------------
@@ -291,8 +301,15 @@ namespace wxl_livingazeroth::prof
     {
         if (!g_frameOn || !OnMainThread()) return;
         if (g_depth >= kMaxDepth) return;
-        Transition();
+        Transition(!CpuOnly(category));
         g_stack[g_depth++] = category;
+    }
+
+    void CountDraws(unsigned draws, uint64_t triangles)
+    {
+        if (!g_frameOn || !OnMainThread()) return;
+        g_frame.draws[Current()] += draws;
+        g_frame.tris[Current()] += triangles;
     }
 
     void Leave(int category)
@@ -303,7 +320,7 @@ namespace wxl_livingazeroth::prof
         for (int i = g_depth - 1; i >= 0; --i)
             if (g_stack[i] == category)
             {
-                Transition();
+                Transition(!CpuOnly(category));
                 for (int k = i; k + 1 < g_depth; ++k) g_stack[k] = g_stack[k + 1];
                 --g_depth;
                 return;
@@ -453,6 +470,12 @@ namespace wxl_livingazeroth::prof
                 out += line;
             }
             std::snprintf(line, sizeof(line), "%-34s %6.0f %7.1f\n", "total", draws, tris / 1000.0);
+            out += line;
+            // The grass rows together (their GPU time is all in "grass: client rest").
+            double grassCpu = s.cpuMs[kDetail], grassDraws = s.draws[kDetail], grassTris = s.tris[kDetail];
+            for (int c = kDetailBake; c <= kOursGrassDraw; ++c) { grassCpu += s.cpuMs[c]; grassDraws += s.draws[c]; grassTris += s.tris[c]; }
+            std::snprintf(line, sizeof(line), "%-34s %6.0f %7.1f %8.2f %8.2f\n", "grass, all rows", grassDraws, grassTris / 1000.0,
+                          grassCpu, s.gpuMs[kDetail]);
             out += line;
             return out;
         }

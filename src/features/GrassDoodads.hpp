@@ -96,6 +96,10 @@ namespace wxl_livingazeroth::grassdoodads
     /// slots itself): analyse new doodads and count them for the panel.
     void NoteSlot(const SlotDoodads& sd, bool overflow);
 
+    /// One doodad's table entry {rootV, 1/(tipV-rootV), windScale, pushScale} (the fallback rule when
+    /// it has no usable mapping). For draws that hold a single doodad (the batched grass renderer).
+    void DoodadEntry(uint32_t id, float out[4]);
+
     /// Snapshot of every doodad seen so far, for the debug panel.
     std::vector<DoodadInfo> Seen();
 

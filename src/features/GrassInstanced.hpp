@@ -26,6 +26,11 @@ namespace wxl_livingazeroth::grassinst
     struct Settings
     {
         bool  enabled = true;       // runtime switch (debug panel); off = the client's own path
+        // Batched: layers are only recorded while the client walks them; at the end of the grass pass
+        // they're drawn together, one draw per (texture, doodad model, page) for up to 32 layer
+        // ranges. Plant data then lives in float textures read by the vertex shader. Off = one
+        // instanced draw per doodad per layer, as the layer comes.
+        bool  batched = true;
         float buildBudgetMs = 3.0f; // per frame; layers past it draw the client's way that frame
         // The player's density limits (instanced path only). How dense grass is comes from
         // GroundEffectDoodadDensity.cdbc (content); these cap it, like a graphics setting.
@@ -33,6 +38,12 @@ namespace wxl_livingazeroth::grassinst
         float maxRadius = 150.0f;     // yards around the player
         float maxSpread = 3.0f;       // yards a copy may move from its plant
         float memoryLimitMB = 256.0f; // cap on the instance pool (dynamic buffers share the 32-bit address space)
+        // Distance thinning: far layers draw only a share of their plants (an even sample: each
+        // layer's plants are shuffled when it's built). By the camera's distance to the layer.
+        bool  thinEnabled = true;
+        float thinStart = 150.0f;   // yards: every plant up to here ...
+        float thinEnd = 800.0f;     // ... fading to thinMinShare here and beyond
+        float thinMinShare = 0.25f; // 0.01 .. 1
     };
 
     /// Attaches the engine buffer lock/unlock hooks the bake verification uses. Call from WXL_Load.
@@ -45,6 +56,9 @@ namespace wxl_livingazeroth::grassinst
     /// instance buffer is current and returns its doodad list (entry k of the per-draw table =
     /// ids[k]). Null = draw this slot the client's way.
     const grassdoodads::SlotDoodads* Prepare(void* slot);
+    /// Batched mode: records a slot Prepare accepted for the combined draw at the end of the grass
+    /// pass. False = not recorded; draw it now (Draw, else the client's way).
+    bool Record(void* slot);
     /// Draws a slot Prepare accepted. False = nothing drawn; use the client's draw.
     bool Draw(void* slot);
     /// Around the client's own slot build (instance colours tagged): the bake verification.
@@ -97,6 +111,13 @@ namespace wxl_livingazeroth::grassinst
         // last frame
         unsigned slotsInstanced = 0;
         unsigned drawCalls = 0;
+        unsigned plantsPlaced = 0;      // plants in the instanced layers, of which ...
+        unsigned plantsDrawn = 0;       // ... drawn after distance thinning (before density copies)
+        bool     batchedMode = false;   // the pool holds plant textures (batched draws)
+        unsigned batchedLayers = 0;     // layers recorded for the combined draw
+        unsigned batchedDraws = 0;      // draws it took
+        unsigned batchedTextures = 0;   // distinct layer textures (one client state flush each)
+        unsigned textureMismatch = 0;   // learned texture differs from the one read off the client's object (check)
         unsigned builds = 0;
         double   buildMs = 0;           // all builds, of which ...
         double   buildDeviceMs = 0;     // ... creating + filling their D3D buffers
@@ -107,6 +128,8 @@ namespace wxl_livingazeroth::grassinst
     Stats GetStats();
     /// Why the instanced path can't run at all, or null.
     const char* Problem();
+    /// Why batched draws are off although enabled, or null.
+    const char* BatchProblem();
 
     /// Draws the next slot the client's way once and compares its baked vertices with what the
     /// instanced path computes for the same plants. The result lands in VerifyReport() and the log.

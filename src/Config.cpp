@@ -79,6 +79,9 @@ namespace wxl_livingazeroth::config
         grassinst::Settings& inst = grassinst::Tunables();
         inst.enabled = Bool(s, "InstancedGrass",
             "Draw grass with the instanced renderer (much faster at long grass distances). 0 = the client's own path.", inst.enabled);
+        inst.batched = Bool(s, "InstancedGrassBatched",
+            "Instanced grass draws all visible grass layers together at the end of the grass pass (much less CPU time). 0 = one layer at a time.",
+            inst.batched);
         inst.buildBudgetMs = Float(s, "InstancedGrassBuildBudgetMs",
             "Milliseconds per frame spent preparing grass coming into view; the rest is drawn the client's way until a later frame.",
             inst.buildBudgetMs);
@@ -90,6 +93,12 @@ namespace wxl_livingazeroth::config
             inst.maxMultiplier);
         inst.maxRadius = Float(s, "GrassDensityMaxRadius", "Your limit on how far around you grass is made denser, in yards.", inst.maxRadius);
         inst.maxSpread = Float(s, "GrassDensityMaxSpread", "Your limit on how far an extra plant may move from its plant, in yards.", inst.maxSpread);
+        inst.thinEnabled = Bool(s, "GrassThinning",
+            "Instanced grass only: far grass draws fewer plants (an even sample), which saves a lot of GPU time at long grass distances.",
+            inst.thinEnabled);
+        inst.thinStart = Float(s, "GrassThinStart", "Yards from the camera within which every plant is drawn.", inst.thinStart);
+        inst.thinEnd = Float(s, "GrassThinEnd", "Yards from the camera where thinning reaches GrassThinMinShare.", inst.thinEnd);
+        inst.thinMinShare = Float(s, "GrassThinMinShare", "Share of plants drawn at GrassThinEnd and beyond (0.01 to 1).", inst.thinMinShare);
 
         grass::Settings& g = grass::Tunables();
         g.enabled = Bool(s, "GrassMotion", "Grass sways in the wind and parts around characters.", g.enabled);

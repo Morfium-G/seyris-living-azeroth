@@ -3,6 +3,7 @@
 #include "GrassInstanced.hpp"
 #include "GrassPerf.hpp"
 
+#include "../debug/Profiler.hpp"
 #include "../wxl_seyris/CdbcApi.hpp"
 
 #include "game/Gx.hpp"
@@ -144,9 +145,21 @@ namespace wxl_livingazeroth::grassdoodads
             return reinterpret_cast<const char*>(p);
         }
 
+        // Per-slot doodad tables, rebuilt only when the slot's doodads or any doodad's values change
+        // (each layer draw used to look up every doodad again).
+        struct CachedTable
+        {
+            SlotDoodads sd;
+            uint32_t    generation = 0; // 0 = rebuild on the next draw
+            float       table[kEntries][4];
+        };
+        std::unordered_map<const void*, CachedTable> g_tables;
+        uint32_t g_infoGeneration = 1; // bumped whenever any doodad's effective values change
+
         // Effective values: automatic, unless an override row exists for this doodad.
         void ApplyOverrides(DoodadInfo& d)
         {
+            if (++g_infoGeneration == 0) g_infoGeneration = 1;
             d.effRootV = d.rootV;
             d.effTipV = d.tipV;
             auto it = g_overrides.find(d.id);
@@ -220,6 +233,7 @@ namespace wxl_livingazeroth::grassdoodads
         // colours. Also records the slot's doodads and analyses new ones.
         void __fastcall hkFill(void* slot, void* edx)
         {
+            prof::Scope scope(prof::kDetailBake);
             uint32_t count = 0, instances = 0;
             const uintptr_t s = reinterpret_cast<uintptr_t>(slot);
             if (!ReadU32(s + kSlotInstanceCount, count) || !ReadU32(s + kSlotInstances, instances) || !instances
@@ -261,46 +275,72 @@ namespace wxl_livingazeroth::grassdoodads
             g_slots[slot] = sd;
         }
 
+        // One doodad's table entry {rootV, 1/(tipV-rootV), windScale, pushScale}; the fallback rule
+        // (root at v = 1, tip at v = 0, full wind and push) when it has no usable mapping. False =
+        // its model isn't read yet (the entry may still change).
+        bool EntryValues(uint32_t id, float out[4])
+        {
+            out[0] = 1.0f; out[1] = -1.0f; out[2] = 1.0f; out[3] = 1.0f;
+            auto d = g_doodads.find(id);
+            if (d == g_doodads.end()) return true;
+            DoodadInfo& info = d->second;
+            if (!info.analyzed) Analyze(info.id); // its model may have loaded since
+            if (!info.analyzed) return false;
+            if (!info.valid && !info.hasOverride) return true;
+
+            const float rootV = info.flipped ? info.effTipV : info.effRootV;
+            const float tipV  = info.flipped ? info.effRootV : info.effTipV;
+            const float span = tipV - rootV;
+            const float flex = 1.0f - info.stiffness; // stiff plants bend less from anything
+            out[0] = rootV;
+            out[1] = std::abs(span) > 1e-4f ? 1.0f / span : 0.0f;
+            out[2] = info.windOn ? flex : 0.0f;
+            out[3] = info.pushOn ? flex : 0.0f;
+            return true;
+        }
+
         // Before each layer draw: hand the shader this slot's doodad table, one register per entry:
         // {rootV, 1/(tipV-rootV), windScale, pushScale}. The fallback entry reproduces the old rule
         // (root at v = 1, tip at v = 0, full wind and push); unused entries get it too.
         void __fastcall hkDraw(void* slot, void* edx)
         {
-            float table[kEntries][4];
-            for (unsigned k = 0; k < kEntries; ++k)
-            {
-                table[k][0] = 1.0f; table[k][1] = -1.0f; table[k][2] = 1.0f; table[k][3] = 1.0f;
-            }
+            prof::Enter(prof::kOursGrassPrep); // left before the draw
 
             // Instanced renderer: the slot's plants sit in our own static buffers (built on first
             // sight), so the client's per-frame re-bake is skipped. Null = this slot draws stock.
             const SlotDoodads* sd = grassinst::Prepare(slot);
             const bool instanced = sd != nullptr;
+            // Batched: the layer joins the combined draw at the end of the grass pass, which sets its
+            // own doodad constants.
+            if (instanced && grassinst::Record(slot))
+            {
+                ++g_drawsTracked;
+                prof::Leave(prof::kOursGrassPrep);
+                return;
+            }
             if (!sd)
             {
                 auto it = g_slots.find(slot);
                 if (it != g_slots.end()) sd = &it->second;
             }
 
-            if (sd)
+            static const SlotDoodads kNone{};
+            if (g_tables.size() > 50000) g_tables.clear(); // slots get reused; don't grow forever
+            CachedTable& cached = g_tables[slot];
+            const SlotDoodads& want = sd ? *sd : kNone;
+            if (cached.generation != g_infoGeneration || cached.sd.count != want.count
+                || std::memcmp(cached.sd.ids, want.ids, want.count * sizeof(uint32_t)) != 0)
             {
-                for (unsigned k = 0; k < sd->count; ++k)
+                float (&table)[kEntries][4] = cached.table;
+                for (unsigned k = 0; k < kEntries; ++k)
                 {
-                    auto d = g_doodads.find(sd->ids[k]);
-                    if (d == g_doodads.end()) continue;
-                    DoodadInfo& info = d->second;
-                    if (!info.analyzed) Analyze(info.id); // its model may have loaded since
-                    if (!info.analyzed || (!info.valid && !info.hasOverride)) continue; // fallback rule
-
-                    const float rootV = info.flipped ? info.effTipV : info.effRootV;
-                    const float tipV  = info.flipped ? info.effRootV : info.effTipV;
-                    const float span = tipV - rootV;
-                    const float flex = 1.0f - info.stiffness; // stiff plants bend less from anything
-                    table[k][0] = rootV;
-                    table[k][1] = std::abs(span) > 1e-4f ? 1.0f / span : 0.0f;
-                    table[k][2] = info.windOn ? flex : 0.0f;
-                    table[k][3] = info.pushOn ? flex : 0.0f;
+                    table[k][0] = 1.0f; table[k][1] = -1.0f; table[k][2] = 1.0f; table[k][3] = 1.0f;
                 }
+                bool complete = true; // every doodad's model read: the table is final
+                for (unsigned k = 0; k < want.count; ++k)
+                    complete &= EntryValues(want.ids[k], table[k]);
+                cached.sd = want;
+                cached.generation = complete ? g_infoGeneration : 0; // incomplete: try again next draw
             }
 
             if (sd) ++g_drawsTracked; else ++g_drawsUntracked;
@@ -315,9 +355,10 @@ namespace wxl_livingazeroth::grassdoodads
 
             if (auto* dev = static_cast<IDirect3DDevice9*>(wxl::game::gx::RawDevice()))
             {
-                dev->SetVertexShaderConstantF(kFirstReg, &table[0][0], kEntries);
+                dev->SetVertexShaderConstantF(kFirstReg, &cached.table[0][0], kEntries);
                 dev->SetVertexShaderConstantF(kHighlightReg, highlight, 1);
             }
+            prof::Leave(prof::kOursGrassPrep);
 
             const double t0 = grassperf::Now();
             if (instanced && grassinst::Draw(slot))
@@ -345,6 +386,8 @@ namespace wxl_livingazeroth::grassdoodads
         grassinst::Install(api);
         return a && b;
     }
+
+    void DoodadEntry(uint32_t id, float out[4]) { EntryValues(id, out); }
 
     void NoteSlot(const SlotDoodads& sd, bool overflow)
     {

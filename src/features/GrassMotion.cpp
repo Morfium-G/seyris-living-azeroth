@@ -4,6 +4,7 @@
 #include "GrassInstanced.hpp"
 #include "GrassPerf.hpp"
 
+#include "../debug/Profiler.hpp"
 #include "../env/Actors.hpp"
 #include "../env/Wind.hpp"
 #include "../env/WorldQuery.hpp"
@@ -219,6 +220,7 @@ namespace wxl_livingazeroth::grass
         {
             grassperf::OnPassBegin();
             g_origInit();
+            prof::Scope scope(prof::kOursGrassWind);
 
             g_chunkUploadsLast = g_chunkUploads;
             g_chunkUploads = 0;
@@ -320,6 +322,7 @@ namespace wxl_livingazeroth::grass
         {
             g_origChunk(mtx, group);
             if (group != 0) return; // the dormant point-light path isn't patched
+            prof::Scope scope(prof::kOursGrassChunk);
             grassperf::OnChunk();
 
             // The chunk's world origin, as the shader works out world positions: c0..c2 are the pure

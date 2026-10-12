@@ -13,11 +13,16 @@ says why.
 | Key | Default | Meaning |
 |---|---|---|
 | InstancedGrass | 1 | Draw grass with the instanced renderer (much faster at long grass distances). 0 = the client's own path. |
+| InstancedGrassBatched | 1 | Instanced grass draws all visible grass layers together at the end of the grass pass (much less CPU time). 0 = one layer at a time. Turns itself off if the GPU can't read float textures in vertex shaders. |
 | InstancedGrassBuildBudgetMs | 3 | Milliseconds per frame spent preparing grass coming into view; the rest is drawn the client's way until a later frame. |
 | InstancedGrassMemoryMB | 256 | Most memory (MB) the instanced grass may use. It shares the client's 32-bit address space; too high can crash the client. At the limit, grass not seen for about a second is dropped. |
 | GrassDensityMaxMultiplier | 4 | Instanced grass only: your limit on grass density (plants drawn per placed plant, 1 = never denser, up to 8). How dense grass is comes from `GroundEffectDoodadDensity.cdbc`; this only caps it, like a graphics setting. |
 | GrassDensityMaxRadius | 150 | Your limit on how far around you grass is made denser, in yards. |
 | GrassDensityMaxSpread | 3 | Your limit on how far an extra plant may move from its plant, in yards. |
+| GrassThinning | 1 | Instanced grass only: far grass draws fewer plants (an even sample), which saves a lot of GPU time at long grass distances. |
+| GrassThinStart | 150 | Yards from the camera within which every plant is drawn. |
+| GrassThinEnd | 800 | Yards from the camera where thinning reaches `GrassThinMinShare`. |
+| GrassThinMinShare | 0.25 | Share of plants drawn at `GrassThinEnd` and beyond (0.01 to 1). |
 | GrassDistanceCap | 10000 | Highest grass distance (`groundEffectDist`) the client accepts. The exe's own cap is 140. Only raised, never lowered: if the exe or another module already allows at least this much, it's left alone. |
 | AntiAliasing | 1 | Our own anti-aliasing (FXAA), drawn before the UI. It only runs with the client's multisampling off, which readable depth (for upcoming effects like fog) needs anyway. |
 | AntiAliasingSubpixel | 0.75 | FXAA subpixel smoothing, 0 (sharpest) .. 1 (softest). |

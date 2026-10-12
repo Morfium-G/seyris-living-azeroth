@@ -13,6 +13,8 @@
 
 #include "wxl/PluginApi.h"
 
+#include <cstdint>
+
 namespace wxl_livingazeroth::prof
 {
     enum Category : int
@@ -41,8 +43,19 @@ namespace wxl_livingazeroth::prof
         kOursFogUpload,   // this module: ground fog textures (field, colour, top map, wake), inside the fog pass
         kOursFogLights,   // this module: our lights in the fog (per-frame light pass), inside the fog pass
         kOursCoverUpload, // this module: surface cover textures (fold + upload), inside the cover draw
+        // Inside the grass pass, CPU only (see CpuOnly): their GPU time stays with the grass row.
+        kDetailBake,      // the client's re-bake of a layer (stock path only)
+        kOursGrassWind,   // this module: wind grid + actors, once per frame
+        kOursGrassChunk,  // this module: per-chunk constants (wind grid, actors)
+        kOursGrassPrep,   // this module: per layer, find/build our instances, doodad table constants
+        kOursGrassBind,   // this module: per layer, the client's state flush before our draws
+        kOursGrassDraw,   // this module: per layer, swap in the instanced state, draw, restore
         kCount
     };
+
+    /// Categories entered per chunk or per layer (thousands a frame): they take CPU time but issue no
+    /// GPU timestamps (the ring would overflow); GPU time between them goes to the category below.
+    constexpr bool CpuOnly(int c) { return c >= kDetailBake && c <= kOursGrassDraw; }
 
     /// From WXL_Load: the hooks (they must be attached there), the events and the panel. Call before
     /// the post-AA subscribes, so the UI scope opens first.
@@ -59,6 +72,9 @@ namespace wxl_livingazeroth::prof
         Scope(const Scope&) = delete;
         Scope& operator=(const Scope&) = delete;
     };
+
+    /// Draws issued straight to D3D (not through the client's Gx draw), charged to the current category.
+    void CountDraws(unsigned draws, uint64_t triangles);
 
     void OnDeviceLost();
 }
