@@ -3,6 +3,7 @@
 #include "debug/WindView.hpp"
 #include "env/Fog.hpp"
 #include "env/Shelter.hpp"
+#include "features/DoodadFade.hpp"
 #include "features/FogWake.hpp"
 #include "features/GroundFog.hpp"
 #include "features/GrassInstanced.hpp"
@@ -131,6 +132,8 @@ namespace wxl_livingazeroth::config
             g.densityScale = In(s, f, "DensityScale", "Your multiplier on every fog kind's density (1 = as FogSettings.cdbc says).", g.densityScale);
             g.maxDistance = In(s, f, "MaxDistance", "How far the fog is drawn, in yards.", g.maxDistance);
             g.farFog = In(s, f, "FarFog", "Beyond 128 yards the fog continues at each zone's typical level (no wall where the near fog ends).", g.farFog);
+            doodadfade::Config().smallUseNext = Whole(s, f, "SmallDoodadsUseNextDistance", "Doodads with a radius under 1 yd (mugs, plates) use the next size's view distance instead of a fixed 30 yd (more doodads drawn).", doodadfade::Config().smallUseNext);
+            doodadfade::Config().fadeFrom = Whole(s, f, "DoodadFadeFromCategory", "Doodads of size categories below this don't fade in but pop in, so the ground fog covers them (fading ones show unfogged): 0 = stock, 5 = none fade.", doodadfade::Config().fadeFrom);
             g.handoverYards = In(s, f, "HandoverWidth", "Yards over which the near fog fades into the far fog at the near field's edge (~128 yd): wider = softer seam, less near detail.", g.handoverYards);
             g.beyondMax = In(s, f, "BeyondMaxDistance", "Past MaxDistance, the far fog continues to the terrain drawn there (one long step, cheap).", g.beyondMax);
             g.halfResolution = In(s, f, "HalfResolution", "Draw the fog at half resolution, upscaled by depth (sharp at silhouettes): about a quarter of the GPU time.", g.halfResolution);

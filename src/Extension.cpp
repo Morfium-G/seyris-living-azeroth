@@ -38,6 +38,7 @@
 #include "env/Regional.hpp"
 #include "env/Wind.hpp"
 #include "env/WorldQuery.hpp"
+#include "features/DoodadFade.hpp"
 #include "features/DoodadLightTable.hpp"
 #include "features/GrassDensity.hpp"
 #include "features/GrassDistanceCap.hpp"
@@ -116,6 +117,7 @@ namespace
         const float dt = a ? a->dt : 0.0f;
         namespace prof = wxl_livingazeroth::prof;
         wxl_livingazeroth::clientweather::Apply();
+        wxl_livingazeroth::doodadfade::Update();
         const auto& snap = wxl_livingazeroth::world::Refresh();
         {
             prof::Scope scope(prof::kOursEnv);

@@ -63,6 +63,8 @@ Where fog forms, and each kind's density, thickness, colour and so on, come from
 | Lights | 1 | Our lights (torches, braziers, lamps) light the fog around them. |
 | LightStrength | 1 | Your multiplier on our lights' light in the fog. |
 | LightRange | 128 | Lights farther than this from the camera (yards) don't light the fog. Lower = cheaper. |
+| SmallDoodadsUseNextDistance | 1 | Doodads with a radius under 1 yd (mugs, plates) use the next size's view distance instead of a fixed 30 yd (more doodads drawn). |
+| DoodadFadeFromCategory | 3 | Doodads of size categories below this don't fade in but pop in, so the ground fog covers them (fading ones show unfogged): 0 = stock, 5 = none fade. |
 | HandoverWidth | 64 | Yards over which the near fog fades into the far fog at the near field's edge (~128 yd): wider = softer seam, less near detail. |
 | BeyondMaxDistance | 1 | Past MaxDistance, the far fog continues to the terrain drawn there (one long step, cheap). |
 | PoolSoftness | 0.6 | How soft heavy fog's edges are, 0 (crisp top, sharp sides) .. 1: its top blurs over this share of its depth, and pools thinner than this many yards fade out. |
