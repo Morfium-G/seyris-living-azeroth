@@ -130,7 +130,14 @@ namespace wxl_livingazeroth::cover::detail
         double jobMs = 0;
         int   gridI = 0, gridJ = 0;     // world cell index (of this level) of the grid's first vertex
         int   refreshRow = 0;
+        // Whole-texture passes, for changes that touch every slot (a refill, a setting, snow,
+        // the cover texture slots) ...
         bool  baseDirty = true, coverDirty = true;
+        // ... and changed regions, per texture row and column (kDirty* bits): a recentre's new
+        // strips (whole rows, or columns for strips along y) and re-sampled rows. Folded and uploaded
+        // on their own once no fill job is running (the slots then map to the grid that draws them).
+        std::vector<uint8_t> dirtyRow = std::vector<uint8_t>(kTex, 0);
+        std::vector<uint8_t> dirtyCol = std::vector<uint8_t>(kTex, 0);
         bool  anyCover = true;          // its last cover pass found cover somewhere (else it isn't drawn)
         int   coverCells = 0;           // cells with cover of their own (depth or painted snow), kept as they're sampled
         int   snowCells = 0;            // cells where fallen snow could settle (snow share)
@@ -150,6 +157,7 @@ namespace wxl_livingazeroth::cover::detail
     extern int            g_mapNow;           // the map being filled
     extern const void*    g_cdbcApi;
     extern double         g_simMs;
+    extern bool           g_resting;          // the finer levels rest: nothing within the outermost's reach
 
     // What the table sees where the player is (for the panel, so rows can be authored on the spot).
     extern terrain::Surface   g_hereSurface;
@@ -180,6 +188,9 @@ namespace wxl_livingazeroth::cover::detail
     void ClearLayerValues();
     void SampleRect(Level& L, bool isLevel0, int i0, int i1, int j0, int j1, bool fresh); // inclusive
 
+    // What a sample changed, for Level::dirtyRow/dirtyCol.
+    constexpr uint8_t kDirtyBase = 1, kDirtyCover = 2, kDirtyLook = 4;
+
     // Plans a level's next grid around the player (origin on an even cell). The filled area is
     // the grid plus an apron of kApron cells: the normals of the border vertices read up to 2
     // cells beyond the grid (morph band normals at the coarser spacing), and without the apron
@@ -199,7 +210,6 @@ namespace wxl_livingazeroth::cover::detail
     extern std::vector<int>   g_changed;          // slots to re-upload this frame
     extern bool               g_changedPending;   // changes not uploaded yet
     extern std::vector<float> g_static0;          // level 0 cover without trenches
-    extern std::vector<float> g_deformK;          // level 0 trench strength (fade-out)
     // Level 0's rim share and relax time per slot, from the rows of the cell's materials.
     extern std::vector<float> g_rimCell, g_relaxCell;
     extern unsigned           g_stamps;           // units stamping this frame
@@ -216,6 +226,14 @@ namespace wxl_livingazeroth::cover::detail
     constexpr float kCoverTextureTile = 33.3333333f / 8.0f; // one repeat per terrain cell, like the terrain's layers
     void EnsureCoverTextures(IDirect3DDevice9* dev);
     bool UploadLevel(Level& L, bool isLevel0);
+    // What the uploads did in the last drawn frame (all levels), for the panel.
+    struct UploadStats
+    {
+        unsigned fullFolds = 0, fullLooks = 0;   // whole-texture passes
+        unsigned regions = 0, regionSlots = 0;   // changed regions, and the slots in them
+        double   foldMs = 0, lookMs = 0;
+    };
+    extern UploadStats g_uploadStats;
     void ReleaseCoverTextures();
 
     // --- GPU and drawing (SurfaceCoverDraw.cpp, SurfaceCoverShaders.cpp) ------------------------

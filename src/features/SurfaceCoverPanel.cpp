@@ -181,6 +181,10 @@ namespace wxl_livingazeroth::cover::detail
                           g_levels[0].foldMs, g_levels[1].foldMs, g_levels[2].foldMs, g_levels[3].foldMs, g_levels[4].foldMs); add();
         }
         std::snprintf(line, sizeof(line), "CPU: sim %.2f ms, upload %.2f ms, draw submit %.2f ms", g_simMs, g_uploadMs, g_drawMs); add();
+        if (g_resting) { std::snprintf(line, sizeof(line), "resting: no cover within the outermost level's reach, the finer levels wait"); add(); }
+        const UploadStats& us = g_uploadStats;
+        std::snprintf(line, sizeof(line), "uploads (last drawn frame): %u whole folds, %u whole looks, %u changed regions (%u slots); fold %.2f ms, look %.2f ms",
+                      us.fullFolds, us.fullLooks, us.regions, us.regionSlots, us.foldMs, us.lookMs); add();
         if (g_seenScene)
         {
             std::snprintf(line, sizeof(line), "terrain light: sun (view) %.3f %.3f %.3f, ambient %.3f %.3f %.3f, diffuse %.3f %.3f %.3f",

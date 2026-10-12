@@ -13,15 +13,14 @@ namespace wxl_livingazeroth::cover::detail
     std::vector<float> g_rim(kTex * kTex, 0.0f);
 
     // Only cells with a trench change from frame to frame. They're kept in a list (relaxed, and
-    // re-uploaded with a dirty rectangle) instead of walking all 147k cells twice per frame. The
-    // rest of level 0 keeps its static cover and the trench fade-out factor from the last full
-    // pass (a full pass runs whenever coverDirty is set: recentre, refill, settings).
+    // re-uploaded every frame with a dirty rectangle, their fade-out from the grid as it is then)
+    // instead of walking all 147k cells twice per frame. The rest of level 0 keeps its static cover
+    // from the last fold of its slot.
     std::vector<int>     g_active;                            // slots with press or rim > 0
     std::vector<uint8_t> g_isActive(kTex * kTex, 0);
     std::vector<int>     g_changed;                           // slots to re-upload this frame
     bool                 g_changedPending = false;            // changes not uploaded yet
     std::vector<float>   g_static0(kTex * kTex, 0.0f);        // level 0 cover without trenches
-    std::vector<float>   g_deformK(kTex * kTex, 0.0f);        // level 0 trench strength (fade-out)
 
     void MarkActive(int s)
     {

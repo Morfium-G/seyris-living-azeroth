@@ -245,6 +245,7 @@ namespace wxl_livingazeroth::cover::detail
         {
             prof::Scope uploads(prof::kOursCoverUpload);
             EnsureCoverTextures(dev);
+            g_uploadStats = UploadStats{};
             for (int k = 0; k < levels; ++k)
                 if (g_levels[k].haveGrid && !UploadLevel(g_levels[k], k == 0)) { g_inactive = "texture upload failed"; return; }
         }

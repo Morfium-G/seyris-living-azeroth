@@ -41,6 +41,7 @@ namespace wxl_livingazeroth::cover::detail
     int g_mapNow = -1;
 
     double g_simMs = 0;
+    bool g_resting = false;
 }
 
 namespace wxl_livingazeroth::cover
@@ -132,9 +133,17 @@ namespace wxl_livingazeroth::cover
 
         ++g_frame;
         const int levels = ActiveLevels();
+        // Nothing within the outermost level's reach (no cover, no ground fallen snow could settle
+        // on while it snows): the finer levels rest -- no recentres, no re-sampling -- and only the
+        // outermost keeps watching. Cover coming into reach shows up there first, seconds before the
+        // finer levels' ground does, and they catch up (or refill) from where they stopped.
+        const Level& outer = g_levels[levels - 1];
+        g_resting = levels > 1 && !refill && outer.haveGrid && !outer.jobActive && outer.coverCells <= 0 &&
+                    (outer.snowCells <= 0 || !fields::SnowActive());
         for (int k = 0; k < levels; ++k)
         {
             Level& L = g_levels[k];
+            if (g_resting && k < levels - 1) continue; // (a job already running still works off below)
             // A refill or a new map replaces whatever job was running; a recentre waits for it.
             if (refill) PlanFill(L, snap.playerPos, newMap || !L.haveGrid ? Plan::NewPlace : Plan::RefillInPlace);
             else if (!L.jobActive) PlanFill(L, snap.playerPos, Plan::Recentre);

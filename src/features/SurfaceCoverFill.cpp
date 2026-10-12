@@ -300,9 +300,10 @@ namespace wxl_livingazeroth::cover::detail
 
     // Base height and coverage parts of one world cell of a level (level 0 also resets its trench
     // state when `fresh`). Everything depends only on the world position, so the levels agree
-    // wherever their vertices coincide.
-    void Sample(Level& L, bool isLevel0, int i, int j, bool fresh)
+    // wherever their vertices coincide. Returns what changed (kDirty* bits).
+    uint8_t Sample(Level& L, bool isLevel0, int i, int j, bool fresh)
     {
+        uint8_t changed = 0;
         const int s = SlotOf(i, j);
         const float x = i * L.cell, y = j * L.cell;
         float z;
@@ -339,7 +340,7 @@ namespace wxl_livingazeroth::cover::detail
         // The cover's base: the terrain, moved by the rows' ZOffset (below the terrain only what
         // rises above it shows, e.g. trench rims through grass).
         const float base = ok ? z + (b.hasLook ? b.zOffset : 0.0f) : kHole;
-        if (base != L.base[s]) { L.base[s] = base; L.baseDirty = true; }
+        if (base != L.base[s]) { L.base[s] = base; changed |= kDirtyBase; }
         const uint8_t material = ToByte(b.covered), driftAmp = ToByte(b.drift), breakup = ToByte(b.breakup), stiff = ToByte(b.stiffness);
         const uint8_t drift = static_cast<uint8_t>(Drift(x, y) * 255.0f + 0.5f);
         const uint8_t edge = static_cast<uint8_t>(EdgeNoise(x, y) * 255.0f + 0.5f);
@@ -355,7 +356,7 @@ namespace wxl_livingazeroth::cover::detail
             L.material[s] = material; L.depth[s] = b.depth; L.slope[s] = slopeF; L.driftAmp[s] = driftAmp;
             L.breakup[s] = breakup; L.drift[s] = drift; L.edgeNoise[s] = edge; L.stiff[s] = stiff;
             L.snowShare[s] = snowShare; L.paintedSnow[s] = paintedSnow;
-            L.coverDirty = true;
+            changed |= kDirtyCover;
         }
         int a = -1, c = -1; // the two strongest
         for (int i = 0; i < b.texCount; ++i)
@@ -370,20 +371,33 @@ namespace wxl_livingazeroth::cover::detail
         if (tint != L.tint[s] || ids != L.texIds[s] || shares != L.texShares[s] || props != L.props[s])
         {
             L.tint[s] = tint; L.texIds[s] = ids; L.texShares[s] = shares; L.props[s] = props;
-            L.lookDirty = true;
+            changed |= kDirtyLook;
         }
         if (isLevel0)
         {
-            if (b.rim != g_rimCell[s]) { g_rimCell[s] = b.rim; L.coverDirty = true; }
+            if (b.rim != g_rimCell[s]) { g_rimCell[s] = b.rim; changed |= kDirtyCover; }
             g_relaxCell[s] = b.relax;
             if (fresh) { g_press[s] = 0.0f; g_rim[s] = 0.0f; }
         }
+        return changed;
     }
 
+    // Marks what changed for the uploads: a segment across the whole filled width as its row, a
+    // shorter one (a recentre's strip along y) by its columns.
     void SampleRect(Level& L, bool isLevel0, int i0, int i1, int j0, int j1, bool fresh) // inclusive
     {
+        const bool wholeRows = i1 - i0 + 1 >= kFilled;
         for (int j = j0; j <= j1; ++j)
-            for (int i = i0; i <= i1; ++i) Sample(L, isLevel0, i, j, fresh);
+        {
+            uint8_t row = 0;
+            for (int i = i0; i <= i1; ++i)
+            {
+                const uint8_t changed = Sample(L, isLevel0, i, j, fresh);
+                if (wholeRows) row |= changed;
+                else if (changed) L.dirtyCol[Slot(i)] |= changed;
+            }
+            if (row) L.dirtyRow[Slot(j)] |= row;
+        }
     }
 
     void PlanFill(Level& L, const float pos[3], Plan plan)
@@ -449,10 +463,13 @@ namespace wxl_livingazeroth::cover::detail
 
         L.gridI = L.jobI; L.gridJ = L.jobJ;
         L.haveGrid = true;
-        L.coverDirty = true;
-        L.baseDirty = true;
-        L.lookDirty = true;
-        if (L.jobFull) { L.firstFillMs = L.jobMs; L.boostRows = kFilled; } // chunks still streaming in get picked up quickly
+        // A recentre only changed its strips (marked while sampling); a full fill changed everything.
+        if (L.jobFull)
+        {
+            L.coverDirty = L.baseDirty = L.lookDirty = true;
+            L.firstFillMs = L.jobMs;
+            L.boostRows = kFilled; // chunks still streaming in get picked up quickly
+        }
         L.fillMs = L.jobMs;
         L.jobActive = false;
         L.job.clear();
