@@ -139,6 +139,7 @@ namespace wxl_livingazeroth::fog
         float poolSpeed = 1.0f;   // how fast heavy fog runs downhill (1 = a surface step evens out in ~1 s; 0 = it stays put)
         float steepStart = 30.0f; // degrees: from here a growing share of the ground-hugging fog runs off ...
         float steepFull = 45.0f;  // ... and from here all of it
+        int   blendPlaces = 1;    // the places' kind settings blend across area borders like the climate (off: each cell its own place's; to compare cost and look)
     };
     FieldSettings& Field();
 

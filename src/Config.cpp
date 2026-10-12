@@ -131,6 +131,7 @@ namespace wxl_livingazeroth::config
             g.densityScale = In(s, f, "DensityScale", "Your multiplier on every fog kind's density (1 = as FogSettings.cdbc says).", g.densityScale);
             g.maxDistance = In(s, f, "MaxDistance", "How far the fog is drawn, in yards.", g.maxDistance);
             g.farFog = In(s, f, "FarFog", "Beyond 128 yards the fog continues at each zone's typical level (no wall where the near fog ends).", g.farFog);
+            g.handoverYards = In(s, f, "HandoverWidth", "Yards over which the near fog fades into the far fog at the near field's edge (~128 yd): wider = softer seam, less near detail.", g.handoverYards);
             g.beyondMax = In(s, f, "BeyondMaxDistance", "Past MaxDistance, the far fog continues to the terrain drawn there (one long step, cheap).", g.beyondMax);
             g.halfResolution = In(s, f, "HalfResolution", "Draw the fog at half resolution, upscaled by depth (sharp at silhouettes): about a quarter of the GPU time.", g.halfResolution);
             g.steps = Whole(s, f, "StepBudget", "Steps per pixel through the fog (quality, not the look): more = smoother far away, slower.", g.steps);

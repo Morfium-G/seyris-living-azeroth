@@ -63,6 +63,7 @@ Where fog forms, and each kind's density, thickness, colour and so on, come from
 | Lights | 1 | Our lights (torches, braziers, lamps) light the fog around them. |
 | LightStrength | 1 | Your multiplier on our lights' light in the fog. |
 | LightRange | 128 | Lights farther than this from the camera (yards) don't light the fog. Lower = cheaper. |
+| HandoverWidth | 64 | Yards over which the near fog fades into the far fog at the near field's edge (~128 yd): wider = softer seam, less near detail. |
 | BeyondMaxDistance | 1 | Past MaxDistance, the far fog continues to the terrain drawn there (one long step, cheap). |
 | PoolSoftness | 0.6 | How soft heavy fog's edges are, 0 (crisp top, sharp sides) .. 1: its top blurs over this share of its depth, and pools thinner than this many yards fade out. |
 | PoolSpeed | 1 | How fast heavy fog (each kind's Weight share) runs downhill into hollows: 1 = default, 0 = it stays where it formed. The light share never runs off. |

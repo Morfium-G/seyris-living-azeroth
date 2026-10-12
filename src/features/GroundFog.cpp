@@ -798,16 +798,21 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
                     const uint32_t area = grid.area ? grid.area[index] : 0;
                     // The place's colours, blended toward the other place around like its settings
                     // (env/Fog: with blended settings only the colours still changed at a border).
-                    PlaceColours colours = coloursOf(area); // (a copy: the next lookup may grow the cache)
+                    // (A copy only where it blends: the next lookup may grow the cache.)
+                    static PlaceColours blended;
+                    const PlaceColours* coloursPtr = &coloursOf(area);
                     uint32_t otherArea = 0;
                     const float otherShare = fog::BlendOf(index, otherArea);
                     if (otherShare > 0.0f && otherArea != area)
                     {
+                        blended = *coloursPtr;
                         const PlaceColours& other = coloursOf(otherArea);
                         for (int k = 0; k < fog::kKindCount; ++k)
                             for (int ch = 0; ch < 3; ++ch)
-                                colours.kind[k][ch] += (other.kind[k][ch] - colours.kind[k][ch]) * otherShare;
+                                blended.kind[k][ch] += (other.kind[k][ch] - blended.kind[k][ch]) * otherShare;
+                        coloursPtr = &blended;
                     }
+                    const PlaceColours& colours = *coloursPtr;
                     for (int k = 0; k < fog::kKindCount; ++k)
                     {
                         const fog::KindSettings& ks = fog::SettingsAt(k, index); // the cell's own place's
@@ -1495,7 +1500,8 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
                 lightTex ? 1.0f : 0.0f, std::fmax(g_settings.poolSoftness, 0.0f), 0.0f, // (colours come from the colour texture)
                 g_settings.densityScale * (1.0f - (interior > 0.0f ? interior : 0.0f)),
                 g_noiseOffset[0], g_noiseOffset[1], g_noiseOffset[2], 1.0f / (g_settings.noiseTileYards > 1.0f ? g_settings.noiseTileYards : 1.0f),
-                g_settings.noiseAmount, 1.0f / 16.0f, g_settings.debugColour ? 1.0f : 0.0f, g_settings.heightBands ? 1.0f : 0.0f,
+                g_settings.noiseAmount, 1.0f / (g_settings.handoverYards > 2.0f ? g_settings.handoverYards : 2.0f),
+                g_settings.debugColour ? 1.0f : 0.0f, g_settings.heightBands ? 1.0f : 0.0f,
                 static_cast<float>(vp.X) / rtDesc.Width, static_cast<float>(vp.Y) / rtDesc.Height,
                 static_cast<float>(vp.Width) / rtDesc.Width, static_cast<float>(vp.Height) / rtDesc.Height,
                 g_poolDensity, 0.3f, ceiling, g_settings.poolGate ? 1.0f : 0.0f,
@@ -1815,6 +1821,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR
             g_api->UiSliderInt("fog floor reach (2 yd cells; 0 = follows every cell)##gffloor", &g_settings.floorReach, 0, 4);
             g_api->UiCheckbox("far fog (beyond 128 yd: each zone's typical fog)##gffar", &g_settings.farFog);
             g_api->UiCheckbox("far fog past the max distance (to the terrain drawn there)##gfbeyond", &g_settings.beyondMax);
+            g_api->UiSliderFloat("near to far fog handover (yd; wider = softer, less near detail)##gfhandover", &g_settings.handoverYards, 8.0f, 64.0f);
             g_api->UiSliderFloat("dither (0 smooth .. 1 grainy)##gfdither", &g_settings.dither, 0.0f, 1.0f);
         }
         if (g_api->UiCollapsingHeader("Quality##gfquality"))

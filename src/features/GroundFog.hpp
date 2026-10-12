@@ -21,6 +21,7 @@ namespace wxl_livingazeroth::groundfog
         int   steps = 48;               // the march's step budget per pixel (jumps through air + steps in the fog)
         int   farFog = 1;               // beyond the near field (128 yd): each zone's typical fog per 33 yd chunk (no edge wall)
         int   beyondMax = 1;            // past the max distance to the terrain drawn there: one long step through the far fog
+        float handoverYards = 64.0f;    // yd: the near fog fades into the far fog over this band at the near field's edge (wider = softer seam, less near detail)
         int   halfResolution = 1;      // march at half resolution, upscaled by depth (about a quarter of the GPU cost)
         float fogStep = 0.25f;         // yd: step length inside the fog near the camera (grows 4% of the distance)
         int   fogLights = 1;            // our lights (torches, braziers...) light the fog around them

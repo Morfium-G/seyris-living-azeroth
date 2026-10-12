@@ -8,6 +8,7 @@
 #include <d3d9.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
@@ -51,6 +52,73 @@ namespace wxl_livingazeroth::fogfar
         }
 
         int Mod(int v) { const int m = v % g_size; return m < 0 ? m + g_size : m; }
+
+        // A chunk's fog: its light layer's density per yd at the floor, thickness, colour.
+        struct ZoneLook { float density = 0.0f, thickness = 1.0f, rgb[3] = {}; };
+
+        /// Where a chunk overlaps the near field (env/Fog), its started cells' real fog, averaged (all
+        /// kinds, amount x density as the far map counts them), replaces the zone's typical fog by
+        /// the share of the chunk they cover: at the handover the far map then shows what the near
+        /// field shows (the zone's typical fog there made a seam). Colours per kind and area cached.
+        void BlendNear(int i, int j, float chunk, ColourFn colour, ZoneLook& look)
+        {
+            const fog::Grid& g = fog::Current();
+            if (!g.amount[0] || !g.groundKnown || !g.area) return;
+            constexpr int N = fog::kGridSize;
+            const int c0 = static_cast<int>(std::floor(i * chunk / fog::kCellSize)), c1 = static_cast<int>(std::floor((i + 1) * chunk / fog::kCellSize));
+            const int r0 = static_cast<int>(std::floor(j * chunk / fog::kCellSize)), r1 = static_cast<int>(std::floor((j + 1) * chunk / fog::kCellSize));
+            if (c1 <= g.firstI || c0 >= g.firstI + N || r1 <= g.firstJ || r0 >= g.firstJ + N) return; // no overlap
+            static std::unordered_map<uint64_t, std::array<float, 3>> colours; // (kind, area) -> colour, per rebuild
+            static ULONGLONG coloursAt = 0;
+            const ULONGLONG now = GetTickCount64();
+            if (now != coloursAt) { colours.clear(); coloursAt = now; }
+            auto wrap = [](int v) { const int m = v % N; return m < 0 ? m + N : m; };
+            // Every 2nd cell each way: plenty for a 33 yd average, a quarter of the work (every cell, with
+            // the blended settings looked up per kind, cost ~0.4 ms per rebuild).
+            int total = 0, count = 0;
+            float sumD = 0.0f, sumW = 0.0f, rgb[3] = {};
+            for (int r = r0; r < r1; r += 2)
+                for (int c = c0; c < c1; c += 2)
+                {
+                    ++total;
+                    if (c < g.firstI || c >= g.firstI + N || r < g.firstJ || r >= g.firstJ + N) continue;
+                    const int index = wrap(r) * N + wrap(c);
+                    if (!g.groundKnown[index] || (g.fresh && g.fresh[index])) continue;
+                    ++count;
+                    for (int k = 0; k < fog::kKindCount; ++k)
+                    {
+                        const fog::KindSettings s = fog::SettingsAt(k, index);
+                        if (!s.enabled) continue;
+                        const float d = g.amount[k][index] * s.density;
+                        if (d <= 0.0f) continue;
+                        sumD += d;
+                        sumW += d * s.thickness;
+                        const uint64_t key = (static_cast<uint64_t>(g.area[index]) << 8) | static_cast<uint64_t>(k);
+                        auto found = colours.find(key);
+                        if (found == colours.end())
+                        {
+                            std::array<float, 3> cl{};
+                            colour(k, g.area[index], cl.data());
+                            found = colours.emplace(key, cl).first;
+                        }
+                        for (int ch = 0; ch < 3; ++ch) rgb[ch] += d * found->second[ch];
+                    }
+                }
+            if (!count || !total) return;
+            const float cover = static_cast<float>(count) / total;
+            const float nearD = sumD / count;
+            const float dz = look.density * (1.0f - cover), dn = nearD * cover;
+            const float d = dz + dn;
+            if (d <= 0.0f) { look.density = 0.0f; return; }
+            const float nearT = sumD > 0.0f ? sumW / sumD : look.thickness;
+            look.thickness = (dz * look.thickness + dn * nearT) / d;
+            for (int ch = 0; ch < 3; ++ch)
+            {
+                const float nearC = sumD > 0.0f ? rgb[ch] / sumD : look.rgb[ch];
+                look.rgb[ch] = (dz * look.rgb[ch] + dn * nearC) / d;
+            }
+            look.density = d;
+        }
 
         /// A chunk's lowest ground: its centre and four points halfway to its corners (the layer
         /// lies on the low parts, so it doesn't float over dips).
@@ -116,7 +184,6 @@ namespace wxl_livingazeroth::fogfar
             if (!g_colour && FAILED(dev->CreateTexture(g_size, g_size, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_colour, nullptr))) { g_colour = nullptr; return false; }
 
             // Per zone (a handful around): its fog's light-layer density, thickness and colour.
-            struct ZoneLook { float density = 0.0f, thickness = 1.0f, rgb[3] = {}; };
             std::unordered_map<uint32_t, ZoneLook> zones;
             auto lookOf = [&](uint32_t zone) -> const ZoneLook& {
                 auto found = zones.find(zone);
@@ -158,8 +225,9 @@ namespace wxl_livingazeroth::fogfar
                     const int slot = Mod(j) * N + Mod(i);
                     const Chunk& ch = g_chunks[slot];
                     const uint32_t zone = map.zone[slot];
-                    if (!zone || ch.i != i || ch.j != j || !ch.groundKnown) continue;
-                    const ZoneLook& l = lookOf(zone);
+                    if (ch.i != i || ch.j != j || !ch.groundKnown) continue;
+                    ZoneLook l = zone ? lookOf(zone) : ZoneLook{};
+                    BlendNear(i, j, map.cellSize, colour, l);
                     if (l.density <= 1.0e-5f) continue;
                     looks[slot] = l;
                     ground[slot] = ch.ground;

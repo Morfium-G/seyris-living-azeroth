@@ -135,6 +135,7 @@ namespace wxl_livingazeroth::fog
         // area border (area fog 0.15/2 yd vs 0.03/8 yd: a visible seam; probe, 2026-10-12). 3 bytes a cell.
         std::vector<uint16_t> g_blendSlot;
         std::vector<uint8_t>  g_blendShare;
+        uint8_t               g_rowVisits[kGridSize] = {}; // per storage row: rules passes seen (the blend's refresh cadence)
         uint32_t g_slotsGeneration = ~0u;
         int      g_slotsMap = -2;
         uint16_t SlotOf(uint32_t area);
@@ -480,6 +481,7 @@ namespace wxl_livingazeroth::fog
         /// toward the strongest other area, by its weight against its own area's.
         void UpdateBlend(int i, int j, int index)
         {
+            if (!g_field.blendPlaces) { g_blendShare[index] = 0; return; }
             uint32_t areas[16];
             float weights[16];
             const int n = climate::AreaWeightsAt((i + 0.5f) * kCellSize, (j + 0.5f) * kCellSize, areas, weights, 16);
@@ -774,11 +776,14 @@ namespace wxl_livingazeroth::fog
                 g_rulesRow = (g_rulesRow + 1) % kGridSize;
                 const bool reseed = g_reseedRows > 0;
                 if (reseed) --g_reseedRows;
+                const bool refreshBlend = (g_rowVisits[Wrap(j)]++ & 3) == 0;
                 for (int i = g_grid.firstI; i < g_grid.firstI + kGridSize; ++i)
                 {
                     const int index = Index(i, j);
                     if (!g_groundKnown[index]) continue;
-                    UpdateBlend(i, j, index);
+                    // Areas don't move: a cell's blend for new cells, else every 4th visit of its row
+                    // (~4 s; picks up chunks loaded late), not every second (part of its ~0.4 ms).
+                    if (g_fresh[index] || refreshBlend || reseed) UpdateBlend(i, j, index);
                     UpdateSlope(i, j, index);
                     float t[kKindCount];
                     CellTargets(i, j, index, t);
@@ -1157,7 +1162,13 @@ namespace wxl_livingazeroth::fog
         // Just the place's Weight: steep ground now keeps fog from forming (CellTargets). Turning its
         // light share heavy there formed thin pools on cliffs faster than they drained, drawn as flat
         // slices per cell: contour stripes and flickering rings (owner-confirmed 2026-10-11).
-        return SettingsAt(kind, index).weight;
+        // (Only the weight is blended here: the whole mixed settings per cell and kind, every step,
+        // cost part of the blend's ~0.4 ms.)
+        if (kind < 0 || kind >= kKindCount) kind = 0;
+        if (g_areaSlot.empty()) return g_settings[kind].weight;
+        const float own = g_slots[g_areaSlot[index]].kind[kind].weight;
+        const uint8_t share = g_blendShare[index];
+        return share ? own + (g_slots[g_blendSlot[index]].kind[kind].weight - own) * (share / 255.0f) : own;
     }
 
     float Progress(int kind) { return kind >= 0 && kind < kKindCount ? g_progress[kind] : 0.0f; }

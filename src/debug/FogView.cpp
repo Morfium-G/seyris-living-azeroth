@@ -55,6 +55,7 @@ namespace wxl_livingazeroth::debug
                 g_api->UiSliderFloat("pool speed (how fast heavy fog runs downhill; 0 = stays put)##fogpoolspeed", &fog::Field().poolSpeed, 0.0f, 2.0f);
                 g_api->UiSliderFloat("steep from (degrees: more of the fog runs off)##fogsteep0", &fog::Field().steepStart, 0.0f, 89.0f);
                 g_api->UiSliderFloat("steep fully (degrees: all of it runs off)##fogsteep1", &fog::Field().steepFull, 0.0f, 89.0f);
+                g_api->UiCheckbox("blend places across area borders (like the climate)##fogblend", &fog::Field().blendPlaces);
                 for (int k = 0; k < fog::kKindCount; ++k) DrawKind(k);
             }
             if (g_api->UiCollapsingHeader("Testing: deposit, clear, fast-forward, pause##fogtesting"))
