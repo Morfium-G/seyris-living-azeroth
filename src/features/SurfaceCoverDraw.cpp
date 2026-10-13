@@ -586,8 +586,11 @@ namespace wxl_livingazeroth::cover::detail
     // cover, which hides them. Traced and probed 2026-10-13 (tracker: "Projected textures on the
     // cover"): stage 0 = decal texture x colour (*arg2; vertex colours unless flags & 2), stage 1 = a
     // falloff texture, both with texture coordinates = camera-space position x their texture matrix;
-    // blend, alpha test and depth bias as the decal wants. Right after it the device still holds all
-    // that; the cover patches under the projector are drawn once more with the decal pixel shader.
+    // blend, alpha test and depth bias as the decal wants. Not every caller combines alike: under a
+    // modulate blend (the blob shadow 0x7E4480, low shadow setting) 0x7E3E80 binds the other falloff
+    // [0xD3803C] and ADDS it, and the blob fades its texture to white by the colour's alpha -- so the
+    // replay takes the stages' combiners from the device too. Right after it the device still holds
+    // all that; the cover patches under the projector are drawn once more with the decal pixel shader.
     constexpr uintptr_t kProjectedDraw = 0x007E3E80;
     constexpr uintptr_t kProjectedTerrainPieces = 0x00CB752C; // pieces it drew (0 = only models, or nothing)
     using ProjectedDrawFn = void(__cdecl*)(uint32_t, const uint32_t*, uint32_t, uint32_t, float);
@@ -635,11 +638,39 @@ namespace wxl_livingazeroth::cover::detail
         D3DMATRIX m0{}, m1{};
         float fog[4] = { 0.0f, 1.0f, 1.0f, 0.0f }; // none
         float fogColor[4] = {};
+        // The decal PS's c51..c58 (see kDecalPsHlsl): stages 0/1, colour then alpha, two registers each.
+        float stages[8][4] = {
+            { D3DTOP_MODULATE, 2, 0, 0 }, { 0, 0, 0, 0 }, { D3DTOP_MODULATE, 2, 0, 0 }, { 0, 0, 0, 0 },
+            { D3DTOP_MODULATE, 2, 0, 0 }, { 1, 0, 0, 0 }, { D3DTOP_MODULATE, 2, 0, 0 }, { 1, 0, 0, 0 },
+        };
+        float texFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     };
+
+    // One combiner argument (D3DTA_*) as the PS takes it: select, complement, alpha replicate.
+    void PackArg(DWORD ta, float out[3])
+    {
+        const DWORD sel = ta & D3DTA_SELECTMASK;
+        out[0] = sel == D3DTA_DIFFUSE ? 0.0f : sel == D3DTA_TEXTURE ? 2.0f : sel == D3DTA_TFACTOR ? 3.0f : 1.0f;
+        out[1] = (ta & D3DTA_COMPLEMENT) ? 1.0f : 0.0f;
+        out[2] = (ta & D3DTA_ALPHAREPLICATE) ? 1.0f : 0.0f;
+    }
+
+    void PackCombiner(IDirect3DDevice9* dev, DWORD stage, D3DTEXTURESTAGESTATETYPE op, D3DTEXTURESTAGESTATETYPE arg1,
+                      D3DTEXTURESTAGESTATETYPE arg2, float a[4], float b[4])
+    {
+        DWORD o = D3DTOP_MODULATE, x = D3DTA_TEXTURE, y = D3DTA_CURRENT;
+        dev->GetTextureStageState(stage, op, &o);
+        dev->GetTextureStageState(stage, arg1, &x);
+        dev->GetTextureStageState(stage, arg2, &y);
+        a[0] = static_cast<float>(o);
+        PackArg(x, a + 1);
+        PackArg(y, b);
+        b[3] = 0.0f;
+    }
 
     // The setup the client just drew with: a vertex shader bound = a model's projected batch (its VS
     // dots the view position with c6/c7 and c8/c9, fogs by c30, its PS by c2), else fixed function
-    // (the texture matrices of stages 0 and 1, no fog).
+    // (the texture matrices of stages 0 and 1, the stages' combiners, no fog).
     DecalSetup ReadDecalSetup(IDirect3DDevice9* dev)
     {
         DecalSetup d;
@@ -649,6 +680,17 @@ namespace wxl_livingazeroth::cover::detail
         {
             dev->GetTransform(D3DTS_TEXTURE0, &d.m0);
             dev->GetTransform(D3DTS_TEXTURE1, &d.m1);
+            for (DWORD s = 0; s < 2; ++s)
+            {
+                PackCombiner(dev, s, D3DTSS_COLOROP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, d.stages[s * 4], d.stages[s * 4 + 1]);
+                PackCombiner(dev, s, D3DTSS_ALPHAOP, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, d.stages[s * 4 + 2], d.stages[s * 4 + 3]);
+            }
+            // A disabled stage 0 disables everything after it.
+            if (d.stages[0][0] == static_cast<float>(D3DTOP_DISABLE)) d.stages[4][0] = static_cast<float>(D3DTOP_DISABLE);
+            DWORD tf = 0xFFFFFFFFu;
+            dev->GetRenderState(D3DRS_TEXTUREFACTOR, &tf);
+            d.texFactor[0] = ((tf >> 16) & 0xFF) / 255.0f; d.texFactor[1] = ((tf >> 8) & 0xFF) / 255.0f;
+            d.texFactor[2] = (tf & 0xFF) / 255.0f;         d.texFactor[3] = ((tf >> 24) & 0xFF) / 255.0f;
             return d;
         }
         vs->Release();
@@ -702,14 +744,16 @@ namespace wxl_livingazeroth::cover::detail
         dev->SetTexture(D3DVERTEXTEXTURESAMPLER3, nullptr);
         dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
         // The texture matrices as columns (D3D multiplies a row vector), the colour as rgba.
-        float ps[11][4];
+        float ps[20][4];
         for (int j = 0; j < 4; ++j)
             for (int i = 0; i < 4; ++i) { ps[j][i] = m0.m[i][j]; ps[4 + j][i] = m1.m[i][j]; }
         ps[8][0] = ((color >> 16) & 0xFF) / 255.0f; ps[8][1] = ((color >> 8) & 0xFF) / 255.0f;
         ps[8][2] = (color & 0xFF) / 255.0f;         ps[8][3] = ((color >> 24) & 0xFF) / 255.0f;
         std::memcpy(ps[9], setup.fog, sizeof(ps[9]));
         std::memcpy(ps[10], setup.fogColor, sizeof(ps[10]));
-        dev->SetPixelShaderConstantF(40, &ps[0][0], 11);
+        std::memcpy(ps[11], setup.stages, sizeof(setup.stages));
+        std::memcpy(ps[19], setup.texFactor, sizeof(ps[19]));
+        dev->SetPixelShaderConstantF(40, &ps[0][0], 20);
         const float opts[4] = { 0.004f, 0.0f, 0.0f, 0.0f };
         dev->SetPixelShaderConstantF(2, opts, 1);
 

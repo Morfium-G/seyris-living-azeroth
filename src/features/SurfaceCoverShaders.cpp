@@ -322,6 +322,11 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
     // cover's (smallest depth, the finer level's box), c40..c43 / c44..c47 the decal / falloff
     // texture coordinates as dot vectors over (view position, 1), c48 the colour, c49 the fog
     // (viewZ * x + y, power z; x = 0, y = 1 = none), c50 the fog colour; s0/s1 the client's textures.
+    // c51..c58 the two stages' combiners as the client set them (fixed function; the decals don't all
+    // combine alike -- the blob shadow fades its texture to white and ADDS its falloff, for a
+    // modulate blend): per stage colour then alpha, each (D3DTOP, arg1 select, complement, alpha
+    // replicate), (arg2 select, complement, alpha replicate, 0); select 0 diffuse, 1 current,
+    // 2 texture, 3 texture factor (c59). A model's projected batch: modulate, modulate.
     const char* kDecalPsHlsl = R"(
 float4 opts : register(c2);
 float4 inner : register(c3);
@@ -330,8 +335,46 @@ float4 m1[4] : register(c44);
 float4 decalColor : register(c48);
 float4 decalFog : register(c49);
 float4 decalFogColor : register(c50);
+float4 stages[8] : register(c51);
+float4 texFactor : register(c59);
 sampler2D decalTex : register(s0);
 sampler2D fadeTex : register(s1);
+
+float4 Arg(float sel, float comp, float rep, float4 dif, float4 cur, float4 tex)
+{
+    float4 v = sel < 0.5 ? dif : (sel < 1.5 ? cur : (sel < 2.5 ? tex : texFactor));
+    v = rep > 0.5 ? v.aaaa : v;
+    return comp > 0.5 ? 1 - v : v;
+}
+
+// D3DTOP_*; anything not listed modulates.
+float4 Op(float op, float4 a, float4 b, float4 dif, float4 cur, float4 tex)
+{
+    float4 r = a * b;
+    r = op == 2 ? a : r;
+    r = op == 3 ? b : r;
+    r = op == 5 ? a * b * 2 : r;
+    r = op == 6 ? a * b * 4 : r;
+    r = op == 7 ? a + b : r;
+    r = op == 8 ? a + b - 0.5 : r;
+    r = op == 9 ? (a + b - 0.5) * 2 : r;
+    r = op == 10 ? a - b : r;
+    r = op == 11 ? a + b - a * b : r;
+    r = op == 12 ? lerp(b, a, dif.a) : r;
+    r = op == 13 ? lerp(b, a, tex.a) : r;
+    r = op == 14 ? lerp(b, a, texFactor.a) : r;
+    r = op == 15 ? a + b * (1 - tex.a) : r;
+    r = op == 16 ? lerp(b, a, cur.a) : r;
+    return saturate(r);
+}
+
+float4 Stage(float4 cA, float4 cB, float4 aA, float4 aB, float4 dif, float4 cur, float4 tex)
+{
+    float4 c = Op(cA.x, Arg(cA.y, cA.z, cA.w, dif, cur, tex), Arg(cB.x, cB.y, cB.z, dif, cur, tex), dif, cur, tex);
+    float4 l = Op(aA.x, Arg(aA.y, aA.z, aA.w, dif, cur, tex), Arg(aB.x, aB.y, aB.z, dif, cur, tex), dif, cur, tex);
+    float4 r = float4(c.rgb, aA.x == 1 ? cur.a : l.a);
+    return cA.x == 1 ? cur : r; // D3DTOP_DISABLE
+}
 
 float4 main(float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float3 vpos : TEXCOORD6) : COLOR
 {
@@ -342,7 +385,8 @@ float4 main(float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float3 vpos : TEXCOORD
     float4 p = float4(vpos, 1);
     float2 t0 = float2(dot(p, m0[0]), dot(p, m0[1]));
     float2 t1 = float2(dot(p, m1[0]), dot(p, m1[1]));
-    float4 c = tex2D(decalTex, t0) * decalColor * tex2D(fadeTex, t1);
+    float4 c = Stage(stages[0], stages[1], stages[2], stages[3], decalColor, decalColor, tex2D(decalTex, t0));
+    c = Stage(stages[4], stages[5], stages[6], stages[7], decalColor, c, tex2D(fadeTex, t1));
     float fog = min(pow(max(vpos.z * decalFog.x + decalFog.y, 0), decalFog.z), 1);
     c.rgb = lerp(decalFogColor.rgb, c.rgb, fog);
     return c;
