@@ -288,6 +288,8 @@ namespace wxl_livingazeroth::cover::detail
     extern DecalStats g_decalStats;
     // The draw's hooks (terrain stage, end of the scene). From Install.
     void InstallDraw(const WXL_Api* api);
+    // Before IDirect3DDevice9::Reset: the draw's state block (a live one makes the Reset fail).
+    void ReleaseDrawDeviceState();
 
     // --- panel (SurfaceCoverPanel.cpp) ----------------------------------------------------------
     void __cdecl Panel(void* user);

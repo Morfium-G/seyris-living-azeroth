@@ -866,6 +866,11 @@ namespace wxl_livingazeroth::cover::detail
         Draw(dev, a ? static_cast<IDirect3DSurface9*>(a->sceneDepth) : nullptr, false);
     }
 
+    void ReleaseDrawDeviceState()
+    {
+        if (g_decalSaved) { g_decalSaved->Release(); g_decalSaved = nullptr; }
+    }
+
     void InstallDraw(const WXL_Api* api)
     {
         api->Subscribe(static_cast<uint32_t>(ev::Event::OnWorldSceneEnd), &OnWorldSceneEnd, nullptr);

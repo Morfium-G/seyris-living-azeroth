@@ -83,6 +83,8 @@ namespace wxl_livingazeroth::cover
         pages::AddPanel(kPanelTitle, &Panel);
     }
 
+    void OnDeviceLost() { detail::ReleaseDrawDeviceState(); }
+
     void PatchLightStats(unsigned& most, unsigned& full) { most = g_patchLightsMost; full = g_patchLightsFull; }
 
     bool SeenSceneFog(float vsFog[4], float psFogColor[4])

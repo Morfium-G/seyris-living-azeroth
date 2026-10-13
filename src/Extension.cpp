@@ -150,6 +150,7 @@ namespace
         wxl_livingazeroth::postaa::OnDeviceLost();
         wxl_livingazeroth::groundfog::OnDeviceLost();
         wxl_livingazeroth::prof::OnDeviceLost();
+        wxl_livingazeroth::cover::OnDeviceLost();
     }
 }
 

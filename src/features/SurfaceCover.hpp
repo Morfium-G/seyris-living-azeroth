@@ -31,6 +31,9 @@ namespace wxl_livingazeroth::cover
     /// Once per frame on the main thread, after the world snapshot and the actors are refreshed.
     void Update(float dt, const world::Snapshot& snap);
 
+    /// Before IDirect3DDevice9::Reset: releases what has to go first (its textures are managed).
+    void OnDeviceLost();
+
     /// Last drawn frame: the most point lights any patch had, and how many patches had more than
     /// lights::kMaxLights (the nearest to the camera kept).
     void PatchLightStats(unsigned& most, unsigned& full);
