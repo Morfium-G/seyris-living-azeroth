@@ -78,6 +78,7 @@ namespace wxl_livingazeroth::cover::detail
         int   wireframe = 0;
         int   drawPoint = 0;            // 0 right after the terrain (inside the world pass), 1 end of the scene
         int   debugView = 0;            // 0 off, 1 cover texture share, 2 specular only, 3 lighting only
+        int   decals = 1;               // the client's projected textures (selection circles, spell ground effects) on the cover too
     };
 
     struct Level
@@ -168,6 +169,7 @@ namespace wxl_livingazeroth::cover::detail
     extern int            g_mapNow;           // the map being filled
     extern const void*    g_cdbcApi;
     extern double         g_simMs;
+    extern unsigned       g_frame;            // counts updates (in world, cover on)
     extern bool           g_resting;          // the finer levels rest: nothing within the outermost's reach
 
     // What the table sees where the player is (for the panel, so rows can be authored on the spot).
@@ -253,6 +255,7 @@ namespace wxl_livingazeroth::cover::detail
     // --- GPU and drawing (SurfaceCoverDraw.cpp, SurfaceCoverShaders.cpp) ------------------------
     extern const char* kVsHlsl;
     extern const char* kPsHlsl;
+    extern const char* kDecalPsHlsl;
     extern bool  g_tintSupported;
     // The terrain's lighting and fog as last read (for the panel): VS c12 fog, c24 sun direction
     // (view space), c25 ambient, c26 diffuse, PS c2 fog colour.
@@ -265,6 +268,24 @@ namespace wxl_livingazeroth::cover::detail
     extern unsigned g_patchLightsMost, g_patchLightsFull; // last frame: the busiest patch; patches over kMaxLights
     extern double g_uploadMs, g_drawMs;
     extern const char* g_inactive;
+    // The client's projected textures redrawn on the cover: what the calls came to since the last
+    // reset (panel).
+    struct DecalStats
+    {
+        unsigned calls = 0, modelCalls = 0, drawn = 0; // modelCalls: from models' projected batches (0x7E3AA0)
+        unsigned noCover = 0, noPieces = 0, noBox = 0; // skipped: cover not drawn this frame, nothing drawn on the terrain, not overhead
+        uintptr_t lastCaller = 0;
+        uint32_t  lastFlags = 0;
+        // The last replayed decal: the setup the client left, and the cover patches it went onto.
+        unsigned  patches = 0, patchesBefore = 0, lastPatches = 0;
+        bool      lastFromModel = false;
+        uint32_t  lastColor = 0;
+        DWORD     texCoordIndex = 0, transformFlags = 0, texCoordIndex1 = 0, transformFlags1 = 0;
+        DWORD     srcBlend = 0, dstBlend = 0, alphaTest = 0, alphaRef = 0, zFunc = 0;
+        unsigned  shaders = 0;        // bit 0: a vertex shader was bound, bit 1: a pixel shader
+        float     matrix[16] = {};    // stage 0 texture matrix
+    };
+    extern DecalStats g_decalStats;
     // The draw's hooks (terrain stage, end of the scene). From Install.
     void InstallDraw(const WXL_Api* api);
 

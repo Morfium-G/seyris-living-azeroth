@@ -54,6 +54,23 @@ namespace wxl_livingazeroth::cover::detail
         g_api->UiSliderFloat("Far lift (yd, 80 -> 400 yd away)", &g_settings.farLift, 0.0f, 3.0f);
         g_api->UiCheckbox("Light and fog like the terrain", &g_settings.sceneLight);
         g_api->UiCheckbox("Dynamic shadows like the terrain", &g_settings.shadows);
+        g_api->UiCheckbox("Selection circles and spell ground effects on the cover", &g_settings.decals);
+        {
+            const DecalStats& ds = g_decalStats;
+            char decals[256];
+            std::snprintf(decals, sizeof(decals), "  decal calls %u (%u from models): drawn on the cover %u; skipped: no cover drawn %u, nothing on the terrain %u, not overhead %u (last caller 0x%08X, flags 0x%X)",
+                          ds.calls, ds.modelCalls, ds.drawn, ds.noCover, ds.noPieces, ds.noBox, static_cast<unsigned>(ds.lastCaller), ds.lastFlags);
+            g_api->UiTextWrapped(decals);
+            std::snprintf(decals, sizeof(decals), "  last replayed (%s): colour %08X, patches %u; stage 0 coords 0x%X flags 0x%X, stage 1 coords 0x%X flags 0x%X; blend %u/%u, alpha test %u ref %u, z func %u, shaders %u",
+                          ds.lastFromModel ? "model" : "decal", ds.lastColor, ds.lastPatches, ds.texCoordIndex, ds.transformFlags,
+                          ds.texCoordIndex1, ds.transformFlags1, ds.srcBlend, ds.dstBlend, ds.alphaTest, ds.alphaRef, ds.zFunc, ds.shaders);
+            g_api->UiTextWrapped(decals);
+            const float* m = ds.matrix;
+            std::snprintf(decals, sizeof(decals), "  stage 0 matrix [%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f]",
+                          m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+            g_api->UiTextWrapped(decals);
+            if (g_api->UiButton("Reset decal counts")) g_decalStats = DecalStats{};
+        }
         g_api->UiSliderFloat("Snow brightness", &g_settings.brightness, 0.3f, 1.5f);
         g_api->UiSliderFloat("Fill budget (ms per frame)", &g_settings.fillBudgetMs, 0.5f, 10.0f);
         static const char* const sources[] = { "Painted strength of every layer (alpha maps)", "Dominant layer per terrain cell (old)" };

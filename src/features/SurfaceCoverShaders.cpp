@@ -310,4 +310,42 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
     return float4(lerp(fogColor.rgb, c, fog), 1);
 }
 )";
+
+    // Projected textures on the cover (selection circles, spell ground effects, targeting reticles):
+    // the client draws them after the scene by re-drawing the terrain under an overhead projector, in
+    // fixed function -- stage 0 the decal texture x the decal colour, stage 1 a falloff texture, each
+    // with texture coordinates = the camera-space position x a texture matrix (3 coordinates, no
+    // divide). Models' projected batches (Consecration) do the same in shaders: their VS dots the
+    // view-space position with c6/c7 (decal) and c8/c9 (falloff), their PS fogs (VS c30, PS c2).
+    // The cover lies on top and hid them; this draws the same onto the cover, with the client's
+    // blend, alpha test and depth bias still set. Same VS as the cover (same depth). PS: c2/c3 as the
+    // cover's (smallest depth, the finer level's box), c40..c43 / c44..c47 the decal / falloff
+    // texture coordinates as dot vectors over (view position, 1), c48 the colour, c49 the fog
+    // (viewZ * x + y, power z; x = 0, y = 1 = none), c50 the fog colour; s0/s1 the client's textures.
+    const char* kDecalPsHlsl = R"(
+float4 opts : register(c2);
+float4 inner : register(c3);
+float4 m0[4] : register(c40);
+float4 m1[4] : register(c44);
+float4 decalColor : register(c48);
+float4 decalFog : register(c49);
+float4 decalFogColor : register(c50);
+sampler2D decalTex : register(s0);
+sampler2D fadeTex : register(s1);
+
+float4 main(float2 d : TEXCOORD1, float2 rel : TEXCOORD2, float3 vpos : TEXCOORD6) : COLOR
+{
+    clip(d.x - opts.x);
+    clip(0.5 - d.y);
+    float2 a = step(inner.xy, rel) * step(rel, inner.zw);
+    clip(0.5 - a.x * a.y);
+    float4 p = float4(vpos, 1);
+    float2 t0 = float2(dot(p, m0[0]), dot(p, m0[1]));
+    float2 t1 = float2(dot(p, m1[0]), dot(p, m1[1]));
+    float4 c = tex2D(decalTex, t0) * decalColor * tex2D(fadeTex, t1);
+    float fog = min(pow(max(vpos.z * decalFog.x + decalFog.y, 0), decalFog.z), 1);
+    c.rgb = lerp(decalFogColor.rgb, c.rgb, fog);
+    return c;
+}
+)";
 }

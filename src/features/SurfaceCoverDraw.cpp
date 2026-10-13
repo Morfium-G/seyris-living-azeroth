@@ -17,7 +17,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -110,13 +112,14 @@ namespace wxl_livingazeroth::cover::detail
     IDirect3DVertexDeclaration9* g_decl = nullptr;
     IDirect3DVertexShader9*      g_vs = nullptr;
     IDirect3DPixelShader9*       g_ps = nullptr;
+    IDirect3DPixelShader9*       g_decalPs = nullptr; // projected textures on the cover (optional)
     bool                         g_gpuFailed = false;
 
     // --- GPU ---------------------------------------------------------------------------------
     void ReleaseGpu()
     {
         auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
-        rel(g_vb); rel(g_ib); rel(g_decl); rel(g_vs); rel(g_ps); moisturetex::Release();
+        rel(g_vb); rel(g_ib); rel(g_decl); rel(g_vs); rel(g_ps); rel(g_decalPs); moisturetex::Release();
         for (Level& L : g_levels) { rel(L.baseTex); rel(L.coverTex); rel(L.lookTex); rel(L.texWTex[0]); rel(L.texWTex[1]); rel(L.propsTex); L.baseDirty = L.coverDirty = L.lookDirty = true; }
         ReleaseCoverTextures();
     }
@@ -219,8 +222,40 @@ namespace wxl_livingazeroth::cover::detail
         g_vs = static_cast<IDirect3DVertexShader9*>(Compile(dev, kVsHlsl, "vs_3_0", false));
         g_ps = static_cast<IDirect3DPixelShader9*>(Compile(dev, kPsHlsl, "ps_3_0", true));
         if (!g_vs || !g_ps) return fail("shader compile failed (see the log)");
+        g_decalPs = static_cast<IDirect3DPixelShader9*>(Compile(dev, kDecalPsHlsl, "ps_3_0", true)); // without it, no decals on the cover
         return true;
     }
+
+    // A level's draw constants: VS c5 (its centre cell, half extent, morph band), c7 (the outermost
+    // level's fade-out), PS c3 (the next finer drawn level's box, camera-relative: this level isn't
+    // drawn there; level 0 has none. The box is a hair smaller than that grid, so the two levels
+    // overlap slightly where they meet -- same heights there -- instead of both skipping a pixel
+    // exactly on the edge).
+    void LevelConstants(int k, bool outermost, const float eye[3], float c5[4], float c7[4], float inner[4])
+    {
+        const Level& L = g_levels[k];
+        c5[0] = static_cast<float>(L.gridI + kHalfCells); c5[1] = static_cast<float>(L.gridJ + kHalfCells);
+        c5[2] = static_cast<float>(kHalfCells);           c5[3] = outermost ? 0.0f : static_cast<float>(kMorphCells);
+        c7[0] = kHalfCells * kOuterFadeStart; c7[1] = kHalfCells * kOuterFadeEnd; c7[2] = outermost ? 1.0f : 0.0f; c7[3] = 0.0f;
+        inner[0] = inner[1] = 1.0e9f; inner[2] = inner[3] = -1.0e9f;
+        int finer = k - 1;
+        while (finer >= 0 && !g_levels[finer].haveGrid) --finer;
+        if (finer < 0) return;
+        const Level& F = g_levels[finer];
+        const double e = F.cell * 0.25;
+        inner[0] = static_cast<float>(static_cast<double>(F.gridI) * F.cell + e - eye[0]);
+        inner[1] = static_cast<float>(static_cast<double>(F.gridJ) * F.cell + e - eye[1]);
+        inner[2] = static_cast<float>(static_cast<double>(F.gridI + kGridCells) * F.cell - e - eye[0]);
+        inner[3] = static_cast<float>(static_cast<double>(F.gridJ + kGridCells) * F.cell - e - eye[1]);
+    }
+
+    // What the cover was last drawn with, for the projected-texture replay (DrawDecal).
+    struct DrawnWith
+    {
+        unsigned frame = 0xFFFFFFFFu; // g_frame of that draw
+        int      lastDrawn = -1;      // the outermost level drawn
+        float    vp[16], eye[4], c8[4], vs9[16];
+    } g_drawn;
 
     // inPass: called inside the world pass, where the world's viewport and depth surface are still
     // bound. Otherwise (end of scene) both have to be put back first.
@@ -497,27 +532,10 @@ namespace wxl_livingazeroth::cover::detail
                 dev->SetSamplerState(8 + q, D3DSAMP_SRGBTEXTURE, FALSE);
             }
 
-            const float c5[4] = { static_cast<float>(L.gridI + kHalfCells), static_cast<float>(L.gridJ + kHalfCells),
-                                  static_cast<float>(kHalfCells), outermost ? 0.0f : static_cast<float>(kMorphCells) };
+            float c5[4], c7[4], inner[4];
+            LevelConstants(k, outermost, eye, c5, c7, inner);
             dev->SetVertexShaderConstantF(5, c5, 1);
-            const float c7[4] = { kHalfCells * kOuterFadeStart, kHalfCells * kOuterFadeEnd, outermost ? 1.0f : 0.0f, 0.0f };
             dev->SetVertexShaderConstantF(7, c7, 1);
-
-            // Not drawn inside the next finer level's grid (camera-relative box); level 0 has none.
-            // The box is a hair smaller than that grid, so the two levels overlap slightly where
-            // they meet (same heights there) instead of both skipping a pixel exactly on the edge.
-            float inner[4] = { 1.0e9f, 1.0e9f, -1.0e9f, -1.0e9f };
-            int finer = k - 1;
-            while (finer >= 0 && !g_levels[finer].haveGrid) --finer;
-            if (finer >= 0)
-            {
-                const Level& F = g_levels[finer];
-                const double e = F.cell * 0.25;
-                inner[0] = static_cast<float>(static_cast<double>(F.gridI) * F.cell + e - eye[0]);
-                inner[1] = static_cast<float>(static_cast<double>(F.gridJ) * F.cell + e - eye[1]);
-                inner[2] = static_cast<float>(static_cast<double>(F.gridI + kGridCells) * F.cell - e - eye[0]);
-                inner[3] = static_cast<float>(static_cast<double>(F.gridJ + kGridCells) * F.cell - e - eye[1]);
-            }
             dev->SetPixelShaderConstantF(3, inner, 1);
             const float innerWorld[4] = { inner[0] + eye[0], inner[1] + eye[1], inner[2] + eye[0], inner[3] + eye[1] };
 
@@ -550,6 +568,281 @@ namespace wxl_livingazeroth::cover::detail
         modellights::Rebind(dev);
         g_drawMs = grassperf::Now() - t0;
         g_inactive = nullptr;
+        if (inPass)
+        {
+            g_drawn.frame = g_frame;
+            g_drawn.lastDrawn = lastDrawn;
+            std::memcpy(g_drawn.vp, cols, sizeof(cols));
+            std::memcpy(g_drawn.eye, eye, sizeof(eye));
+            std::memcpy(g_drawn.c8, c8, sizeof(c8));
+            std::memcpy(g_drawn.vs9, vs9, sizeof(vs9));
+        }
+    }
+
+    // --- the client's projected textures on the cover ---------------------------------------------
+    // The projected-texture draw 0x7E3E80 (cdecl: ?, colour*, ?, flags, ?; called through 0x7E4370 by
+    // the world's decal pass, Player_C's selection circles, missile trajectories, ...) re-draws the
+    // terrain pieces under an overhead projector after the scene, in fixed function -- so after the
+    // cover, which hides them. Traced and probed 2026-10-13 (tracker: "Projected textures on the
+    // cover"): stage 0 = decal texture x colour (*arg2; vertex colours unless flags & 2), stage 1 = a
+    // falloff texture, both with texture coordinates = camera-space position x their texture matrix;
+    // blend, alpha test and depth bias as the decal wants. Right after it the device still holds all
+    // that; the cover patches under the projector are drawn once more with the decal pixel shader.
+    constexpr uintptr_t kProjectedDraw = 0x007E3E80;
+    constexpr uintptr_t kProjectedTerrainPieces = 0x00CB752C; // pieces it drew (0 = only models, or nothing)
+    using ProjectedDrawFn = void(__cdecl*)(uint32_t, const uint32_t*, uint32_t, uint32_t, float);
+    ProjectedDrawFn g_origProjectedDraw = nullptr;
+    IDirect3DStateBlock9* g_decalSaved = nullptr;
+
+    uint32_t SafeRead(const void* p)
+    {
+        __try { return *static_cast<const uint32_t*>(p); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return 0xFFFFFFFFu; }
+    }
+
+    // uv_j = (vpos, 1) . M[.][j] with vpos = q . V3 (q = world - eye, V3 = the view rotation rows
+    // c9..c11): the ground box the decal's texture spans (uv 0..1), taken at q.z = 0 (the projector
+    // looks straight down, so z barely matters). False when the projection isn't overhead.
+    bool DecalBox(const D3DMATRIX& M, const float vs9[16], const float eye[4], float box[4])
+    {
+        double A[3][2];
+        for (int r = 0; r < 3; ++r)
+            for (int j = 0; j < 2; ++j)
+            {
+                double s = 0.0;
+                for (int c = 0; c < 3; ++c) s += static_cast<double>(vs9[r * 4 + c]) * M.m[c][j];
+                A[r][j] = s;
+            }
+        const double det = A[0][0] * A[1][1] - A[1][0] * A[0][1];
+        if (std::fabs(det) < 1e-9) return false;
+        box[0] = box[1] = 1e30f; box[2] = box[3] = -1e30f;
+        for (int corner = 0; corner < 4; ++corner)
+        {
+            const double u = (corner & 1) - M.m[3][0], v = (corner >> 1) - M.m[3][1];
+            // qx * A[0][j] + qy * A[1][j] = (u, v)[j]
+            const double qx = (u * A[1][1] - v * A[1][0]) / det, qy = (v * A[0][0] - u * A[0][1]) / det;
+            const float x = static_cast<float>(qx + eye[0]), y = static_cast<float>(qy + eye[1]);
+            box[0] = std::min(box[0], x); box[1] = std::min(box[1], y);
+            box[2] = std::max(box[2], x); box[3] = std::max(box[3], y);
+        }
+        return box[2] - box[0] < 2000.0f && box[3] - box[1] < 2000.0f;
+    }
+
+    // How the client's decal draw mapped the view-space position to its two textures (as texture
+    // matrices: row-vector convention, columns = u, v), and its fog.
+    struct DecalSetup
+    {
+        D3DMATRIX m0{}, m1{};
+        float fog[4] = { 0.0f, 1.0f, 1.0f, 0.0f }; // none
+        float fogColor[4] = {};
+    };
+
+    // The setup the client just drew with: a vertex shader bound = a model's projected batch (its VS
+    // dots the view position with c6/c7 and c8/c9, fogs by c30, its PS by c2), else fixed function
+    // (the texture matrices of stages 0 and 1, no fog).
+    DecalSetup ReadDecalSetup(IDirect3DDevice9* dev)
+    {
+        DecalSetup d;
+        IDirect3DVertexShader9* vs = nullptr;
+        dev->GetVertexShader(&vs);
+        if (!vs)
+        {
+            dev->GetTransform(D3DTS_TEXTURE0, &d.m0);
+            dev->GetTransform(D3DTS_TEXTURE1, &d.m1);
+            return d;
+        }
+        vs->Release();
+        float c[4][4];
+        dev->GetVertexShaderConstantF(6, &c[0][0], 4);
+        for (int i = 0; i < 4; ++i)
+        {
+            d.m0.m[i][0] = c[0][i]; d.m0.m[i][1] = c[1][i];
+            d.m1.m[i][0] = c[2][i]; d.m1.m[i][1] = c[3][i];
+        }
+        dev->GetVertexShaderConstantF(30, d.fog, 1);
+        dev->GetPixelShaderConstantF(2, d.fogColor, 1);
+        return d;
+    }
+
+    void DrawDecal(IDirect3DDevice9* dev, uint32_t color, const DecalSetup& setup)
+    {
+        const D3DMATRIX& m0 = setup.m0;
+        const D3DMATRIX& m1 = setup.m1;
+        float box[4];
+        if (!DecalBox(m0, g_drawn.vs9, g_drawn.eye, box)) { ++g_decalStats.noBox; return; }
+        ++g_decalStats.drawn;
+
+        if (g_decalSaved) g_decalSaved->Capture();
+        else if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &g_decalSaved))) g_decalSaved = nullptr;
+        if (!g_decalSaved) return;
+
+        // The cover's VS exactly as drawn this frame (same positions, so the same depth), no tint,
+        // no far moisture, no point lights; the decal PS with the client's textures on s0/s1.
+        dev->SetVertexShader(g_vs);
+        dev->SetPixelShader(g_decalPs);
+        dev->SetVertexDeclaration(g_decl);
+        dev->SetStreamSource(0, g_vb, 0, 8);
+        dev->SetIndices(g_ib);
+        dev->SetVertexShaderConstantF(0, g_drawn.vp, 4);
+        dev->SetVertexShaderConstantF(6, g_drawn.eye, 1);
+        dev->SetVertexShaderConstantF(8, g_drawn.c8, 1);
+        dev->SetVertexShaderConstantF(9, g_drawn.vs9, 4);
+        const float zero[16] = {};
+        dev->SetVertexShaderConstantF(13, zero, 4);
+        dev->SetVertexShaderConstantF(17, zero, 1);
+        for (DWORD s = D3DVERTEXTEXTURESAMPLER0; s <= D3DVERTEXTEXTURESAMPLER1; ++s)
+        {
+            dev->SetSamplerState(s, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+            dev->SetSamplerState(s, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+            dev->SetSamplerState(s, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+            dev->SetSamplerState(s, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+            dev->SetSamplerState(s, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+        }
+        dev->SetTexture(D3DVERTEXTEXTURESAMPLER2, nullptr);
+        dev->SetTexture(D3DVERTEXTEXTURESAMPLER3, nullptr);
+        dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        // The texture matrices as columns (D3D multiplies a row vector), the colour as rgba.
+        float ps[11][4];
+        for (int j = 0; j < 4; ++j)
+            for (int i = 0; i < 4; ++i) { ps[j][i] = m0.m[i][j]; ps[4 + j][i] = m1.m[i][j]; }
+        ps[8][0] = ((color >> 16) & 0xFF) / 255.0f; ps[8][1] = ((color >> 8) & 0xFF) / 255.0f;
+        ps[8][2] = (color & 0xFF) / 255.0f;         ps[8][3] = ((color >> 24) & 0xFF) / 255.0f;
+        std::memcpy(ps[9], setup.fog, sizeof(ps[9]));
+        std::memcpy(ps[10], setup.fogColor, sizeof(ps[10]));
+        dev->SetPixelShaderConstantF(40, &ps[0][0], 11);
+        const float opts[4] = { 0.004f, 0.0f, 0.0f, 0.0f };
+        dev->SetPixelShaderConstantF(2, opts, 1);
+
+        for (int k = 0; k <= g_drawn.lastDrawn && k < kMaxLevels; ++k)
+        {
+            const Level& L = g_levels[k];
+            if (!L.haveGrid || !L.anyCover) continue;
+            float c5[4], c7[4], inner[4];
+            LevelConstants(k, k == g_drawn.lastDrawn, g_drawn.eye, c5, c7, inner);
+            dev->SetVertexShaderConstantF(5, c5, 1);
+            dev->SetVertexShaderConstantF(7, c7, 1);
+            dev->SetPixelShaderConstantF(3, inner, 1);
+            dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, L.baseTex);
+            dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, L.coverTex);
+            for (int pj = 0; pj < kPatches; ++pj)
+                for (int pi = 0; pi < kPatches; ++pi)
+                {
+                    const double x0 = static_cast<double>(L.gridI + pi * kPatchCells) * L.cell, y0 = static_cast<double>(L.gridJ + pj * kPatchCells) * L.cell;
+                    const double x1 = x0 + kPatchCells * L.cell, y1 = y0 + kPatchCells * L.cell;
+                    if (x1 < box[0] || x0 > box[2] || y1 < box[1] || y0 > box[3]) continue; // not under the decal
+                    // Wholly inside the finer level's box: that level draws this ground.
+                    if (x0 - g_drawn.eye[0] >= inner[0] && x1 - g_drawn.eye[0] <= inner[2] &&
+                        y0 - g_drawn.eye[1] >= inner[1] && y1 - g_drawn.eye[1] <= inner[3]) continue;
+                    const float c4[4] = { static_cast<float>(L.gridI + pi * kPatchCells), static_cast<float>(L.gridJ + pj * kPatchCells), L.cell, 1.0f / kTex };
+                    dev->SetVertexShaderConstantF(4, c4, 1);
+                    ++g_decalStats.patches;
+                    dev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, kPatchVerts * kPatchVerts, 0, kPatchCells * kPatchCells * 2);
+                }
+        }
+        dev->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
+        dev->SetTexture(D3DVERTEXTEXTURESAMPLER1, nullptr);
+        g_decalSaved->Apply();
+    }
+
+    // Diagnostics (panel): what the projected-texture calls came to, since the last reset.
+    DecalStats g_decalStats;
+    std::vector<uintptr_t> g_decalCallers; // logged once each
+
+    // The other projected-texture draw, 0x7E3AA0 (same arguments): the M2 scene's projected-batch
+    // callback 0x77F500 (registered on the scene by 0x81CC30, gated by [0xCD7750] & 4, likely the
+    // projectedTextures option) uses it for models that project onto the ground -- e.g. Consecration.
+    constexpr uintptr_t kModelProjectedDraw = 0x007E3AA0;
+    ProjectedDrawFn g_origModelProjectedDraw = nullptr;
+
+    // Whether a projected-texture call drew any terrain piece: the client's GxDraw 0x482A40 (cdecl
+    // (batch, indexed) -> the device's draw; only 3 callers, the two projected draws among them),
+    // counted while one of them runs. (Comparing the texture matrix before and after failed: a decal
+    // that stays put, like Consecration, leaves the same matrix frame after frame.)
+    constexpr uintptr_t kGxDraw = 0x00482A40;
+    using GxDrawFn = void(__cdecl*)(void* batch, int indexed);
+    GxDrawFn g_origGxDraw = nullptr;
+    unsigned g_projectedDepth = 0, g_projectedDraws = 0;
+
+    void __cdecl hkGxDraw(void* batch, int indexed)
+    {
+        if (g_projectedDepth) ++g_projectedDraws;
+        g_origGxDraw(batch, indexed);
+    }
+
+    void AfterProjectedDraw(IDirect3DDevice9* dev, bool drew, const uint32_t* color, uint32_t flags, bool fromModel);
+
+    void __cdecl hkModelProjectedDraw(uint32_t a1, const uint32_t* color, uint32_t a3, uint32_t flags, float a5)
+    {
+        const unsigned draws = g_projectedDraws;
+        ++g_projectedDepth;
+        g_origModelProjectedDraw(a1, color, a3, flags, a5);
+        --g_projectedDepth;
+        AfterProjectedDraw(static_cast<IDirect3DDevice9*>(gx::RawDevice()), g_projectedDraws != draws, color, flags, true);
+    }
+
+    void __cdecl hkProjectedDraw(uint32_t a1, const uint32_t* color, uint32_t a3, uint32_t flags, float a5)
+    {
+        const unsigned draws = g_projectedDraws;
+        ++g_projectedDepth;
+        g_origProjectedDraw(a1, color, a3, flags, a5);
+        --g_projectedDepth;
+        AfterProjectedDraw(static_cast<IDirect3DDevice9*>(gx::RawDevice()), g_projectedDraws != draws, color, flags, false);
+    }
+
+
+    void AfterProjectedDraw(IDirect3DDevice9* dev, bool drew, const uint32_t* color, uint32_t flags, bool fromModel)
+    {
+        ++g_decalStats.calls;
+        if (fromModel) ++g_decalStats.modelCalls;
+        {
+            // Who asked (frames: us, the wrapper 0x7E4370 or the model callback 0x77F500, its caller),
+            // logged once per caller.
+            void* frames[5] = {};
+            const USHORT got = RtlCaptureStackBackTrace(0, 5, frames, nullptr);
+            uintptr_t caller = 0;
+            for (USHORT k = 0; k + 1 < got; ++k)
+            {
+                const uintptr_t f = reinterpret_cast<uintptr_t>(frames[k]);
+                if ((f >= 0x007E4370 && f < 0x007E4480) || (f >= 0x0077F500 && f < 0x0077F540)) { caller = reinterpret_cast<uintptr_t>(frames[k + 1]); break; }
+            }
+            g_decalStats.lastCaller = caller;
+            g_decalStats.lastFlags = flags;
+            if (std::find(g_decalCallers.begin(), g_decalCallers.end(), caller) == g_decalCallers.end() && g_decalCallers.size() < 32)
+            {
+                g_decalCallers.push_back(caller);
+                g_api->Log(WXL_LOG_INFO, kTag, "cover decals: projected-texture caller 0x%08X, flags 0x%X, colour %08X, terrain pieces %u",
+                           static_cast<unsigned>(caller), flags, color ? SafeRead(color) : 0u, SafeRead(reinterpret_cast<const void*>(kProjectedTerrainPieces)));
+            }
+        }
+        if (!dev || !g_settings.enabled || !g_settings.decals || g_settings.drawPoint != 0 || !g_decalPs || dev != g_device) return;
+        if (g_drawn.frame != g_frame) { ++g_decalStats.noCover; return; }
+        if (!drew) { ++g_decalStats.noPieces; return; } // nothing on the terrain (or only on models)
+        prof::Scope scope(prof::kOursCoverDraw);
+        {
+            // What the client left on the device (panel: the last decal's setup).
+            DecalStats& ds = g_decalStats;
+            ds.lastFromModel = fromModel;
+            ds.lastColor = color ? SafeRead(color) : 0xFFFFFFFFu;
+            dev->GetTextureStageState(0, D3DTSS_TEXCOORDINDEX, &ds.texCoordIndex);
+            dev->GetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, &ds.transformFlags);
+            dev->GetTextureStageState(1, D3DTSS_TEXCOORDINDEX, &ds.texCoordIndex1);
+            dev->GetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, &ds.transformFlags1);
+            dev->GetRenderState(D3DRS_SRCBLEND, &ds.srcBlend);
+            dev->GetRenderState(D3DRS_DESTBLEND, &ds.dstBlend);
+            dev->GetRenderState(D3DRS_ALPHATESTENABLE, &ds.alphaTest);
+            dev->GetRenderState(D3DRS_ALPHAREF, &ds.alphaRef);
+            dev->GetRenderState(D3DRS_ZFUNC, &ds.zFunc);
+            IDirect3DVertexShader9* vs = nullptr; IDirect3DPixelShader9* ps = nullptr;
+            dev->GetVertexShader(&vs); dev->GetPixelShader(&ps);
+            ds.shaders = (vs ? 1u : 0u) | (ps ? 2u : 0u);
+            if (vs) vs->Release();
+            if (ps) ps->Release();
+            ds.patchesBefore = ds.patches;
+        }
+        const DecalSetup setup = ReadDecalSetup(dev);
+        std::memcpy(g_decalStats.matrix, &setup.m0, sizeof(g_decalStats.matrix)); // what the replay uses (panel)
+        DrawDecal(dev, color ? SafeRead(color) : 0xFFFFFFFFu, setup);
+        g_decalStats.lastPatches = g_decalStats.patches - g_decalStats.patchesBefore;
     }
 
     void __cdecl hkTerrainStage()
@@ -576,11 +869,20 @@ namespace wxl_livingazeroth::cover::detail
     void InstallDraw(const WXL_Api* api)
     {
         api->Subscribe(static_cast<uint32_t>(ev::Event::OnWorldSceneEnd), &OnWorldSceneEnd, nullptr);
-    if (!api->HookAttach("LivingAzeroth.TerrainStage", kTerrainStage, reinterpret_cast<void*>(&hkTerrainStage),
-                         reinterpret_cast<void**>(&g_origTerrainStage), WXL_HOOK_DEFAULT_PRIORITY))
-    {
-        api->Log(WXL_LOG_WARN, kTag, "surface cover: terrain stage hook failed; drawing at the end of the scene instead.");
-        g_settings.drawPoint = 1;
-    }
+        if (!api->HookAttach("LivingAzeroth.TerrainStage", kTerrainStage, reinterpret_cast<void*>(&hkTerrainStage),
+                             reinterpret_cast<void**>(&g_origTerrainStage), WXL_HOOK_DEFAULT_PRIORITY))
+        {
+            api->Log(WXL_LOG_WARN, kTag, "surface cover: terrain stage hook failed; drawing at the end of the scene instead.");
+            g_settings.drawPoint = 1;
+        }
+        if (!api->HookAttach("LivingAzeroth.CoverDecals", kProjectedDraw, reinterpret_cast<void*>(&hkProjectedDraw),
+                             reinterpret_cast<void**>(&g_origProjectedDraw), WXL_HOOK_DEFAULT_PRIORITY))
+            api->Log(WXL_LOG_WARN, kTag, "surface cover: projected-texture hook failed; decals stay hidden under the cover.");
+        if (!api->HookAttach("LivingAzeroth.CoverDecalDraws", kGxDraw, reinterpret_cast<void*>(&hkGxDraw),
+                             reinterpret_cast<void**>(&g_origGxDraw), WXL_HOOK_DEFAULT_PRIORITY))
+            api->Log(WXL_LOG_WARN, kTag, "surface cover: GxDraw hook failed; decals can't be told apart and aren't put on the cover.");
+        if (!api->HookAttach("LivingAzeroth.CoverModelDecals", kModelProjectedDraw, reinterpret_cast<void*>(&hkModelProjectedDraw),
+                             reinterpret_cast<void**>(&g_origModelProjectedDraw), WXL_HOOK_DEFAULT_PRIORITY))
+            api->Log(WXL_LOG_WARN, kTag, "surface cover: model projected-texture hook failed; model ground projections stay hidden under the cover.");
     }
 }
