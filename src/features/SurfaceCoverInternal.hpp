@@ -6,6 +6,7 @@
 //   SurfaceCoverDraw.cpp      GPU objects, the draw and its hooks
 //   SurfaceCoverShaders.cpp   the cover's HLSL
 //   SurfaceCoverCamera.cpp    the 3rd-person camera kept above the cover
+//   SurfaceCoverLift.cpp      models at units' feet (Base attachment) lifted onto the cover
 //   SurfaceCoverPanel.cpp     the debug panel
 // Design and history: orchestration docs/r&d/immersion/deformable-surfaces.md.
 #pragma once
@@ -82,6 +83,7 @@ namespace wxl_livingazeroth::cover::detail
         int   decals = 1;               // the client's projected textures (selection circles, spell ground effects) on the cover too
         int   camera = 1;               // the 3rd-person camera can't sink into the cover
         float cameraClearance = 0.4f;   // yd the camera's boom keeps above the cover (its near plane)
+        int   liftBase = 1;             // models on units' Base attachment (auras at the feet) sit on the cover
     };
 
     struct Level
@@ -245,8 +247,8 @@ namespace wxl_livingazeroth::cover::detail
     // just filled a new place, whose cover would draw plain until then.
     void RecountCoverTextures();
     bool UploadLevel(Level& L, bool isLevel0);
-    // A slot's depth as the cover texture draws it (level 0 with its trenches), unsigned.
-    float DrawnDepth(const Level& L, bool isLevel0, int row, int col);
+    // A slot's depth as the cover texture draws it (level 0 with its trenches, or without), unsigned.
+    float DrawnDepth(const Level& L, bool isLevel0, int row, int col, bool trenches);
     // What the uploads did in the last drawn frame (all levels), for the panel.
     struct UploadStats
     {
@@ -296,11 +298,24 @@ namespace wxl_livingazeroth::cover::detail
     // Before IDirect3DDevice9::Reset: the draw's state block (a live one makes the Reset fail).
     void ReleaseDrawDeviceState();
 
+    // The cover's top and depth at a world position over the first `levels` levels (cover::TopAt).
+    // Level 0 alone only reads fixed-size arrays: safe from the scene's animate threads; the
+    // coarser levels' folds read snow and moisture state the main thread changes.
+    // trenches = false: level 0 as if nobody had walked there (the surface around a unit, not its footprint).
+    bool SampleTop(float x, float y, int levels, float& z, float& depth, bool trenches = true);
+
     // --- camera (SurfaceCoverCamera.cpp) -------------------------------------------------------
     // Keeps the 3rd-person camera above the cover like the client keeps it out of the terrain. From Install.
     void InstallCamera(const WXL_Api* api);
     struct CameraStats { unsigned calls = 0, pulled = 0; float lastPull = 0.0f; };
     extern CameraStats g_cameraStats;
+
+    // --- lift (SurfaceCoverLift.cpp) -------------------------------------------------------------
+    // Models on a unit's Base attachment (auras and other spell effects at the feet) lifted onto the
+    // cover. From Install.
+    void InstallLift(const WXL_Api* api);
+    unsigned LiftedCount(); // model builds lifted so far (panel; counted from the animate threads)
+    float    LastLift();    // yd, the last lift
 
     // --- panel (SurfaceCoverPanel.cpp) ----------------------------------------------------------
     void __cdecl Panel(void* user);

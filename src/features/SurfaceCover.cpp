@@ -69,6 +69,8 @@ namespace wxl_livingazeroth::cover
     bool Trenches() { return g_settings.stamp != 0; }
     float DepthMultiplier() { return g_settings.depthMul; }
     float FillBudgetMs() { return g_settings.fillBudgetMs; }
+    void SetLiftBaseEffects(bool on) { g_settings.liftBase = on ? 1 : 0; }
+    bool LiftBaseEffects() { return g_settings.liftBase != 0; }
 
     void LoadTable(const void* cdbcApi)
     {
@@ -82,15 +84,20 @@ namespace wxl_livingazeroth::cover
         for (int k = 0; k < kMaxLevels; ++k) g_levels[k].cell = kCell0 * static_cast<float>(1 << k);
         detail::InstallDraw(api);
         detail::InstallCamera(api);
+        detail::InstallLift(api);
         pages::AddPanel(kPanelTitle, &Panel);
     }
 
     void OnDeviceLost() { detail::ReleaseDrawDeviceState(); }
 
-    bool TopAt(float x, float y, float& z)
+    bool TopAt(float x, float y, float& z) { float depth; return detail::SampleTop(x, y, ActiveLevels(), z, depth); }
+}
+
+namespace wxl_livingazeroth::cover::detail
+{
+    bool SampleTop(float x, float y, int levels, float& z, float& depth, bool trenches)
     {
         if (!g_settings.enabled || g_inactive) return false;
-        const int levels = ActiveLevels();
         for (int k = 0; k < levels; ++k)
         {
             const Level& L = g_levels[k];
@@ -100,22 +107,27 @@ namespace wxl_livingazeroth::cover
             const int i0 = static_cast<int>(std::floor(fi)), j0 = static_cast<int>(std::floor(fj));
             if (i0 < L.gridI || j0 < L.gridJ || i0 + 1 > L.gridI + kGridCells || j0 + 1 > L.gridJ + kGridCells) continue;
             const float fx = fi - i0, fy = fj - j0;
-            float base[4], depth[4];
+            float base[4], dep[4];
             for (int c = 0; c < 4; ++c)
             {
                 const int row = Slot(j0 + (c >> 1)), col = Slot(i0 + (c & 1));
                 base[c] = L.base[row * kTex + col];
                 if (base[c] <= kHole) return false;
-                depth[c] = DrawnDepth(L, k == 0, row, col);
+                dep[c] = DrawnDepth(L, k == 0, row, col, trenches);
             }
             auto bilerp = [&](const float* v) { return (v[0] * (1 - fx) + v[1] * fx) * (1 - fy) + (v[2] * (1 - fx) + v[3] * fx) * fy; };
             // The outermost level's fade band (0.8..0.97 of its half) is left out: nothing asks that far out.
-            const float d = bilerp(depth);
-            z = bilerp(base) + d;
-            return d > 0.0f;
+            depth = bilerp(dep);
+            z = bilerp(base) + depth;
+            return depth > 0.0f;
         }
         return false;
     }
+}
+
+namespace wxl_livingazeroth::cover
+{
+    using namespace detail;
 
     void PatchLightStats(unsigned& most, unsigned& full) { most = g_patchLightsMost; full = g_patchLightsFull; }
 

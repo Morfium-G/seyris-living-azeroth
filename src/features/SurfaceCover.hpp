@@ -24,6 +24,9 @@ namespace wxl_livingazeroth::cover
     bool  Trenches();
     float DepthMultiplier();
     float FillBudgetMs();
+    /// Effects at units' feet (Base attachment: auras) lifted onto the cover.
+    void SetLiftBaseEffects(bool on);
+    bool LiftBaseEffects();
 
     /// Loads SurfaceCover.cdbc (which ground gets cover, how deep) through the cdbc reader.
     void LoadTable(const void* cdbcApi);
