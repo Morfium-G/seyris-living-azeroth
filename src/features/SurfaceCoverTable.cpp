@@ -36,26 +36,39 @@ namespace wxl_livingazeroth::covertable
             {"Flags",          17, WXL_CDBC_FIELD_VALUE},
             {"MeltKeptShare",       18, WXL_CDBC_FIELD_VALUE}, // appended: older files without them still load
             {"MeltGoneTemperature", 19, WXL_CDBC_FIELD_VALUE}, // appended; signed (-1000 inherits)
+            {"MoistureMin",         20, WXL_CDBC_FIELD_VALUE}, // appended
         };
-        constexpr WXL_SeyrisCdbcDefinition kDef = { "SurfaceCover", kFile, kFields, 20 };
+        constexpr WXL_SeyrisCdbcDefinition kDef = { "SurfaceCover", kFile, kFields, 21 };
 
         // The reader accepts files with more columns than a definition names, so an older 21-column
         // SurfaceCover.cdbc (place keys in the table itself) would load as garbage under this layout.
-        // A one-column definition at index 20 loads only from such a file: refuse it.
-        constexpr WXL_SeyrisCdbcField kOldLayoutProbe[] = { {"Probe", 20, WXL_CDBC_FIELD_VALUE} };
-        constexpr WXL_SeyrisCdbcDefinition kOldLayoutDef = { "SurfaceCover", kFile, kOldLayoutProbe, 1 };
+        // Since MoistureMin the current layout has 21 columns too, so the two are told apart by column
+        // 3: the old layout's Texture (a string offset, a small number), the current one's Depth (a
+        // float: -1 or a depth, a large number as raw bits). The probe loads from 21+ column files only.
+        constexpr WXL_SeyrisCdbcField kOldLayoutProbe[] = {
+            {"ID", 0, WXL_CDBC_FIELD_VALUE}, {"Column3", 3, WXL_CDBC_FIELD_VALUE}, {"Probe", 20, WXL_CDBC_FIELD_VALUE} };
+        constexpr WXL_SeyrisCdbcDefinition kOldLayoutDef = { "SurfaceCover", kFile, kOldLayoutProbe, 3 };
+
+        bool IsOldLayout(const WXL_SeyrisCdbcApi* cdbc, void* probe)
+        {
+            const uint32_t count = cdbc->RowCount(probe);
+            for (uint32_t i = 0; i < count; ++i)
+                if (const void* rec = cdbc->RowAt(probe, i))
+                    if (cdbc->Value(probe, rec, "Column3", 0) >= 0x01000000u) return false; // a float: the current layout
+            return count > 0;
+        }
 
         // The float fields that inherit with -1, in Values order. TintStrength carries TintColor
         // with it: the row that decides the strength also decides the colour. Depth carries Flags
         // the same way (0 is a valid Flags value, so it can't inherit on its own).
         enum Field { kDepth, kMaxSlope, kSlopeFade, kDrift, kBreakup, kRim, kRelax, kTint, kZOffset, kWetness,
-                     kMeltKept, kMeltGone, kFieldCount };
+                     kMeltKept, kMeltGone, kMoistureMin, kFieldCount };
         constexpr const char* kFloatColumns[kFieldCount] = {
             "Depth", "MaxSlope", "SlopeFade", "DriftNoise", "EdgeBreakup", "Rim", "RelaxSeconds", "TintStrength",
-            "ZOffset", "Wetness", "MeltKeptShare", "MeltGoneTemperature",
+            "ZOffset", "Wetness", "MeltKeptShare", "MeltGoneTemperature", "MoistureMin",
         };
         // What a column reads as when the file is too old to have it: "not set".
-        constexpr float kMissing[kFieldCount] = { -1, -1, -1, -1, -1, -1, -1, -1, -1000, -1, -1, -1000 };
+        constexpr float kMissing[kFieldCount] = { -1, -1, -1, -1, -1, -1, -1, -1, -1000, -1, -1, -1000, -1 };
 
         // Whether a row sets field f. ZOffset is signed: -1000 and below inherit (the rule for every
         // signed column), and so does exactly -1 (what older files and the v3 converter wrote).
@@ -138,6 +151,7 @@ namespace wxl_livingazeroth::covertable
             if (set[kWetness])   v.wetness = value[kWetness] > 1.0f ? 1.0f : value[kWetness];
             if (set[kMeltKept])  v.meltKeptShare = value[kMeltKept] > 1.0f ? 1.0f : value[kMeltKept];
             if (set[kMeltGone])  v.meltGoneTemperature = value[kMeltGone];
+            if (set[kMoistureMin]) v.moistureMin = value[kMoistureMin];
             if (cover > 0)       v.coverTexture = cover;
             // What lies on top is the cover's own material; without one it's the ground's. Its
             // stiffness decides how far feet press the cover down.
@@ -161,11 +175,15 @@ namespace wxl_livingazeroth::covertable
         if (!cdbc || !cdbc->HasFeature("cdbc-load")) { g_status = "wxl-seyris-tools (cdbc) not available: no cover rows"; return; }
 
         char err[256] = {};
-        if (void* old = cdbc->Load(&kOldLayoutDef, err, sizeof(err)))
+        if (void* probe = cdbc->Load(&kOldLayoutDef, err, sizeof(err)))
         {
-            cdbc->Release(old);
-            g_status = "an older layout (place keys in SurfaceCover itself): split it with tools/convert_surface_cover_v4.py";
-            return;
+            const bool old = IsOldLayout(cdbc, probe);
+            cdbc->Release(probe);
+            if (old)
+            {
+                g_status = "an older layout (place keys in SurfaceCover itself): split it with tools/convert_surface_cover_v4.py";
+                return;
+            }
         }
         err[0] = 0;
         void* table = cdbcload::LoadAppendOnly(cdbc, kDef, err, sizeof(err));

@@ -41,7 +41,13 @@ namespace wxl_livingazeroth::covertable
         // melts it down to, and the degC at which it's gone completely.
         float    meltKeptShare = 0.6f;
         float    meltGoneTemperature = 25.0f;
+        // The ground moisture (0..1) the cover needs to form (mud), reaching its full depth 0.1 above
+        // it. Above 1 = off: the cover doesn't depend on moisture (the default).
+        float    moistureMin = 2.0f;
     };
+
+    /// Whether a MoistureMin turns the moisture gate on.
+    inline bool MoistureGated(float moistureMin) { return moistureMin <= 1.0f; }
 
     /// Cover textures drawn at once: the slots go to the textures most present in view.
     constexpr int kMaxCoverTextures = 8;

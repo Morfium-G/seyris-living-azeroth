@@ -99,6 +99,14 @@ namespace wxl_livingazeroth::cover::detail
         // 1 = the cover's base sits below the terrain (ZOffset < 0, e.g. mud whose rims show through):
         // written as a negative depth, so the VS lowers it far away instead of lifting it.
         std::vector<uint8_t>  sink = std::vector<uint8_t>(kTex * kTex, 0);
+        // Moisture-gated covers (MoistureMin, e.g. mud): the share of the painted cover that needs
+        // moisture (0..255), the moisture it needs and the ground's rest moisture there (0..255 =
+        // 0..1; the rest stands in for the moisture beyond the near grid). Applied at fold, which
+        // re-runs every few seconds while the moisture data changes (wetCells: slots with a share).
+        std::vector<uint8_t>  wetGate = std::vector<uint8_t>(kTex * kTex, 0);
+        std::vector<uint8_t>  wetMin = std::vector<uint8_t>(kTex * kTex, 0);
+        std::vector<uint8_t>  wetRest = std::vector<uint8_t>(kTex * kTex, 0);
+        int                   wetCells = 0;
         // Fallen snow (regional-layer-and-snow.md): how much of the spot may hold it (0..255, the
         // share of bare and snow-covered layers, none on or beside other covers, none under
         // liquids), and the share of the painted depth that is snow (it melts by the near grid's

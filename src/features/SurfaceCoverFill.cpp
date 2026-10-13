@@ -1,6 +1,7 @@
 #include "SurfaceCoverInternal.hpp"
 
 #include "GrassPerf.hpp"
+#include "GroundMaterialTable.hpp"
 
 #include <array>
 #include <climits>
@@ -77,6 +78,8 @@ namespace wxl_livingazeroth::cover::detail
         float vertexColor[3] = { 0.5f, 0.5f, 0.5f }; // MCCV mixed in by the rows' "use MCCV" share; 0.5 = neutral
         int   texId[8] = {}; float texShare[8] = {}; int texCount = 0; // cover textures present, by ID
         float snowShare = 0.0f, paintedSnow = 0.0f;
+        // The painted share that needs ground moisture (MoistureMin), its threshold and the ground's rest moisture.
+        float wetGate = 0.0f, wetMin = 0.0f, wetRest = 0.0f;
         bool  hasLook = false; // some row (painted or fallen snow's look) set the properties above
     };
 
@@ -208,6 +211,7 @@ namespace wxl_livingazeroth::cover::detail
         g_blendTarget = &b;
         float sum[kSumCount] = {}, lookW = 0.0f, total = 0.0f, snowPainted = 0.0f, otherPainted = 0.0f;
         float paintedDepth = 0.0f, snowDepth = 0.0f;
+        float gatedW = 0.0f, gatedMin = 0.0f, gatedRest = 0.0f;
         float bare[4] = {};
         for (int k = 0; k < count; ++k)
         {
@@ -223,6 +227,12 @@ namespace wxl_livingazeroth::cover::detail
             AddLook(pv, pw, lookW, sum);
             paintedDepth += pw * pv.depth;
             if (parts[k].rows->paintedSnow) { snowPainted += pw; snowDepth += pw * pv.depth; }
+            if (covertable::MoistureGated(pv.moistureMin))
+            {
+                gatedW += pw;
+                gatedMin += pw * pv.moistureMin;
+                gatedRest += pw * materials::Get(pv.material).restMoisture;
+            }
             else otherPainted += pw;
         }
         if (total <= 0.0f) return b;
@@ -240,6 +250,12 @@ namespace wxl_livingazeroth::cover::detail
         const float dry = WaterFactor(covertable::kFlagPreventUnderwater);
         b.snowShare = (snowPainted + bareTotal) / total * (1.0f - (other > 1.0f ? 1.0f : other)) * dry;
         b.paintedSnow = paintedDepth > 0.0f ? snowDepth / paintedDepth : 0.0f;
+        if (gatedW > 0.0f)
+        {
+            b.wetGate = gatedW / b.covered;
+            b.wetMin = gatedMin / gatedW;
+            b.wetRest = gatedRest / gatedW;
+        }
         FinishBlend(b, lookW, sum);
         return b;
     }
@@ -345,6 +361,13 @@ namespace wxl_livingazeroth::cover::detail
         if (base != L.base[s]) { L.base[s] = base; changed |= kDirtyBase; }
         const uint8_t sink = b.hasLook && b.zOffset < 0.0f ? 1 : 0;
         if (sink != L.sink[s]) { L.sink[s] = sink; changed |= kDirtyCover; }
+        const uint8_t wetGate = ToByte(b.wetGate), wetMin = ToByte(b.wetMin), wetRest = ToByte(b.wetRest);
+        if (wetGate != L.wetGate[s] || wetMin != L.wetMin[s] || wetRest != L.wetRest[s])
+        {
+            L.wetCells += (wetGate ? 1 : 0) - (L.wetGate[s] ? 1 : 0);
+            L.wetGate[s] = wetGate; L.wetMin[s] = wetMin; L.wetRest[s] = wetRest;
+            changed |= kDirtyCover;
+        }
         const uint8_t material = ToByte(b.covered), driftAmp = ToByte(b.drift), breakup = ToByte(b.breakup), stiff = ToByte(b.stiffness);
         const uint8_t drift = static_cast<uint8_t>(Drift(x, y) * 255.0f + 0.5f);
         const uint8_t edge = static_cast<uint8_t>(EdgeNoise(x, y) * 255.0f + 0.5f);

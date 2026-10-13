@@ -154,6 +154,37 @@ namespace wxl_livingazeroth::cover::detail
     }
 
     // One slot's cover depth without trenches, from its parts, the multipliers and the snow.
+    // The world position of a slot's cell (the apron sits just before the grid's first cell).
+    void SlotWorld(const Level& L, const FoldInputs& in, int row, int col, float& wx, float& wy)
+    {
+        const int di = (col - in.slotI0 + kTex) % kTex, dj = (row - in.slotJ0 + kTex) % kTex;
+        wx = static_cast<float>(L.gridI + (di >= kTex - kApron ? di - kTex : di)) * L.cell;
+        wy = static_cast<float>(L.gridJ + (dj >= kTex - kApron ? dj - kTex : dj)) * L.cell;
+    }
+
+    // The ground's moisture (0..1) at a world position: the near grid's own value, else (beyond it,
+    // or not filled yet) the ground's rest moisture plus its zone's excess (per terrain chunk).
+    float MoistureAt(float x, float y, float rest)
+    {
+        static const int kMoisture = fields::Find("moisture");
+        const float pos[3] = { x, y, 0.0f };
+        float m;
+        if (kMoisture >= 0 && fields::Sample(kMoisture, pos, m)) return m;
+        const fields::WetGrid& g = fields::Wet();
+        float excess = g.farExcess;
+        if (g.farValues && g.farSize > 0 && g.farCellSize > 0.0f)
+        {
+            const int i = static_cast<int>(std::floor(x / g.farCellSize)), j = static_cast<int>(std::floor(y / g.farCellSize));
+            if (i >= g.farFirstI && i < g.farFirstI + g.farSize && j >= g.farFirstJ && j < g.farFirstJ + g.farSize)
+            {
+                const int mi = ((i % g.farSize) + g.farSize) % g.farSize, mj = ((j % g.farSize) + g.farSize) % g.farSize;
+                excess = g.farValues[mj * g.farSize + mi];
+            }
+        }
+        m = rest + excess;
+        return m < 0.0f ? 0.0f : (m > 1.0f ? 1.0f : m);
+    }
+
     float FoldSlot(const Level& L, const FoldInputs& in, int row, int col)
     {
         const int s = row * kTex + col;
@@ -163,15 +194,21 @@ namespace wxl_livingazeroth::cover::detail
         driftF = driftF < 0.0f ? 0.0f : driftF;
         const float slope = L.slope[s] / 255.0f;
         float cover = L.depth[s] > 0.0f ? in.depthMul * L.depth[s] * Shape(L.material[s], b, L.edgeNoise[s]) * slope * driftF : 0.0f;
+        // Moisture-gated (mud): only where the ground is wet enough, full 0.1 above the threshold.
+        if (L.wetGate[s] && cover > 0.0f)
+        {
+            float wx, wy;
+            SlotWorld(L, in, row, col, wx, wy);
+            float t = (MoistureAt(wx, wy, L.wetRest[s] / 255.0f) - L.wetMin[s] / 255.0f) * 10.0f;
+            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+            cover *= 1.0f - L.wetGate[s] / 255.0f * (1.0f - t);
+        }
         // Snow: painted snow thinned by its kept share (patchy: where the drift and edge noise are
         // low it opens first), fallen snow on top.
         if (in.snowOn && (L.snowShare[s] || L.paintedSnow[s]))
         {
-            // The world cell this slot holds (the apron sits just before the grid's first cell).
-            const int di = (col - in.slotI0 + kTex) % kTex, dj = (row - in.slotJ0 + kTex) % kTex;
-            const float wx = static_cast<float>(L.gridI + (di >= kTex - kApron ? di - kTex : di)) * L.cell;
-            const float wy = static_cast<float>(L.gridJ + (dj >= kTex - kApron ? dj - kTex : dj)) * L.cell;
-            float fallen, keep;
+            float wx, wy, fallen, keep;
+            SlotWorld(L, in, row, col, wx, wy);
             fields::SnowAt(wx, wy, fallen, keep);
             if (L.paintedSnow[s] && keep < 1.0f && cover > 0.0f)
             {
@@ -268,10 +305,9 @@ namespace wxl_livingazeroth::cover::detail
     {
         const int s = row * kTex + col;
         if (!in.snowOn || !L.snowShare[s]) return false;
-        const int di = (col - in.slotI0 + kTex) % kTex, dj = (row - in.slotJ0 + kTex) % kTex;
-        float fallen, keep;
-        fields::SnowAt(static_cast<float>(L.gridI + (di >= kTex - kApron ? di - kTex : di)) * L.cell,
-                       static_cast<float>(L.gridJ + (dj >= kTex - kApron ? dj - kTex : dj)) * L.cell, fallen, keep);
+        float wx, wy, fallen, keep;
+        SlotWorld(L, in, row, col, wx, wy);
+        fields::SnowAt(wx, wy, fallen, keep);
         return fallen > 0.0f;
     }
 

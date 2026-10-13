@@ -43,6 +43,11 @@ namespace wxl_livingazeroth::cover::detail
     double g_simMs = 0;
     bool g_resting = false;
     bool g_lookSnowActive = false; // the snow state the looks were built for
+    // Moisture-gated covers (mud): refolded at most every kWetSeconds while the moisture data changes.
+    constexpr float kWetSeconds = 3.0f;
+    float    g_wetTimer = 0.0f;
+    uint32_t g_wetVersion = 0;
+    unsigned g_wetPending = 0; // levels still to refold (bit per level)
 }
 
 namespace wxl_livingazeroth::cover
@@ -217,6 +222,23 @@ namespace wxl_livingazeroth::cover
                 g_snowCursor = k + 1;
                 break;
             }
+        }
+
+        // Moisture-gated covers: every few seconds, if the ground's moisture changed, the levels with
+        // such cells refold, one per frame. (So mud stays a moment after the ground dried.)
+        g_wetTimer += dt;
+        if (g_wetTimer >= kWetSeconds)
+        {
+            g_wetTimer = 0.0f;
+            const uint32_t version = fields::Wet().version;
+            if (version != g_wetVersion) { g_wetVersion = version; g_wetPending = (1u << levels) - 1u; }
+        }
+        for (int k = 0; k < levels && g_wetPending; ++k)
+        {
+            if (!(g_wetPending & (1u << k))) continue;
+            g_wetPending &= ~(1u << k);
+            Level& L = g_levels[k];
+            if (L.haveGrid && L.wetCells > 0) { L.coverDirty = true; break; }
         }
 
         // The table's values where the player is, for the panel's "here" lines.

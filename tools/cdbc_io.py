@@ -63,9 +63,10 @@ GROUND_MATERIAL = ["u", "s", "u", "f", "f", "u", "f", "f"]
 #                  ID  Name Parent RestMoisture Stiffness Flags Absorbency Temperature
 GROUND_MATERIAL_SELECTOR = ["u", "u", "u", "s", "u", "i", "u", "u", "u"]
 #                  ID  ScopeType ScopeID TexturePath GroundEffectID TerrainType LiquidType MaterialID Flags
-SURFACE_COVER = ["u", "u", "u", "f", "f", "f", "f", "f", "f", "f", "u", "f", "s", "f", "f", "f", "f", "u", "f", "f"]
+SURFACE_COVER = ["u", "u", "u", "f", "f", "f", "f", "f", "f", "f", "u", "f", "s", "f", "f", "f", "f", "u", "f", "f", "f"]
 #  ID MaterialID CoverMaterial Depth MaxSlope SlopeFade DriftNoise EdgeBreakup Rim RelaxSeconds
 #  TintColor TintStrength CoverTexture Opacity Flatten ZOffset Wetness Flags MeltKeptShare MeltGoneTemperature
+#  MoistureMin (appended 2026-10-13)
 AREA_CLIMATE = ["u", "u", "u", "f", "f", "f", "f", "f", "u", "f", "s"]
 #  ID ScopeType ScopeID DayTemp NightTemp SeasonAmplitude SeasonOffset Humidity Flags Fogginess Comment
 FOG_SETTINGS = ["u", "u", "u", "u", "f", "f", "f", "f", "f", "f", "f", "f", "f", "i", "f", "f", "f", "f", "f", "u", "s"]
@@ -85,7 +86,7 @@ DOODAD_LIGHT_ASSIGNMENT = ["u", "s", "u", "i", "s", "f", "f", "f", "f", "f", "f"
 TABLES = {
     "GroundMaterial": (GROUND_MATERIAL, [0, "", 0, -1.0, -1.0, 0, -1.0, -1000.0]),
     "GroundMaterialSelector": (GROUND_MATERIAL_SELECTOR, [0, 0, 0, "", 0, -1, 0, 0, 0]),
-    "SurfaceCover": (SURFACE_COVER, [0, 0, 0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 0, -1.0, "", -1.0, -1.0, -1000.0, -1.0, 0, -1.0, -1000.0]),
+    "SurfaceCover": (SURFACE_COVER, [0, 0, 0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 0, -1.0, "", -1.0, -1.0, -1000.0, -1.0, 0, -1.0, -1000.0, -1.0]),
     "AreaClimate": (AREA_CLIMATE, [0, 0, 0, -1000.0, -1000.0, -1.0, -1.0, -1.0, 0, -1.0, ""]),
     "FogSettings": (FOG_SETTINGS, [0, 0, 0, 0] + [-1.0] * 9 + [-1] + [-1.0] * 5 + [0, ""]),
     "WindProfile": (WIND_PROFILE, [0, 0, 0] + [-1.0] * 11 + [0, ""]),

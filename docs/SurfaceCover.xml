@@ -19,4 +19,5 @@
     <Field Name="Flags" Type="int" />
     <Field Name="MeltKeptShare" Type="float" />
     <Field Name="MeltGoneTemperature" Type="float" />
+    <Field Name="MoistureMin" Type="float" />
   </Table>

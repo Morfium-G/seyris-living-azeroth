@@ -131,6 +131,17 @@ namespace wxl_livingazeroth::cover::detail
             std::snprintf(line, sizeof(line), "here (table): depth %.2f, max slope %.0f, fade %.0f, drift %.2f, breakup %.2f, rim %.2f, relax %.0f s, tint %08X x %.2f, cover texture %d, z offset %.3f, wetness %.2f, flags 0x%X",
                           v.depth, v.maxSlope, v.slopeFade, v.driftNoise, v.edgeBreakup, v.rim, v.relaxSeconds, v.tintColor, v.tintStrength, v.coverTexture,
                           v.zOffset, v.wetness, v.flags); add();
+            if (covertable::MoistureGated(v.moistureMin))
+            {
+                const world::Snapshot& snap = world::Current();
+                const fields::MoistureDetail md = snap.inWorld ? fields::Moisture(snap.playerPos) : fields::MoistureDetail{};
+                if (md.known)
+                    std::snprintf(line, sizeof(line), "here (moisture): needs %.2f, ground %.2f -> %s", v.moistureMin, md.value,
+                                  md.value >= v.moistureMin + 0.1f ? "full cover" : (md.value > v.moistureMin ? "forming" : "none"));
+                else
+                    std::snprintf(line, sizeof(line), "here (moisture): needs %.2f, ground moisture not known here yet", v.moistureMin);
+                add();
+            }
             if (g_hereMccvValid)
                 std::snprintf(line, sizeof(line), "here: vertex colour (MCCV) r %.2f g %.2f b %.2f (0.50 = neutral)", g_hereMccv[0], g_hereMccv[1], g_hereMccv[2]);
             else

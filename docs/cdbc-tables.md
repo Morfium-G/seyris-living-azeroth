@@ -180,6 +180,7 @@ in over time. Grass and small doodads are buried under it.
 | Flags | 0x1 **prevent underwater**: the cover thins out over 0.3 yd below a terrain liquid's surface (rivers, lakes, sea; not WMO water). 0x2 **prevent on land**: cover only there (river and sea floors). 0x4 **use MCCV**: tinted by the terrain's vertex colours, like the terrain. 0x8 **ignore specular map**: no shine from the CoverTexture. Flags come from the row that decides Depth, except 0x8, which belongs to the CoverTexture named in the same row |
 | MeltKeptShare | **snow covers only**: the share of the painted depth mild weather melts it down to (at 15 °C; less above 0 °C, nothing at or below). 0.6 if no row sets it. Appended |
 | MeltGoneTemperature | **snow covers only**: °C at which painted snow melts away completely (from MeltKeptShare at 15 °C down to nothing here). 25 if no row sets it; set it low (e.g. 16) for "no snow in summer" in a zone or on a texture. Signed: **−1000 inherits**. Appended |
+| MoistureMin | the cover only forms where the ground's **moisture** (0 bone dry .. 1 soaked; the climate panel shows it) is at least this, growing to its full Depth over the next 0.1: mud on riverbanks and in swamps, more of it after rain, drying away again. Checked every few seconds, so it lingers briefly after the ground dried. **2 (no row sets it) = off**: the cover doesn't depend on moisture. Off by default on purpose: nothing becomes mud unless a row asks for it. Appended |
 
 **Specular:** a CoverTexture's alpha is its specular mask, as on the terrain's layers. If a `_s.blp`
 next to it exists (later expansions keep the mask there), that one is used instead. The shine uses the
@@ -189,7 +190,7 @@ A float of **−1 takes that field from the parent material's row** (ZOffset: ex
 up the chain; a material without a row takes everything from its parents'. TintColor comes with
 TintStrength's row, Flags with Depth's row. Fields no row sets use the defaults: MaxSlope 45,
 SlopeFade 15, DriftNoise 0.35, EdgeBreakup 0.5, Rim 0.3, RelaxSeconds 30, no tint, no cover texture,
-ZOffset 0, Wetness 0, no flags. No material, no row along its chain, or Depth 0 = no cover.
+ZOffset 0, Wetness 0, no flags, MoistureMin off. No material, no row along its chain, or Depth 0 = no cover.
 
 **Trench size:** like the client's own footprints. CreatureModelData's FootprintTextureLength/Width
 (in inches) × the unit's scale, the mount's while mounted; the trench radius is 1.2 × the print's
