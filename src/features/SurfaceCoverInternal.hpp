@@ -111,7 +111,6 @@ namespace wxl_livingazeroth::cover::detail
         // byte). Turned into per-slot weights at upload, with whatever IDs hold the slots then.
         std::vector<uint32_t> texIds = std::vector<uint32_t>(kTex * kTex, 0);
         std::vector<uint16_t> texShares = std::vector<uint16_t>(kTex * kTex, 0);
-        std::vector<uint32_t> texWeights[2] = { std::vector<uint32_t>(kTex * kTex, 0), std::vector<uint32_t>(kTex * kTex, 0) };
         // A = wetness, RGB = the terrain's vertex colour where rows use it (0x80 = neutral).
         std::vector<uint32_t> props = std::vector<uint32_t>(kTex * kTex, 0x00808080u);
         uint32_t slotsUploaded = 0;     // the slot generation the weight textures were built with
@@ -225,6 +224,9 @@ namespace wxl_livingazeroth::cover::detail
     extern std::unordered_map<int, std::string> g_textureStatus;
     constexpr float kCoverTextureTile = 33.3333333f / 8.0f; // one repeat per terrain cell, like the terrain's layers
     void EnsureCoverTextures(IDirect3DDevice9* dev);
+    // Recount which cover textures are around at the next draw (instead of within a second): a level
+    // just filled a new place, whose cover would draw plain until then.
+    void RecountCoverTextures();
     bool UploadLevel(Level& L, bool isLevel0);
     // What the uploads did in the last drawn frame (all levels), for the panel.
     struct UploadStats

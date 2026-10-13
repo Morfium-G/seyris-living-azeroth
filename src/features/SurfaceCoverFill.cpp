@@ -226,12 +226,14 @@ namespace wxl_livingazeroth::cover::detail
             else otherPainted += pw;
         }
         if (total <= 0.0f) return b;
-        // Fallen snow's look on the bare parts, fully only where nothing is painted.
+        // Fallen snow's look on the bare parts, only where nothing is painted. (It used to fade in below
+        // a quarter painted, which is exactly a painted cover's thin edge: its untextured white diluted
+        // the cover's texture and tint there, a pale rim around sand and mud, wide on the coarse
+        // levels.) Fallen snow lying right at a painted edge takes the painted look instead.
         float bareTotal = 0.0f;
         for (int k = 0; k < count; ++k) bareTotal += bare[k];
-        const float lookShare = 1.0f - (b.covered * 4.0f > 1.0f ? 1.0f : b.covered * 4.0f);
-        if (lookShare > 0.0f)
-            for (int k = 0; k < count; ++k) AddLook(parts[k].rows->look, bare[k] * lookShare, lookW, sum);
+        if (b.covered <= 0.0f)
+            for (int k = 0; k < count; ++k) AddLook(parts[k].rows->look, bare[k], lookW, sum);
         // Where fallen snow may lie: bare ground and snow covers, not on or beside other covers,
         // not under a liquid's surface.
         const float other = otherPainted * 4.0f / total;
@@ -383,7 +385,8 @@ namespace wxl_livingazeroth::cover::detail
     }
 
     // Marks what changed for the uploads: a segment across the whole filled width as its row, a
-    // shorter one (a recentre's strip along y) by its columns.
+    // shorter one (a recentre's strip along y) by its columns. A changed look also marks the
+    // neighbouring rows/columns: bare ground next to cover shows its neighbour's look (LookRect).
     void SampleRect(Level& L, bool isLevel0, int i0, int i1, int j0, int j1, bool fresh) // inclusive
     {
         const bool wholeRows = i1 - i0 + 1 >= kFilled;
@@ -394,9 +397,15 @@ namespace wxl_livingazeroth::cover::detail
             {
                 const uint8_t changed = Sample(L, isLevel0, i, j, fresh);
                 if (wholeRows) row |= changed;
-                else if (changed) L.dirtyCol[Slot(i)] |= changed;
+                else if (changed)
+                {
+                    L.dirtyCol[Slot(i)] |= changed;
+                    if (changed & kDirtyLook) { L.dirtyCol[Slot(i - 1)] |= kDirtyLook; L.dirtyCol[Slot(i + 1)] |= kDirtyLook; }
+                }
             }
-            if (row) L.dirtyRow[Slot(j)] |= row;
+            if (!row) continue;
+            L.dirtyRow[Slot(j)] |= row;
+            if (row & kDirtyLook) { L.dirtyRow[Slot(j - 1)] |= kDirtyLook; L.dirtyRow[Slot(j + 1)] |= kDirtyLook; }
         }
     }
 
@@ -467,6 +476,7 @@ namespace wxl_livingazeroth::cover::detail
         if (L.jobFull)
         {
             L.coverDirty = L.baseDirty = L.lookDirty = true;
+            RecountCoverTextures();
             L.firstFillMs = L.jobMs;
             L.boostRows = kFilled; // chunks still streaming in get picked up quickly
         }

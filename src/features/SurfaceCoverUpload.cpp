@@ -25,6 +25,8 @@ namespace wxl_livingazeroth::cover::detail
     std::unordered_map<int, std::string>       g_textureStatus;
     uint32_t           g_coverTexturesGeneration = 0;
 
+    void RecountCoverTextures() { g_slotFrame = 0; }
+
     void ReleaseCoverTextures()
     {
         for (auto& e : g_textureCache) if (e.second) e.second->Release();
@@ -249,27 +251,63 @@ namespace wxl_livingazeroth::cover::detail
         return true;
     }
 
-    // The cells' cover texture IDs -> weights of whichever slots hold those IDs now, then the look
-    // textures (tint, weights, props) for the rectangle.
+    // Whose look a slot shows. The look textures are filtered between slots, so at a cover's edge
+    // the bare ground next to it pulled the colour toward "no look": the plain cover colour, no
+    // tint, no wetness -- a pure white rim, as wide as a cell (only visible on the coarser levels).
+    // Bare ground (no cover, no fallen snow, no look of its own) next to a slot with a look shows
+    // that neighbour's look instead; its depth still tapers the cover out.
+    bool HasLook(const Level& L, int s) { return L.texShares[s] != 0 || (L.tint[s] >> 24) != 0; }
+
+    int LookSource(const Level& L, int row, int col)
+    {
+        const int s = row * kTex + col;
+        if (L.depth[s] > 0.0f || L.paintedSnow[s] || L.snowShare[s] || HasLook(L, s)) return s;
+        static const int kAround[8][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 }, { 1, 1 }, { -1, 1 }, { 1, -1 }, { -1, -1 } };
+        for (const auto& d : kAround)
+        {
+            const int n = Slot(row + d[1]) * kTex + Slot(col + d[0]);
+            if (HasLook(L, n)) return n;
+        }
+        return s;
+    }
+
+    // The look textures for the rectangle: tint (VS), the cover texture weights (each cell's two
+    // IDs -> whichever slots hold those IDs now) and props (PS).
     bool LookRect(Level& L, const Rect& r)
     {
-        for (int row = r.r0; row < r.r1; ++row)
-            for (int col = r.c0; col < r.c1; ++col)
+        IDirect3DTexture9* const textures[4] = { L.lookTex, L.texWTex[0], L.texWTex[1], L.propsTex };
+        D3DLOCKED_RECT lr[4] = {};
+        const RECT rect{ r.c0, r.r0, r.c1, r.r1 };
+        int locked = 0;
+        for (; locked < 4; ++locked)
+            if (textures[locked] && FAILED(textures[locked]->LockRect(0, &lr[locked], &rect, 0))) break;
+        const bool ok = locked == 4;
+        if (ok)
+            for (int row = r.r0; row < r.r1; ++row)
             {
-                const int sl = row * kTex + col;
-                uint8_t w[8] = {};
-                for (int k = 0; k < 2; ++k)
+                uint32_t* out[4];
+                for (int t = 0; t < 4; ++t)
+                    out[t] = textures[t] ? reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(lr[t].pBits) + (row - r.r0) * lr[t].Pitch) : nullptr;
+                for (int col = r.c0; col < r.c1; ++col)
                 {
-                    const int id = static_cast<int>((L.texIds[sl] >> (16 * k)) & 0xFFFF);
-                    const int slot = id > 0 && id < static_cast<int>(g_slotOfId.size()) ? g_slotOfId[id] : -1;
-                    if (slot >= 0) w[slot] = static_cast<uint8_t>((L.texShares[sl] >> (8 * k)) & 0xFF);
+                    const int src = LookSource(L, row, col);
+                    uint8_t w[8] = {};
+                    for (int k = 0; k < 2; ++k)
+                    {
+                        const int id = static_cast<int>((L.texIds[src] >> (16 * k)) & 0xFFFF);
+                        const int slot = id > 0 && id < static_cast<int>(g_slotOfId.size()) ? g_slotOfId[id] : -1;
+                        if (slot >= 0) w[slot] = static_cast<uint8_t>((L.texShares[src] >> (8 * k)) & 0xFF);
+                    }
+                    const int c = col - r.c0;
+                    if (out[0]) out[0][c] = L.tint[src];
+                    for (int q = 0; q < 2; ++q)
+                        out[1 + q][c] = (static_cast<uint32_t>(w[q * 4 + 3]) << 24) | (static_cast<uint32_t>(w[q * 4]) << 16) |
+                                        (static_cast<uint32_t>(w[q * 4 + 1]) << 8) | w[q * 4 + 2];
+                    out[3][c] = L.props[src];
                 }
-                for (int q = 0; q < 2; ++q)
-                    L.texWeights[q][sl] = (static_cast<uint32_t>(w[q * 4 + 3]) << 24) | (static_cast<uint32_t>(w[q * 4]) << 16) |
-                                          (static_cast<uint32_t>(w[q * 4 + 1]) << 8) | w[q * 4 + 2];
             }
-        return CopyRect(L.lookTex, L.tint, r) && CopyRect(L.texWTex[0], L.texWeights[0], r) &&
-               CopyRect(L.texWTex[1], L.texWeights[1], r) && CopyRect(L.propsTex, L.props, r);
+        for (int t = 0; t < locked; ++t) if (textures[t]) textures[t]->UnlockRect(0);
+        return ok;
     }
 
     // One changed region: whatever its kDirty* bits say.
