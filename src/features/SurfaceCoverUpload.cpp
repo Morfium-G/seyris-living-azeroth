@@ -245,6 +245,11 @@ namespace wxl_livingazeroth::cover::detail
         return cover + (deformed - cover) * DeformK(L, s);
     }
 
+    float DrawnDepth(const Level& L, bool isLevel0, int row, int col)
+    {
+        return isLevel0 ? Trenched(L, row * kTex + col) : FoldSlot(L, Inputs(L), row, col);
+    }
+
     // The depth as the cover texture holds it: negative where the cover sits below the terrain.
     float Stored(const Level& L, int s, float depth) { return L.sink[s] ? -depth : depth; }
 

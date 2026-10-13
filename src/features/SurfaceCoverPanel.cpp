@@ -54,6 +54,14 @@ namespace wxl_livingazeroth::cover::detail
         g_api->UiSliderFloat("Far lift (yd, 80 -> 400 yd away)", &g_settings.farLift, 0.0f, 3.0f);
         g_api->UiCheckbox("Light and fog like the terrain", &g_settings.sceneLight);
         g_api->UiCheckbox("Dynamic shadows like the terrain", &g_settings.shadows);
+        g_api->UiCheckbox("Camera stays above the cover", &g_settings.camera);
+        g_api->UiSliderFloat("Camera clearance (yd)", &g_settings.cameraClearance, 0.0f, 1.5f);
+        {
+            char cam[128];
+            std::snprintf(cam, sizeof(cam), "  camera tests %u, pulled in %u (last by %.2f yd)",
+                          g_cameraStats.calls, g_cameraStats.pulled, g_cameraStats.lastPull);
+            g_api->UiTextWrapped(cam);
+        }
         g_api->UiCheckbox("Selection circles and spell ground effects on the cover", &g_settings.decals);
         {
             const DecalStats& ds = g_decalStats;

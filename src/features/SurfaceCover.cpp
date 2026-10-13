@@ -5,6 +5,7 @@
 #include "../env/Fields.hpp"
 #include "GrassPerf.hpp"
 
+#include <cmath>
 #include <cstring>
 
 namespace wxl_livingazeroth::cover::detail
@@ -80,10 +81,41 @@ namespace wxl_livingazeroth::cover
         g_api = api;
         for (int k = 0; k < kMaxLevels; ++k) g_levels[k].cell = kCell0 * static_cast<float>(1 << k);
         detail::InstallDraw(api);
+        detail::InstallCamera(api);
         pages::AddPanel(kPanelTitle, &Panel);
     }
 
     void OnDeviceLost() { detail::ReleaseDrawDeviceState(); }
+
+    bool TopAt(float x, float y, float& z)
+    {
+        if (!g_settings.enabled || g_inactive) return false;
+        const int levels = ActiveLevels();
+        for (int k = 0; k < levels; ++k)
+        {
+            const Level& L = g_levels[k];
+            if (!L.haveGrid || !L.anyCover) continue;
+            // The mesh's vertex (i, j) sits at (i, j) x cell; the grid spans kGridCells cells from gridI/gridJ.
+            const float fi = x / L.cell, fj = y / L.cell;
+            const int i0 = static_cast<int>(std::floor(fi)), j0 = static_cast<int>(std::floor(fj));
+            if (i0 < L.gridI || j0 < L.gridJ || i0 + 1 > L.gridI + kGridCells || j0 + 1 > L.gridJ + kGridCells) continue;
+            const float fx = fi - i0, fy = fj - j0;
+            float base[4], depth[4];
+            for (int c = 0; c < 4; ++c)
+            {
+                const int row = Slot(j0 + (c >> 1)), col = Slot(i0 + (c & 1));
+                base[c] = L.base[row * kTex + col];
+                if (base[c] <= kHole) return false;
+                depth[c] = DrawnDepth(L, k == 0, row, col);
+            }
+            auto bilerp = [&](const float* v) { return (v[0] * (1 - fx) + v[1] * fx) * (1 - fy) + (v[2] * (1 - fx) + v[3] * fx) * fy; };
+            // The outermost level's fade band (0.8..0.97 of its half) is left out: nothing asks that far out.
+            const float d = bilerp(depth);
+            z = bilerp(base) + d;
+            return d > 0.0f;
+        }
+        return false;
+    }
 
     void PatchLightStats(unsigned& most, unsigned& full) { most = g_patchLightsMost; full = g_patchLightsFull; }
 

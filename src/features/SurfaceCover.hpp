@@ -31,6 +31,11 @@ namespace wxl_livingazeroth::cover
     /// Once per frame on the main thread, after the world snapshot and the actors are refreshed.
     void Update(float dt, const world::Snapshot& snap);
 
+    /// The top of the cover as drawn at a world position (base + depth, level 0 with its trenches,
+    /// bilinear over the finest drawn level holding it). False where no cover is drawn: off, outside
+    /// the grid, a hole, or no depth there (z is then the terrain the cover sits on, if known).
+    bool TopAt(float x, float y, float& z);
+
     /// Before IDirect3DDevice9::Reset: releases what has to go first (its textures are managed).
     void OnDeviceLost();
 

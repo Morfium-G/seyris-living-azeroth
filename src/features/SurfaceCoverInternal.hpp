@@ -5,6 +5,7 @@
 //   SurfaceCoverUpload.cpp    cover texture slots, folding and texture uploads
 //   SurfaceCoverDraw.cpp      GPU objects, the draw and its hooks
 //   SurfaceCoverShaders.cpp   the cover's HLSL
+//   SurfaceCoverCamera.cpp    the 3rd-person camera kept above the cover
 //   SurfaceCoverPanel.cpp     the debug panel
 // Design and history: orchestration docs/r&d/immersion/deformable-surfaces.md.
 #pragma once
@@ -79,6 +80,8 @@ namespace wxl_livingazeroth::cover::detail
         int   drawPoint = 0;            // 0 right after the terrain (inside the world pass), 1 end of the scene
         int   debugView = 0;            // 0 off, 1 cover texture share, 2 specular only, 3 lighting only
         int   decals = 1;               // the client's projected textures (selection circles, spell ground effects) on the cover too
+        int   camera = 1;               // the 3rd-person camera can't sink into the cover
+        float cameraClearance = 0.4f;   // yd the camera's boom keeps above the cover (its near plane)
     };
 
     struct Level
@@ -242,6 +245,8 @@ namespace wxl_livingazeroth::cover::detail
     // just filled a new place, whose cover would draw plain until then.
     void RecountCoverTextures();
     bool UploadLevel(Level& L, bool isLevel0);
+    // A slot's depth as the cover texture draws it (level 0 with its trenches), unsigned.
+    float DrawnDepth(const Level& L, bool isLevel0, int row, int col);
     // What the uploads did in the last drawn frame (all levels), for the panel.
     struct UploadStats
     {
@@ -290,6 +295,12 @@ namespace wxl_livingazeroth::cover::detail
     void InstallDraw(const WXL_Api* api);
     // Before IDirect3DDevice9::Reset: the draw's state block (a live one makes the Reset fail).
     void ReleaseDrawDeviceState();
+
+    // --- camera (SurfaceCoverCamera.cpp) -------------------------------------------------------
+    // Keeps the 3rd-person camera above the cover like the client keeps it out of the terrain. From Install.
+    void InstallCamera(const WXL_Api* api);
+    struct CameraStats { unsigned calls = 0, pulled = 0; float lastPull = 0.0f; };
+    extern CameraStats g_cameraStats;
 
     // --- panel (SurfaceCoverPanel.cpp) ----------------------------------------------------------
     void __cdecl Panel(void* user);
