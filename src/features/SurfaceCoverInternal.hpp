@@ -77,6 +77,7 @@ namespace wxl_livingazeroth::cover::detail
         int   alphaSwap = 0;            // debug: read the alpha maps with rows and columns swapped
         int   wireframe = 0;
         int   drawPoint = 0;            // 0 right after the terrain (inside the world pass), 1 end of the scene
+        int   debugView = 0;            // 0 off, 1 cover texture share, 2 specular only, 3 lighting only
     };
 
     struct Level
@@ -95,6 +96,9 @@ namespace wxl_livingazeroth::cover::detail
         std::vector<uint8_t>  driftAmp = std::vector<uint8_t>(kTex * kTex, 0);
         std::vector<uint8_t>  breakup = std::vector<uint8_t>(kTex * kTex, 0);
         std::vector<uint8_t>  stiff = std::vector<uint8_t>(kTex * kTex, 0); // cover material's stiffness (level 0's trenches)
+        // 1 = the cover's base sits below the terrain (ZOffset < 0, e.g. mud whose rims show through):
+        // written as a negative depth, so the VS lowers it far away instead of lifting it.
+        std::vector<uint8_t>  sink = std::vector<uint8_t>(kTex * kTex, 0);
         // Fallen snow (regional-layer-and-snow.md): how much of the spot may hold it (0..255, the
         // share of bare and snow-covered layers, none on or beside other covers, none under
         // liquids), and the share of the painted depth that is snow (it melts by the near grid's

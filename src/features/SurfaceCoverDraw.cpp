@@ -421,6 +421,8 @@ namespace wxl_livingazeroth::cover::detail
         {
             const float c13[4] = { g_shadowUsed ? 1.0f : 0.0f, moisturetex::FarExcess(), 1.0f / moisturetex::kEdgeFadeYards, terrainwet::Strength() };
             dev->SetPixelShaderConstantF(13, c13, 1);
+            const float c14[4] = { static_cast<float>(g_settings.debugView), 0.0f, 0.0f, 0.0f };
+            dev->SetPixelShaderConstantF(14, c14, 1);
             if (g_shadowUsed)
             {
                 dev->SetPixelShaderConstantF(20, pcfOffsets, 8);

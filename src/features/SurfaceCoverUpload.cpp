@@ -208,6 +208,9 @@ namespace wxl_livingazeroth::cover::detail
         return cover + (deformed - cover) * DeformK(L, s);
     }
 
+    // The depth as the cover texture holds it: negative where the cover sits below the terrain.
+    float Stored(const Level& L, int s, float depth) { return L.sink[s] ? -depth : depth; }
+
     // A rectangle of slots, [c0, c1) x [r0, r1).
     struct Rect { int c0, r0, c1, r1; int Slots() const { return (c1 - c0) * (r1 - r0); } };
     constexpr Rect kWhole = { 0, 0, kTex, kTex };
@@ -241,39 +244,53 @@ namespace wxl_livingazeroth::cover::detail
             {
                 const float cover = FoldSlot(L, in, row, col);
                 any = any || cover > 0.0f;
-                if (!isLevel0) { out[col - r.c0] = cover; continue; }
                 const int s = row * kTex + col;
+                if (!isLevel0) { out[col - r.c0] = Stored(L, s, cover); continue; }
                 g_static0[s] = cover;
-                out[col - r.c0] = Trenched(L, s);
+                out[col - r.c0] = Stored(L, s, Trenched(L, s));
             }
         }
         L.coverTex->UnlockRect(0);
         return true;
     }
 
-    // Whose look a slot shows. The look textures are filtered between slots, so at a cover's edge
-    // the bare ground next to it pulled the colour toward "no look": the plain cover colour, no
-    // tint, no wetness -- a pure white rim, as wide as a cell (only visible on the coarser levels).
-    // Bare ground (no cover, no fallen snow, no look of its own) next to a slot with a look shows
-    // that neighbour's look instead; its depth still tapers the cover out.
-    bool HasLook(const Level& L, int s) { return L.texShares[s] != 0 || (L.tint[s] >> 24) != 0; }
+    // Whose look a slot shows. The look textures are filtered between slots, and the mesh's border
+    // vertices sit on the first slots without cover, so the cover's outermost edge took THEIR look:
+    // ground fallen snow could lie on has fallen snow's look (plain, untextured), which drew the
+    // border pure white wherever it showed above the terrain. A slot without painted cover, and
+    // without fallen snow lying on it now, shows a painted neighbour's look instead; its depth still
+    // tapers the cover out. (Per slot: the "snow active" flag is set by any zone's snow values, so it
+    // can be on in a desert.) Snow appearing on a border slot later keeps the neighbour's look until
+    // that slot's look is redone (one slot wide, while it snows there).
+    bool Painted(const Level& L, int s) { return L.depth[s] > 0.0f || L.paintedSnow[s]; }
 
-    int LookSource(const Level& L, int row, int col)
+    bool SnowLiesOn(const Level& L, const FoldInputs& in, int row, int col)
     {
         const int s = row * kTex + col;
-        if (L.depth[s] > 0.0f || L.paintedSnow[s] || L.snowShare[s] || HasLook(L, s)) return s;
+        if (!in.snowOn || !L.snowShare[s]) return false;
+        const int di = (col - in.slotI0 + kTex) % kTex, dj = (row - in.slotJ0 + kTex) % kTex;
+        float fallen, keep;
+        fields::SnowAt(static_cast<float>(L.gridI + (di >= kTex - kApron ? di - kTex : di)) * L.cell,
+                       static_cast<float>(L.gridJ + (dj >= kTex - kApron ? dj - kTex : dj)) * L.cell, fallen, keep);
+        return fallen > 0.0f;
+    }
+
+    int LookSource(const Level& L, const FoldInputs& in, int row, int col)
+    {
+        const int s = row * kTex + col;
+        if (Painted(L, s) || SnowLiesOn(L, in, row, col)) return s;
         static const int kAround[8][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 }, { 1, 1 }, { -1, 1 }, { 1, -1 }, { -1, -1 } };
         for (const auto& d : kAround)
         {
             const int n = Slot(row + d[1]) * kTex + Slot(col + d[0]);
-            if (HasLook(L, n)) return n;
+            if (Painted(L, n)) return n;
         }
         return s;
     }
 
     // The look textures for the rectangle: tint (VS), the cover texture weights (each cell's two
     // IDs -> whichever slots hold those IDs now) and props (PS).
-    bool LookRect(Level& L, const Rect& r)
+    bool LookRect(Level& L, const Rect& r, const FoldInputs& in)
     {
         IDirect3DTexture9* const textures[4] = { L.lookTex, L.texWTex[0], L.texWTex[1], L.propsTex };
         D3DLOCKED_RECT lr[4] = {};
@@ -290,7 +307,7 @@ namespace wxl_livingazeroth::cover::detail
                     out[t] = textures[t] ? reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(lr[t].pBits) + (row - r.r0) * lr[t].Pitch) : nullptr;
                 for (int col = r.c0; col < r.c1; ++col)
                 {
-                    const int src = LookSource(L, row, col);
+                    const int src = LookSource(L, in, row, col);
                     uint8_t w[8] = {};
                     for (int k = 0; k < 2; ++k)
                     {
@@ -327,7 +344,7 @@ namespace wxl_livingazeroth::cover::detail
         if (bits & kDirtyLook)
         {
             const double t0 = grassperf::Now();
-            if (!LookRect(L, r)) return false;
+            if (!LookRect(L, r, in)) return false;
             g_uploadStats.lookMs += grassperf::Now() - t0;
         }
         return true;
@@ -387,7 +404,7 @@ namespace wxl_livingazeroth::cover::detail
         if (L.lookDirty || L.slotsUploaded != g_slotGeneration)
         {
             const double t0 = grassperf::Now();
-            if (!LookRect(L, kWhole)) return false;
+            if (!LookRect(L, kWhole, in)) return false;
             L.lookDirty = false;
             L.slotsUploaded = g_slotGeneration;
             g_uploadStats.lookMs += grassperf::Now() - t0;
@@ -417,7 +434,7 @@ namespace wxl_livingazeroth::cover::detail
                 for (int sl : g_changed)
                 {
                     const int c = sl % kTex, r = sl / kTex;
-                    *(reinterpret_cast<float*>(static_cast<uint8_t*>(lr.pBits) + (r - r0) * lr.Pitch) + (c - c0)) = Trenched(L, sl);
+                    *(reinterpret_cast<float*>(static_cast<uint8_t*>(lr.pBits) + (r - r0) * lr.Pitch) + (c - c0)) = Stored(L, sl, Trenched(L, sl));
                 }
                 L.coverTex->UnlockRect(0);
                 g_changed.clear();

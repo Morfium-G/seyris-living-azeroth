@@ -343,6 +343,8 @@ namespace wxl_livingazeroth::cover::detail
         // rises above it shows, e.g. trench rims through grass).
         const float base = ok ? z + (b.hasLook ? b.zOffset : 0.0f) : kHole;
         if (base != L.base[s]) { L.base[s] = base; changed |= kDirtyBase; }
+        const uint8_t sink = b.hasLook && b.zOffset < 0.0f ? 1 : 0;
+        if (sink != L.sink[s]) { L.sink[s] = sink; changed |= kDirtyCover; }
         const uint8_t material = ToByte(b.covered), driftAmp = ToByte(b.drift), breakup = ToByte(b.breakup), stiff = ToByte(b.stiffness);
         const uint8_t drift = static_cast<uint8_t>(Drift(x, y) * 255.0f + 0.5f);
         const uint8_t edge = static_cast<uint8_t>(EdgeNoise(x, y) * 255.0f + 0.5f);

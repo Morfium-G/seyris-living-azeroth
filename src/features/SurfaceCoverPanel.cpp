@@ -60,6 +60,8 @@ namespace wxl_livingazeroth::cover::detail
         g_api->UiCombo("Material from", &g_settings.materialSource, sources, 2);
         g_api->UiCheckbox("Swap alpha map axes (debug)", &g_settings.alphaSwap);
         g_api->UiCheckbox("Wireframe", &g_settings.wireframe);
+        static const char* const debugViews[] = { "Off", "Texture share (green = textured, red = plain colour)", "Shine only", "Light only" };
+        g_api->UiCombo("Debug colour", &g_settings.debugView, debugViews, 4);
         static const char* const drawPoints[] = { "Right after the terrain (inside the world pass)", "End of the scene (old)" };
         g_api->UiCombo("Draw point", &g_settings.drawPoint, drawPoints, 2);
 

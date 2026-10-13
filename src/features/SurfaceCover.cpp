@@ -42,6 +42,7 @@ namespace wxl_livingazeroth::cover::detail
 
     double g_simMs = 0;
     bool g_resting = false;
+    bool g_lookSnowActive = false; // the snow state the looks were built for
 }
 
 namespace wxl_livingazeroth::cover
@@ -197,6 +198,13 @@ namespace wxl_livingazeroth::cover
         {
             const uint32_t version = fields::SnowVersion();
             const bool active = fields::SnowActive();
+            // Ground that could hold fallen snow shows the snow's look only while snow is around (else a
+            // painted neighbour's, see LookSource): snow starting or stopping redoes the looks.
+            if (active != g_lookSnowActive)
+            {
+                g_lookSnowActive = active;
+                for (Level& L : g_levels) L.lookDirty = true;
+            }
             for (int n = 0; n < levels; ++n)
             {
                 const int k = (g_snowCursor + n) % levels;

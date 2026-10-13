@@ -83,15 +83,18 @@ float4 Tint(float2 idx) { return look.x > 0.5 ? tex2Dlod(lookTex, float4((idx + 
 float Cheb(float2 idx) { float2 a = abs(idx - lod.xy); return max(a.x, a.y); }
 float Fade(float2 idx) { return fade.z > 0.5 ? saturate((fade.y - Cheb(idx)) / (fade.y - fade.x)) : 1; }
 
+// The cover texture holds the depth, negative where the cover sits below the terrain (ZOffset < 0):
+// such a cover is lowered far away instead of lifted.
 // x = base height, y = cover depth
 float2 Sample(float2 idx)
 {
     float2 uv = (idx + 0.5) * grid.w;
-    return float2(tex2Dlod(baseTex, float4(uv, 0, 0)).r, tex2Dlod(coverTex, float4(uv, 0, 0)).r * Fade(idx));
+    return float2(tex2Dlod(baseTex, float4(uv, 0, 0)).r, abs(tex2Dlod(coverTex, float4(uv, 0, 0)).r) * Fade(idx));
 }
 
 float B(float2 idx) { return tex2Dlod(baseTex, float4((idx + 0.5) * grid.w, 0, 0)).r; }
-float C(float2 idx) { return tex2Dlod(coverTex, float4((idx + 0.5) * grid.w, 0, 0)).r * Fade(idx); }
+float C(float2 idx) { return abs(tex2Dlod(coverTex, float4((idx + 0.5) * grid.w, 0, 0)).r) * Fade(idx); }
+float LiftDir(float2 idx) { return tex2Dlod(coverTex, float4((idx + 0.5) * grid.w, 0, 0)).r < 0 ? -1 : 1; }
 // Inside the level's filled area (its grid plus the 2-cell apron): beyond it the slots hold stale heights.
 float2 Inside(float2 idx) { return clamp(idx, lod.xy - lod.z - 2, lod.xy + lod.z + 2); }
 
@@ -125,6 +128,7 @@ VOut main(float2 ij : POSITION)
     Vertex(idx, 1, p, n, s);
     o.tint = Tint(idx);
     o.wuv = (idx + 0.5) * grid.w;
+    float dir = LiftDir(idx);
 
     // Border band: odd vertices slide onto their even neighbours, so the edge becomes the coarser
     // level's triangles.
@@ -138,16 +142,18 @@ VOut main(float2 ij : POSITION)
         // at world-sized coordinates, and the two levels' edges no longer meet (hairline cracks).
         float4 t1 = Tint(idx - odd);
         float2 w1 = (idx - odd + 0.5) * grid.w;
-        if (m >= 1) { p = p1; n = n1; s = s1; o.tint = t1; o.wuv = w1; }
+        if (m >= 1) { p = p1; n = n1; s = s1; o.tint = t1; o.wuv = w1; dir = LiftDir(idx - odd); }
         else        { p = lerp(p, p1, m); n = lerp(normalize(n), normalize(n1), m); s = lerp(s, s1, m); o.tint = lerp(o.tint, t1, m); o.wuv = lerp(o.wuv, w1, m); }
     }
 
     o.far = FarAt(p.xy);
 
     // Far away the client draws simpler terrain than its heights, which pokes through a thin
-    // cover; a lift that only depends on the distance stays seamless across the levels.
+    // cover; a lift that only depends on the distance stays seamless across the levels. A cover
+    // below the terrain (mud whose rims show through) is lowered instead, so the simpler far terrain
+    // hides it rather than the lift pushing it into view.
     float dist = length(float3(p.xy - eye.xy, p.z - eye.z));
-    p.z += lift.z * saturate((dist - lift.x) / (lift.y - lift.x)) * saturate(s.y * 10);
+    p.z += dir * lift.z * saturate((dist - lift.x) / (lift.y - lift.x)) * saturate(s.y * 10);
 
     // Normal and position into view space, where the terrain shader lights and fogs (its sun
     // direction is view space; its fog runs on the view depth).
@@ -187,6 +193,7 @@ float4 specOn1 : register(c9);
 float4 specular : register(c10);
 float4 wetMap : register(c11);  // 1 / grid extent (yd), uv offset (x, y), on
 float4 wetBox : register(c12);  // the grid's valid box, camera-relative (min x, min y, max x, max y)
+float4 debugView : register(c14); // x = 0 off, 1 cover texture share, 2 specular only, 3 lighting only
 float4 misc : register(c13);     // x = 1: the terrain's dynamic shadows apply; y = (unused), z = 1 / the near grid's edge fade (yd),
                                  // w = how much darker soaked ground gets (the wet terrain's strength, so both match)
 float4 pcf[8] : register(c20);   // the terrain's PCF offsets (its PS c3..c10)
@@ -293,6 +300,13 @@ float4 main(float3 n : TEXCOORD0, float2 d : TEXCOORD1, float2 rel : TEXCOORD2, 
     float shaped = peak - over + room * (1 - exp(-over / room));
     total *= shaped / max(peak, 0.001);
     float3 c = colour * total + specular.rgb * sp * shade;
+    // Debug views (panel): which part makes a colour.
+    [branch] if (debugView.x > 0.5)
+    {
+        if (debugView.x < 1.5) return float4(1 - share, share, 0, 1);       // cover texture share: red = plain colour
+        if (debugView.x < 2.5) return float4(specular.rgb * sp * shade, 1); // the shine alone
+        return float4(total * 0.5, 1);                                     // the light alone (half, so bright stays readable)
+    }
     return float4(lerp(fogColor.rgb, c, fog), 1);
 }
 )";
